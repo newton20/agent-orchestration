@@ -1,11 +1,15 @@
 # agent-orchestrator
 
-A Claude Code plugin that runs multi-phase, multi-session builds without
-manual copy-paste between windows. You write a YAML manifest describing
-phases and agent roles. The orchestrator spawns visible Claude Code sessions
-in Windows Terminal tabs, polls a file-drop protocol for completion signals,
-handles QA↔impl review loops, recovers from crashes, and notifies you when
-things land or need a decision.
+A Claude Code plugin (in active development) for multi-phase, multi-session
+builds. You write a YAML manifest describing phases and agent roles, and
+the orchestrator spawns visible Claude Code sessions in Windows Terminal
+tabs, polls a file-drop protocol for completion signals, and advances
+phases. Review loops, crash recovery, prompt injection, and email
+notifications are planned for later units.
+
+**Current shipped scope:** Unit 0 prototype only. You still paste the first
+prompt into each spawned Claude tab by hand. See the status table below for
+what's done and what's pending.
 
 ## Current status
 

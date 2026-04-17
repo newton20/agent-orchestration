@@ -29,17 +29,28 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+function parsePositiveInt(raw, flagName) {
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
+    die(`${flagName} requires a positive integer, got: ${JSON.stringify(raw)}`);
+  }
+  return n;
+}
+
 function parseArgs(argv) {
   const args = { manifest: null, dryRun: false, pollSec: DEFAULT_POLL_SEC };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--dry-run') args.dryRun = true;
-    else if (a === '--poll-seconds') args.pollSec = parseInt(argv[++i], 10);
-    else if (a === '-h' || a === '--help') {
+    else if (a === '--poll-seconds') {
+      const raw = argv[++i];
+      if (raw === undefined) die('--poll-seconds requires a value');
+      args.pollSec = parsePositiveInt(raw, '--poll-seconds');
+    } else if (a === '-h' || a === '--help') {
       console.log(
         'Usage: node orchestrate-prototype.js <manifest.yaml> [--dry-run] [--poll-seconds N]\n' +
           '  --dry-run       Print spawn commands instead of executing them.\n' +
-          '  --poll-seconds  Completion-signal poll interval (default 30).'
+          '  --poll-seconds  Completion-signal poll interval in seconds (positive integer, default 30).'
       );
       process.exit(0);
     } else if (!a.startsWith('-')) args.manifest = a;
@@ -63,7 +74,25 @@ function loadManifest(manifestPath) {
   manifest.phases.forEach((p, i) => {
     if (!p.id) die(`phases[${i}] is missing required field \`id\``);
     if (!p.completion_signal) die(`phases[${i}] (${p.id}) is missing \`completion_signal\``);
+    if (p.timeout_minutes !== undefined) {
+      const n = Number(p.timeout_minutes);
+      if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
+        die(
+          `phases[${i}] (${p.id}) \`timeout_minutes\` must be a positive integer, got: ` +
+            JSON.stringify(p.timeout_minutes)
+        );
+      }
+    }
   });
+  if (manifest.launcher?.shell !== undefined) {
+    const allowed = ['powershell', 'cmd'];
+    if (!allowed.includes(manifest.launcher.shell)) {
+      die(
+        `launcher.shell must be one of ${allowed.join(' | ')}, got: ` +
+          JSON.stringify(manifest.launcher.shell)
+      );
+    }
+  }
   return manifest;
 }
 

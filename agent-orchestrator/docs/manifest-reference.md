@@ -62,9 +62,9 @@ launcher:
 
 | Field | Type | Default | Since | Notes |
 |---|---|---|---|---|
-| `shell` | string (`powershell` \| `cmd`) | `powershell` | prototype | Which host shell wraps the binary in the new `wt` tab. |
-| `binary` | string | `agency claude` | prototype | The Claude CLI invocation. Can be `claude`, `agency claude`, or a full path. Spaces are allowed. |
-| `auto_mode_flag` | string | `--enable-auto-mode` | prototype | Passed immediately after `binary`. Set to empty string to omit. |
+| `shell` | string (`powershell` \| `cmd`) | `powershell` | prototype | Which host shell wraps the binary in the new `wt` tab. The prototype validates this literally — any other value errors. |
+| `binary` | string | `agency claude` | prototype | The Claude CLI invocation. Works well for space-separated subcommands like `agency claude` or a single binary like `claude`. **Caveat:** the prototype concatenates `binary + auto_mode_flag` into a shell string; embedded quotes, paths with spaces, or shell metacharacters may break. Unit 4's `spawn-session.js` will replace this with proper argv construction. |
+| `auto_mode_flag` | string | `--enable-auto-mode` | prototype | Passed immediately after `binary`. Set to empty string to omit. Same quoting caveat as `binary`. |
 | `shell_args` | string | `-NoExit -Command` (ps) / `/k` (cmd) | V1 | Arguments injected between the shell binary and the Claude invocation. |
 | `passthrough_flags` | list of strings | `[]` | V1 | Extra flags appended to every Claude spawn (e.g. `--model`, `--plugin-dir`). |
 
@@ -129,8 +129,8 @@ phases:
 
 | Field | Type | Default | Since | Notes |
 |---|---|---|---|---|
-| `id` | string | — | prototype | **Required.** Must be unique. Used in the `wt` tab title and session name (`orch-<id>-<role>`). |
-| `title` | string | `id` | prototype | Cosmetic. Appears in the tab title. |
+| `id` | string | — | prototype | **Required.** Used in the session name (`orch-<id>-<role>`). The prototype checks presence only; V1's `parse-manifest.js` will also enforce uniqueness. |
+| `title` | string | — | prototype | Cosmetic suffix appended to the tab title. When present, the tab title becomes `orch-<id>-<role> — <title>`; otherwise it is `orch-<id>-<role>`. |
 | `timeout_minutes` | integer | 60 (prototype) / `defaults.phase_timeout_minutes` (V1) | prototype | Wall-clock cap for this phase. On timeout, the prototype exits fatally; V1 marks the phase failed and continues the DAG. |
 | `depends_on` | list of phase `id`s | `[]` | V1 | DAG edge. Phase cannot start until every listed phase completes. |
 | `parallel_with` | list of phase `id`s | `[]` | V1 | Hint for the scheduler that these phases can run simultaneously. |

@@ -745,22 +745,37 @@ Zero manual intervention between phases. No crashes or timeouts.
 - `skills/session-handoff/references/message-templates.md` (304 lines) — Base Template, 5 role preambles, 5 message-type overrides, composition algorithm.
 - `skills/session-handoff/references/sanitization-patterns.md` — skeleton only. Phase 1 agent explicitly flagged it as "deliberately not modified" (Unit 3's scope). Scope discipline held.
 
-**Findings to fold into Units 1–11:**
+### Prototype-validated (demonstrated by the Unit 0 code itself)
 
-1. **Completion-signal handoff notes exceeded their freeform spec and became a structured coordination channel.** Phase 0 documented SKILL.md's section structure so Phase 1 knew exactly where to splice ("`## Phase 2-5 (reserved)` anchor"), plus 6 preserved design decisions. Phase 1 pre-paved Unit 3 with invariants. **Action:** Unit 6's `protocol-header.md` should make the handoff-notes schema **first-class and structured** (required fields: files_modified, files_deliberately_skipped, design_calls_next_phase_should_know, blockers/open_questions), not a freeform "anything the next phase needs" invitation.
+1. **`workdir` field needed.** Manifest at `claude-skills/docs/orchestration/` vs. spawn cwd at `claude-skills/` root — prototype initially assumed they were the same. Resolved by adding optional top-level `workdir` (absolute or relative to manifest dir), and the prototype ships with it working. Unit 4 (`spawn-session.js`) already anticipates a `workdir` parameter — carry through, document in Unit 2's parser and Unit 11's schema.
 
-2. **Manual prompt paste is the dominant friction.** 2 paste actions for 2 phases. Scales linearly. **Action:** Unit 5 (SessionStart hook) is the clearest next ROI after Unit 1 scaffolding.
+2. **`wt --suppressApplicationTitle` is required for tab-title persistence.** Without it, tab titles revert to "PowerShell" then "Claude Code" within seconds, defeating the `orch-<phase>-<role>` naming. The prototype includes this flag in its `wt` command. **Action:** Unit 4's spawn command must retain it.
 
-3. **No git bootstrap in prompts.** Agents did not stage or commit; left work uncommitted. **Action:** Unit 6's `impl-prompt.md` template should include an explicit "commit your work with message X" clause. Unit 11's orchestrator should treat commit presence as a secondary completion check.
+3. **Launcher schema is already straining.** `binary` + `auto_mode_flag` + V1's `shell_args` + `passthrough_flags` is patchwork. Current prototype concatenates `binary + auto_mode_flag` into a shell string; that breaks with paths containing spaces or embedded quotes. **Action:** Unit 4 should redesign this as a structured `argv`-shaped launcher spec (shell, pre-flags, binary, post-flags) instead of bolting on more string fields.
 
-4. **Tab accumulation.** Two live tabs after two phases; N phases → N tabs. **Action:** Unit 11 should close or mute completed tabs on phase advance. Add optional config: `close_tabs_on_success`.
+### Empirical run observations (from the actual session-handoff execution, not things the Unit 0 code itself proves)
 
-5. **30-second poll cadence validated.** Detection lag on Phase 1 was under 30s (signal appeared at 04:22:13, detected same tick). Unit 11's 2-minute default for multi-hour builds is fine; for short phases, make the interval configurable (30s – 2min).
+4. **Completion-signal handoff notes exceeded their freeform spec and became a structured coordination channel.** Phase 0 documented SKILL.md's section structure so Phase 1 knew exactly where to splice ("`## Phase 2-5 (reserved)` anchor"), plus 6 preserved design decisions. Phase 1 pre-paved Unit 3 with invariants. **Action:** Unit 6's `protocol-header.md` should make the handoff-notes schema **first-class and structured** (required fields: files_modified, files_deliberately_skipped, design_calls_next_phase_should_know, blockers/open_questions), not a freeform "anything the next phase needs" invitation.
 
-6. **`workdir` field emerged as a needed manifest addition.** Manifest at `claude-skills/docs/orchestration/` vs. spawn cwd at `claude-skills/` root — prototype initially assumed they were the same. Fixed by adding optional top-level `workdir` (absolute or relative to manifest dir). Unit 4 (`spawn-session.js`) already anticipates a `workdir` parameter — carry through, document in Unit 2's parser and Unit 11's schema.
+5. **Manual prompt paste is the dominant friction.** 2 paste actions for 2 phases. Scales linearly. **Action:** Unit 5 (SessionStart hook) is the clearest next ROI after Unit 1 scaffolding.
 
-7. **`wt --suppressApplicationTitle` is required for tab-title persistence.** Without it, tab titles revert to "PowerShell" then "Claude Code" within seconds, defeating the `orch-<phase>-<role>` naming. **Action:** Unit 4 spawn command must include this flag.
+6. **No git bootstrap in prompts.** Agents did not stage or commit; left work uncommitted. **Action:** Unit 6's `impl-prompt.md` template should include an explicit "commit your work with message X" clause. Unit 11's orchestrator should treat commit presence as a secondary completion check.
 
-8. **Session-name mechanism untested under `agency` wrapper.** Prototype omits `--name` and `--plugin-dir` entirely (leaving them to Unit 5's hook era). Unit 4.5 spike still required — nothing in Unit 0 de-risks it.
+7. **Tab accumulation.** Two live tabs after two phases; N phases → N tabs. **Action:** Unit 11 should close or mute completed tabs on phase advance. Add optional config: `close_tabs_on_success`.
+
+8. **30-second poll cadence was adequate.** Detection lag on Phase 1 was under 30s (signal appeared at 04:22:13, detected same tick). Unit 11's 2-minute default for multi-hour builds is fine; for short phases, make the interval configurable (30s – 2min).
+
+9. **Session-name mechanism untested under `agency` wrapper.** Prototype omits `--name` and `--plugin-dir` entirely (leaving them to Unit 5's hook era). Unit 4.5 spike still required — nothing in Unit 0 de-risks it.
 
 **No fundamental revisions required.** The architecture holds. All findings are implementation-detail tuning, not structural.
+
+### Post-review fixes (codex, 2026-04-17)
+
+Codex `review` pass on the initial commit surfaced 2 P1 and 5 P2 findings. Addressed:
+
+- **P1:** `--poll-seconds` and `phase.timeout_minutes` now validate as positive integers; non-numeric input fails fast with a clear message instead of producing NaN deadlines or tight polling loops.
+- **P1 / P2:** Manifest-reference claim that `binary` supports "spaces and full paths" tempered. Docs now flag the concatenation-into-shell-string as a known prototype limitation and point at Unit 4 for proper argv construction. See finding 3 above.
+- **P2:** `launcher.shell` now validated against a literal whitelist (`powershell | cmd`); typos like `pwsh` error at parse time instead of silently falling into the `cmd` branch.
+- **P2:** Manifest reference stopped claiming prototype enforces `phase.id` uniqueness (it only checks presence). Corrected `title` docs (runtime title is `orch-<id>-<role> — <title>`, not `id`).
+- **P2:** Top-level README opening paragraph no longer describes review loops, crash recovery, and notifications as present — it names the current shipped scope explicitly (Unit 0 only).
+- **P2 (this section):** Findings above are now split into "Prototype-validated" vs "Empirical run observations" so the reader can tell which claims are anchored in the Unit 0 code and which are from the real-world test run.
