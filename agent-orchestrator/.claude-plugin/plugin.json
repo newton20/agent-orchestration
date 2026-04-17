@@ -1,0 +1,19 @@
+{
+  "name": "agent-orchestrator",
+  "version": "0.1.0",
+  "description": "Multi-session phased-build orchestration for Claude Code. Spawns visible Claude Code sessions per phase, coordinates via a file-drop protocol, and handles review loops and crash recovery.",
+  "author": {
+    "name": "dunliu",
+    "url": "https://github.com/newton20"
+  },
+  "license": "MIT",
+  "keywords": [
+    "orchestration",
+    "multi-agent",
+    "claude-code",
+    "windows-terminal",
+    "file-protocol",
+    "phased-delivery"
+  ],
+  "repository": "https://github.com/newton20/agent-orchestration"
+}
