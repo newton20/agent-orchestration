@@ -1,0 +1,126 @@
+# agent-orchestrator manifest — annotated reference
+#
+# This file documents the full manifest shape for V1. For a runnable
+# minimal example, see ../prototype/manifest-example.yaml. For per-field
+# semantics and defaults, see ../docs/manifest-reference.md.
+#
+# The manifest is the user-owned structural file. The orchestrator
+# never edits it. Runtime state (PIDs, timestamps, status) is written
+# to a separate manifest-status.yaml alongside it to avoid write
+# conflicts while the user has the manifest open.
+
+# ---- Project identity ------------------------------------------------
+
+name: my-phased-build
+# Optional. Cosmetic. Shown in the orchestrator's startup header.
+
+workdir: .
+# Optional. Where spawned Claude tabs start (wt --startingDirectory).
+# Absolute path or path relative to this manifest's directory. Defaults
+# to the manifest's own directory. This is independent of where
+# prompt_file / completion_signal paths resolve — those always resolve
+# relative to the manifest file itself.
+
+# ---- Launcher: how Claude Code is invoked ----------------------------
+
+launcher:
+  shell: powershell                   # powershell | cmd. Validated literally.
+  binary: agency claude               # The Claude CLI. Direct "claude" or a wrapper.
+  auto_mode_flag: --enable-auto-mode  # Flag passed right after binary. "" to omit.
+  shell_args: -NoExit -Command        # V1. Flags between the shell host and the binary.
+  passthrough_flags:                  # V1. Appended to every Claude spawn.
+    - --model=sonnet
+    - --permission-mode=auto
+
+# Alternative: direct Claude (non-agency users)
+# launcher:
+#   shell: cmd
+#   binary: claude
+#   auto_mode_flag: --permission-mode auto
+#   shell_args: /k
+
+# ---- Defaults: per-run fallbacks -------------------------------------
+# V1 honors these; prototype ignores the block.
+
+defaults:
+  model: sonnet
+  phase_timeout_minutes: 120
+  heartbeat_timeout_minutes: 5
+  permission_mode: auto
+  notifications:                      # V1.5 (Unit 10)
+    enabled: false
+    email: liudun88@gmail.com
+
+# ---- Phases ----------------------------------------------------------
+
+phases:
+
+  # Linear first phase with a single implementer.
+  - id: phase-0
+    title: Scaffold monorepo
+    timeout_minutes: 120              # Overrides defaults.phase_timeout_minutes.
+    agent:                            # Single-agent shorthand (prototype + V1).
+      role: impl
+      prompt_file: prompts/phase-0-impl.md
+    completion_signal: signals/phase-0-impl-complete.md
+
+  # V1: review-loop phase with impl + qa agents.
+  - id: phase-1
+    title: Build feature with impl/qa review cycle
+    depends_on: [phase-0]             # V1. Phase cannot start until phase-0 completes.
+    review_loop:                      # V1 (Unit 11).
+      enabled: true
+      max_iterations: 3               # Hard cap before escalating to user.
+    agents:                           # V1 multi-agent form.
+      - role: impl
+        model: sonnet
+        prompt_file: prompts/phase-1-impl.md
+      - role: qa
+        model: sonnet
+        prompt_file: prompts/phase-1-qa.md
+    completion_signal: signals/phase-1-impl-complete.md
+
+  # V1: two phases that can run in parallel.
+  - id: phase-2a
+    title: Build auth module
+    depends_on: [phase-1]
+    parallel_with: [phase-2b]         # V1. Scheduler hint: these two can overlap.
+    agents:
+      - role: impl
+        prompt_file: prompts/phase-2a-impl.md
+    completion_signal: signals/phase-2a-impl-complete.md
+
+  - id: phase-2b
+    title: Build billing module
+    depends_on: [phase-1]
+    parallel_with: [phase-2a]
+    agents:
+      - role: impl
+        prompt_file: prompts/phase-2b-impl.md
+    completion_signal: signals/phase-2b-impl-complete.md
+
+  # Final integration phase that waits on both parallel phases.
+  - id: phase-3
+    title: Integration + final QA
+    depends_on: [phase-2a, phase-2b]
+    review_loop:
+      enabled: true
+      max_iterations: 3
+    agents:
+      - role: impl
+        prompt_file: prompts/phase-3-impl.md
+      - role: qa
+        prompt_file: prompts/phase-3-qa.md
+    completion_signal: signals/phase-3-impl-complete.md
+
+# ---- Validation rules (enforced by Unit 2's parse-manifest.js) -------
+#
+# - `phases[]` must be non-empty.
+# - Every `phase.id` must be unique (V1; prototype only checks presence).
+# - Every `phase.completion_signal` must be non-empty.
+# - Every `depends_on` reference must resolve to an existing `phase.id`.
+# - The `depends_on` graph must be acyclic.
+# - `launcher.shell` must be `powershell` or `cmd`.
+# - `timeout_minutes` must be a positive integer.
+# - Unknown top-level fields produce a warning, not an error, so future
+#   V1+ fields don't break older manifests.
