@@ -1,0 +1,35 @@
+# Agent Orchestrator — Unit 0 prototype manifest example.
+# Two-phase sequential build. Minimal fields only — no review loops, no
+# parallelism, no recovery. Those are Unit 1+ concerns.
+
+name: prototype-smoke-test
+
+# Launcher tells the prototype how to start a Claude session.
+# Defaults shown here match the plan's "agency wrapper" configuration.
+# Omit this block entirely and the prototype uses the same defaults.
+launcher:
+  shell: powershell            # powershell | cmd
+  binary: agency claude        # binary invoked inside the new wt tab
+  auto_mode_flag: --enable-auto-mode
+
+phases:
+  - id: phase-0
+    title: Scaffold initial files
+    timeout_minutes: 120
+    agent:
+      role: impl
+      # Optional: absolute or relative path to a prompt you'll paste into Claude.
+      # The prototype does NOT inject it (that is Unit 5's SessionStart hook).
+      # It only prints the path so you can find and paste it by hand.
+      prompt_file: prompts/phase-0-impl.md
+    # Agent signals completion by creating this file. Path is relative to the
+    # manifest's directory. Parent directories are auto-created.
+    completion_signal: signals/phase-0-impl-complete.md
+
+  - id: phase-1
+    title: Wire phase-0 artifacts into the feature path
+    timeout_minutes: 120
+    agent:
+      role: impl
+      prompt_file: prompts/phase-1-impl.md
+    completion_signal: signals/phase-1-impl-complete.md
