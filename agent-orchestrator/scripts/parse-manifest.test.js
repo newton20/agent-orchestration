@@ -191,6 +191,52 @@ test('empty phases array: specific error', () => {
   assert.ok(result.errors.some((e) => e.path === 'phases'));
 });
 
+test('phase.id must match [A-Za-z0-9._-]+ (path-traversal guard)', () => {
+  for (const id of [
+    '../../outside',
+    '..\\outside',
+    'with/slash',
+    'with\\backslash',
+    'with space',
+    'with:colon',
+  ]) {
+    const manifest = {
+      name: 'hostile',
+      phases: [
+        { id, completion_signal: 'sig.md', agent: { role: 'impl' } },
+      ],
+    };
+    const result = validate(manifest);
+    assert.strictEqual(result.valid, false, `expected "${id}" to fail`);
+    assert.ok(
+      result.errors.some(
+        (e) =>
+          e.path === 'phases[0].id' &&
+          /not safe as a filesystem/.test(e.message)
+      ),
+      `expected filesystem-safety error for "${id}"`
+    );
+  }
+});
+
+test('phase.id rejects __proto__ / prototype / constructor', () => {
+  for (const id of ['__proto__', 'prototype', 'constructor']) {
+    const manifest = {
+      name: 'reserved',
+      phases: [
+        { id, completion_signal: 'sig.md', agent: { role: 'impl' } },
+      ],
+    };
+    const result = validate(manifest);
+    assert.strictEqual(result.valid, false, `expected "${id}" to fail`);
+    assert.ok(
+      result.errors.some(
+        (e) => e.path === 'phases[0].id' && /reserved JavaScript property/.test(e.message)
+      )
+    );
+  }
+});
+
 test('missing phase.id: reports phases[0].id', () => {
   const manifest = {
     name: 'no-id',
