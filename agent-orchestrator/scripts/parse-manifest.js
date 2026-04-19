@@ -176,6 +176,13 @@ function validate(manifest) {
       warn(k, `unknown top-level field "${k}" — ignored (forward-compat)`);
   }
 
+  if (
+    manifest.name === undefined ||
+    typeof manifest.name !== 'string' ||
+    manifest.name.trim() === ''
+  )
+    push('name', 'missing required field `name` (non-empty string)');
+
   if (!Array.isArray(manifest.phases) || manifest.phases.length === 0) {
     push('phases', 'must be a non-empty array');
     // Without phases, nothing else is useful to validate structurally.
@@ -362,8 +369,8 @@ function validateAgent(a, p_, push) {
     push(p_, 'must be an object');
     return;
   }
-  if (a.role !== undefined && typeof a.role !== 'string')
-    push(`${p_}.role`, 'must be a string');
+  if (a.role === undefined || typeof a.role !== 'string' || a.role.trim() === '')
+    push(`${p_}.role`, 'missing required field `role` (non-empty string)');
   if (a.model !== undefined && typeof a.model !== 'string')
     push(`${p_}.model`, 'must be a string');
   if (a.prompt_file !== undefined && typeof a.prompt_file !== 'string')
@@ -381,44 +388,88 @@ function expectPositiveInt(v, p_, push) {
 // -------------------- Dependency graph --------------------
 
 /**
- * Kahn's algorithm: topological sort + cycle detection in one pass.
+ * Topological sort via Kahn's algorithm. When a cycle exists, falls back
+ * to a DFS that returns the actual cycle path (not just the unsorted
+ * residue — residue includes downstream nodes reachable from the cycle,
+ * which is misleading in the error message).
+ *
  * Returns { order: string[] | null, cycle: string[] | null }. On cycle,
- * `cycle` is the list of ids that could not be sorted (the cycle residue).
+ * `cycle` is a ring of node ids that proves the circularity — e.g.
+ * ['a', 'b', 'c', 'a'] for a -> b -> c -> a.
  */
 function analyzeDeps(phases) {
   const ids = phases.map((p) => p.id);
   const idSet = new Set(ids);
   const indeg = new Map(ids.map((id) => [id, 0]));
   const edges = new Map(ids.map((id) => [id, []]));
+  const deps = new Map(ids.map((id) => [id, []]));
 
   for (const p of phases) {
-    const deps = Array.isArray(p.depends_on) ? p.depends_on : [];
-    for (const d of deps) {
-      if (!idSet.has(d)) {
-        // Surfaced as an error separately by validate(), but also affects
-        // graph construction — skip the edge here.
-        continue;
-      }
+    const ds = Array.isArray(p.depends_on) ? p.depends_on : [];
+    for (const d of ds) {
+      if (!idSet.has(d)) continue; // dangling — surfaced separately
       edges.get(d).push(p.id);
+      deps.get(p.id).push(d);
       indeg.set(p.id, indeg.get(p.id) + 1);
     }
   }
 
   const queue = ids.filter((id) => indeg.get(id) === 0);
+  const indegWork = new Map(indeg);
   const order = [];
   while (queue.length > 0) {
     const id = queue.shift();
     order.push(id);
     for (const next of edges.get(id)) {
-      indeg.set(next, indeg.get(next) - 1);
-      if (indeg.get(next) === 0) queue.push(next);
+      indegWork.set(next, indegWork.get(next) - 1);
+      if (indegWork.get(next) === 0) queue.push(next);
     }
   }
-  if (order.length !== ids.length) {
-    const residue = ids.filter((id) => indeg.get(id) > 0);
-    return { order: null, cycle: residue };
+  if (order.length === ids.length) return { order, cycle: null };
+
+  // Cycle exists. Find the shortest actual cycle via DFS from each
+  // still-in-degree node, walking depends_on edges (reverse of execution).
+  const residue = new Set(ids.filter((id) => indegWork.get(id) > 0));
+  const cycle = findCycle(ids, deps, residue);
+  return { order: null, cycle };
+}
+
+function findCycle(ids, deps, residue) {
+  const WHITE = 0,
+    GRAY = 1,
+    BLACK = 2;
+  const color = new Map(ids.map((id) => [id, WHITE]));
+  const stack = [];
+  const seen = new Set();
+
+  const starts = residue.size > 0 ? [...residue] : ids;
+  for (const start of starts) {
+    if (color.get(start) !== WHITE) continue;
+    const path = dfsFindCycle(start, deps, color);
+    if (path) return path;
   }
-  return { order, cycle: null };
+  return null;
+
+  function dfsFindCycle(node, deps, color) {
+    if (seen.has(node)) return null;
+    color.set(node, GRAY);
+    stack.push(node);
+    for (const d of deps.get(node) || []) {
+      if (color.get(d) === GRAY) {
+        // Found a back-edge: cycle is stack from `d` to end + back to `d`.
+        const idx = stack.indexOf(d);
+        return [...stack.slice(idx), d];
+      }
+      if (color.get(d) === WHITE) {
+        const found = dfsFindCycle(d, deps, color);
+        if (found) return found;
+      }
+    }
+    color.set(node, BLACK);
+    stack.pop();
+    seen.add(node);
+    return null;
+  }
 }
 
 // -------------------- Dangling dep check (runs before graph) --------------------
@@ -537,40 +588,105 @@ function statusPathFor(manifestPath) {
   return path.join(dir, `${base}-status.yaml`);
 }
 
+// Block JS object-key injection. Phase IDs must not be internal object
+// property names that would mutate the prototype chain when used as a
+// map key. A valid phase id is [A-Za-z0-9._-]+ anyway.
+const UNSAFE_ID_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
+const VALID_ID_RE = /^[A-Za-z0-9._-]+$/;
+
+/**
+ * Testable update entry point. Returns { ok: true, status_file, phase,
+ * updates } on success, { ok: false, error } on any validation failure.
+ * Never calls process.exit — callers (CLI main) do that.
+ */
 function runUpdate(manifestPath, phaseId, updates) {
   const loaded = loadManifest(manifestPath);
-  if (!loaded.ok) fail(loaded.error);
-  const ids = new Set((loaded.manifest.phases || []).map((p) => p.id));
+  if (!loaded.ok) return { ok: false, error: loaded.error };
+
+  const dangling = findDanglingDeps(
+    Array.isArray(loaded.manifest.phases) ? loaded.manifest.phases : []
+  );
+  const vresult = validate(loaded.manifest);
+  if (dangling.length > 0 || !vresult.valid) {
+    const errs = [...dangling, ...vresult.errors]
+      .map((e) => `${e.path}: ${e.message}`)
+      .join('; ');
+    return {
+      ok: false,
+      error: `manifest is invalid — cannot update status: ${errs}`,
+    };
+  }
+
+  if (
+    typeof phaseId !== 'string' ||
+    UNSAFE_ID_KEYS.has(phaseId) ||
+    !VALID_ID_RE.test(phaseId)
+  )
+    return {
+      ok: false,
+      error:
+        `phase id "${phaseId}" is not safe as a YAML map key — ` +
+        `use [A-Za-z0-9._-]+ and avoid __proto__/prototype/constructor`,
+    };
+
+  const ids = new Set(loaded.manifest.phases.map((p) => p.id));
   if (!ids.has(phaseId))
-    fail(`phase "${phaseId}" not found in ${manifestPath}`);
+    return {
+      ok: false,
+      error: `phase "${phaseId}" not found in ${manifestPath}`,
+    };
 
   if (
     updates.status !== undefined &&
     !KNOWN_STATUS.includes(String(updates.status))
   )
-    fail(
-      `status must be one of ${KNOWN_STATUS.join(' | ')}, got ${JSON.stringify(updates.status)}`
-    );
+    return {
+      ok: false,
+      error:
+        `status must be one of ${KNOWN_STATUS.join(' | ')}, got ${JSON.stringify(updates.status)}`,
+    };
   if (updates.pid !== undefined && !Number.isInteger(updates.pid))
-    fail(`pid must be an integer, got ${JSON.stringify(updates.pid)}`);
+    return {
+      ok: false,
+      error: `pid must be an integer, got ${JSON.stringify(updates.pid)}`,
+    };
   if (
     updates.retry_count !== undefined &&
     !Number.isInteger(updates.retry_count)
   )
-    fail(`retry_count must be an integer, got ${JSON.stringify(updates.retry_count)}`);
+    return {
+      ok: false,
+      error: `retry_count must be an integer, got ${JSON.stringify(updates.retry_count)}`,
+    };
 
   const statusPath = statusPathFor(path.resolve(manifestPath));
-  let status = { phases: {} };
+  let status = { phases: Object.create(null) };
   if (fs.existsSync(statusPath)) {
     const raw = fs.readFileSync(statusPath, 'utf8');
+    let parsed;
     try {
-      const parsed = yaml.load(raw);
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed))
-        status = parsed;
+      parsed = yaml.load(raw);
     } catch (e) {
-      fail(`corrupt status file at ${statusPath}: ${e.message}`);
+      return {
+        ok: false,
+        error: `corrupt status file at ${statusPath}: ${e.message}`,
+      };
     }
-    if (!status.phases || typeof status.phases !== 'object') status.phases = {};
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      status = parsed;
+      if (
+        !status.phases ||
+        typeof status.phases !== 'object' ||
+        Array.isArray(status.phases)
+      )
+        status.phases = Object.create(null);
+      else {
+        const safe = Object.create(null);
+        for (const k of Object.keys(status.phases))
+          if (!UNSAFE_ID_KEYS.has(k)) safe[k] = status.phases[k];
+        status.phases = safe;
+      }
+    }
   }
 
   const existing = status.phases[phaseId] || {};
@@ -581,21 +697,29 @@ function runUpdate(manifestPath, phaseId, updates) {
     '# auto-generated by parse-manifest.js --update; do not hand-edit\n' +
     '# runtime state for the orchestrator; the user-owned manifest is the sibling file\n';
   fs.writeFileSync(statusPath, header + yaml.dump(status));
-  process.stdout.write(
-    JSON.stringify(
-      { ok: true, status_file: statusPath, phase: phaseId, updates },
-      null,
-      2
-    ) + '\n'
-  );
+  return { ok: true, status_file: statusPath, phase: phaseId, updates };
 }
 
 // -------------------- Entry --------------------
 
 function main() {
   const args = parseCliArgs(process.argv);
-  if (args.update) runUpdate(args.manifest, args.update, args.updates);
-  else runValidate(args.manifest);
+  if (args.update) {
+    const result = runUpdate(args.manifest, args.update, args.updates);
+    if (!result.ok) fail(result.error);
+    process.stdout.write(
+      JSON.stringify(
+        {
+          ok: true,
+          status_file: result.status_file,
+          phase: result.phase,
+          updates: result.updates,
+        },
+        null,
+        2
+      ) + '\n'
+    );
+  } else runValidate(args.manifest);
 }
 
 // Run only when invoked as a script. Under `node --test` or `require`d,
@@ -609,4 +733,5 @@ module.exports = {
   analyzeDeps,
   normalizePhases,
   statusPathFor,
+  runUpdate,
 };
