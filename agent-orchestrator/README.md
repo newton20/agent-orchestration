@@ -19,7 +19,7 @@ what's done and what's pending.
 | 0.5 | README + manifest reference | **Done** — you're reading it |
 | 1 | Plugin scaffold (`.claude-plugin/`, stub skills, templates, schema) | **Done (pending plugin-load smoke test)** |
 | 2 | Manifest parser + validator (`scripts/parse-manifest.js` + tests) | **Done** |
-| 3 | File-protocol scaffolding | Pending |
+| 3 | File-protocol scaffolding (`scripts/scaffold-protocol.js` + tests) | **Done** |
 | 4 | Session spawner (Node.js) | Pending |
 | 4.5 | SessionStart hook + agency launcher spike | Pending |
 | 5 | SessionStart hook for prompt injection | Pending |
