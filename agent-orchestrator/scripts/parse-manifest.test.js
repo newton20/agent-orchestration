@@ -18,6 +18,7 @@ const {
   analyzeDeps,
   normalizePhases,
   statusPathFor,
+  runUpdate,
 } = require('./parse-manifest');
 
 function write(manifestObj) {
@@ -337,7 +338,10 @@ test('circular dependency: cycle detected, valid=false', () => {
   };
   const { cycle, order } = analyzeDeps(manifest.phases);
   assert.strictEqual(order, null);
-  assert.ok(cycle && cycle.length === 3);
+  // Cycle is a ring: first == last, three unique nodes in a 3-cycle.
+  assert.ok(cycle && cycle.length === 4);
+  assert.strictEqual(cycle[0], cycle[cycle.length - 1]);
+  assert.strictEqual(new Set(cycle).size, 3);
 
   const result = validate(manifest);
   assert.strictEqual(result.valid, false);
@@ -375,6 +379,178 @@ test('statusPathFor: sibling file with -status suffix', () => {
     statusPathFor('/a/b/sprint3.yml'),
     path.join('/a/b', 'sprint3-status.yaml')
   );
+});
+
+// -------------------- Required fields per the plan --------------------
+
+test('missing top-level name: specific error (plan requires name)', () => {
+  const manifest = {
+    phases: [
+      { id: 'p0', completion_signal: 's.md', agent: { role: 'impl' } },
+    ],
+  };
+  const result = validate(manifest);
+  assert.strictEqual(result.valid, false);
+  assert.ok(
+    result.errors.some(
+      (e) => e.path === 'name' && /missing required/.test(e.message)
+    )
+  );
+});
+
+test('empty string name: rejected', () => {
+  const manifest = {
+    name: '   ',
+    phases: [
+      { id: 'p0', completion_signal: 's.md', agent: { role: 'impl' } },
+    ],
+  };
+  const result = validate(manifest);
+  assert.strictEqual(result.valid, false);
+  assert.ok(result.errors.some((e) => e.path === 'name'));
+});
+
+test('missing agent.role (shorthand form): reports phases[i].agent.role', () => {
+  const manifest = {
+    name: 'noRole',
+    phases: [
+      { id: 'p0', completion_signal: 's.md', agent: { model: 'sonnet' } },
+    ],
+  };
+  const result = validate(manifest);
+  assert.strictEqual(result.valid, false);
+  assert.ok(
+    result.errors.some(
+      (e) =>
+        e.path === 'phases[0].agent.role' && /missing required/.test(e.message)
+    )
+  );
+});
+
+test('missing role on an agents[] entry: reports the indexed path', () => {
+  const manifest = {
+    name: 'noRole2',
+    phases: [
+      {
+        id: 'p0',
+        completion_signal: 's.md',
+        agents: [{ role: 'impl' }, { model: 'sonnet' }],
+      },
+    ],
+  };
+  const result = validate(manifest);
+  assert.strictEqual(result.valid, false);
+  assert.ok(
+    result.errors.some(
+      (e) =>
+        e.path === 'phases[0].agents[1].role' &&
+        /missing required/.test(e.message)
+    )
+  );
+});
+
+// -------------------- Cycle detection truthfulness --------------------
+
+test('cycle detection: returns the actual cycle path, not downstream residue', () => {
+  // a <-> b cycle, c depends on b (downstream but not in cycle)
+  const phases = [
+    { id: 'a', depends_on: ['b'], completion_signal: 'a.md', agent: { role: 'impl' } },
+    { id: 'b', depends_on: ['a'], completion_signal: 'b.md', agent: { role: 'impl' } },
+    { id: 'c', depends_on: ['b'], completion_signal: 'c.md', agent: { role: 'impl' } },
+  ];
+  const { cycle } = analyzeDeps(phases);
+  assert.ok(cycle && cycle.length >= 2, 'cycle should be non-trivial');
+  // c is downstream of the cycle but not part of it — must not appear
+  assert.ok(!cycle.includes('c'), 'cycle should not include non-cyclic downstream node');
+  // first and last of the cycle should be the same node (ring representation)
+  assert.strictEqual(cycle[0], cycle[cycle.length - 1]);
+});
+
+// -------------------- Update mode --------------------
+
+test('runUpdate: writes a new status file with the expected shape', () => {
+  const file = write({ ...validMinimal });
+  const result = runUpdate(file, 'phase-0', {
+    status: 'running',
+    pid: 12345,
+    started_at: '2026-04-18T12:00:00Z',
+  });
+  assert.strictEqual(result.ok, true, result.error);
+  const parsed = yaml.load(fs.readFileSync(result.status_file, 'utf8'));
+  assert.strictEqual(parsed.phases['phase-0'].status, 'running');
+  assert.strictEqual(parsed.phases['phase-0'].pid, 12345);
+  assert.strictEqual(parsed.phases['phase-0'].started_at, '2026-04-18T12:00:00Z');
+  assert.ok(parsed.updated_at, 'expected updated_at timestamp');
+});
+
+test('runUpdate: second call preserves prior fields', () => {
+  const file = write({ ...validMinimal });
+  runUpdate(file, 'phase-0', { status: 'running', pid: 111 });
+  const r2 = runUpdate(file, 'phase-0', { status: 'completed' });
+  assert.strictEqual(r2.ok, true);
+  const parsed = yaml.load(fs.readFileSync(r2.status_file, 'utf8'));
+  assert.strictEqual(parsed.phases['phase-0'].status, 'completed');
+  assert.strictEqual(parsed.phases['phase-0'].pid, 111, 'pid must survive second update');
+});
+
+test('runUpdate: preserves status entries for unrelated phases', () => {
+  const manifest = {
+    name: 'multi',
+    phases: [
+      { id: 'p0', completion_signal: 'p0.md', agent: { role: 'impl' } },
+      { id: 'p1', completion_signal: 'p1.md', agent: { role: 'impl' } },
+    ],
+  };
+  const file = write(manifest);
+  runUpdate(file, 'p0', { status: 'completed', pid: 100 });
+  const r = runUpdate(file, 'p1', { status: 'running', pid: 200 });
+  const parsed = yaml.load(fs.readFileSync(r.status_file, 'utf8'));
+  assert.strictEqual(parsed.phases.p0.status, 'completed');
+  assert.strictEqual(parsed.phases.p0.pid, 100);
+  assert.strictEqual(parsed.phases.p1.status, 'running');
+});
+
+test('runUpdate: unknown phase id rejected', () => {
+  const file = write({ ...validMinimal });
+  const r = runUpdate(file, 'no-such-phase', { status: 'running' });
+  assert.strictEqual(r.ok, false);
+  assert.match(r.error, /not found/);
+});
+
+test('runUpdate: invalid status value rejected', () => {
+  const file = write({ ...validMinimal });
+  const r = runUpdate(file, 'phase-0', { status: 'exploded' });
+  assert.strictEqual(r.ok, false);
+  assert.match(r.error, /status must be one of/);
+});
+
+test('runUpdate: __proto__ phase id rejected (prototype-pollution guard)', () => {
+  const manifest = {
+    name: 'x',
+    phases: [
+      { id: 'phase-0', completion_signal: 's.md', agent: { role: 'impl' } },
+    ],
+  };
+  const file = write(manifest);
+  const r = runUpdate(file, '__proto__', { status: 'running' });
+  assert.strictEqual(r.ok, false);
+  assert.match(r.error, /not safe as a YAML map key|not found/);
+});
+
+test('runUpdate: malformed manifest (phases as object, not array) refuses cleanly', () => {
+  const file = writeRaw('name: bad\nphases: {}\n');
+  const r = runUpdate(file, 'phase-0', { status: 'running' });
+  assert.strictEqual(r.ok, false);
+  assert.match(r.error, /manifest is invalid/);
+});
+
+test('runUpdate: corrupt status file surfaces as error, not a crash', () => {
+  const file = write({ ...validMinimal });
+  const statusPath = statusPathFor(file);
+  fs.writeFileSync(statusPath, '{not valid yaml: [');
+  const r = runUpdate(file, 'phase-0', { status: 'running' });
+  assert.strictEqual(r.ok, false);
+  assert.match(r.error, /corrupt status file/);
 });
 
 // -------------------- Integration: the plugin's own example --------------------
