@@ -177,10 +177,35 @@ function scaffoldProtocol({ manifestPath, pluginDir, dryRun = false }) {
         }
       } else if (a.type === 'copy') {
         if (a.skipIfExists && fs.existsSync(a.dst)) {
+          // Partial-copy recovery: a zero-byte destination is almost
+          // certainly a crashed prior run's half-write, not a user
+          // edit. Overwrite it. Anything larger is treated as
+          // intentional (user customization or a valid stub) and
+          // preserved.
+          const stats = fs.statSync(a.dst);
+          if (stats.size === 0) {
+            fs.copyFileSync(a.src, a.dst);
+            executed.push({ ...a, copied: true, recovered_empty_dst: true });
+            continue;
+          }
           executed.push({ ...a, skipped: true });
           continue;
         }
-        fs.copyFileSync(a.src, a.dst);
+        // Atomic write: copy to <dst>.tmp then rename. This prevents a
+        // mid-copy crash from leaving a truncated file in place.
+        const tmpDst = `${a.dst}.tmp-${process.pid}`;
+        try {
+          fs.copyFileSync(a.src, tmpDst);
+          fs.renameSync(tmpDst, a.dst);
+        } catch (e) {
+          // Best-effort cleanup of the tmp if the rename failed.
+          try {
+            fs.unlinkSync(tmpDst);
+          } catch (_) {
+            /* ignore */
+          }
+          throw e;
+        }
         executed.push({ ...a, copied: true });
       } else if (a.type === 'warning') {
         executed.push({ ...a });

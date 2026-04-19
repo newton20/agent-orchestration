@@ -72,6 +72,12 @@ const KNOWN_PHASE = new Set([
   'completion_signal',
 ]);
 
+// Phase ids must be safe as filesystem path segments AND YAML map keys.
+// Enforced by validate() so every downstream consumer (scaffold-protocol,
+// spawn-session, runUpdate, future orchestrator) gets the guarantee.
+const VALID_ID_RE = /^[A-Za-z0-9._-]+$/;
+const UNSAFE_ID_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
+
 // -------------------- CLI entry --------------------
 
 function printHelp() {
@@ -282,6 +288,18 @@ function validate(manifest) {
     }
     if (!p.id || typeof p.id !== 'string' || p.id.trim() === '')
       push(`${p_}.id`, 'missing required field `id` (non-empty string)');
+    else if (!VALID_ID_RE.test(p.id))
+      push(
+        `${p_}.id`,
+        `phase id "${p.id}" is not safe as a filesystem/YAML identifier — ` +
+          `use [A-Za-z0-9._-]+ (no path separators, whitespace, or traversal)`
+      );
+    else if (UNSAFE_ID_KEYS.has(p.id))
+      push(
+        `${p_}.id`,
+        `phase id "${p.id}" is a reserved JavaScript property name — ` +
+          `avoid __proto__ / prototype / constructor`
+      );
     else if (seenIds.has(p.id)) push(`${p_}.id`, `duplicate phase id "${p.id}"`);
     else seenIds.add(p.id);
 
@@ -588,11 +606,10 @@ function statusPathFor(manifestPath) {
   return path.join(dir, `${base}-status.yaml`);
 }
 
-// Block JS object-key injection. Phase IDs must not be internal object
-// property names that would mutate the prototype chain when used as a
-// map key. A valid phase id is [A-Za-z0-9._-]+ anyway.
-const UNSAFE_ID_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
-const VALID_ID_RE = /^[A-Za-z0-9._-]+$/;
+// Phase-id validation (VALID_ID_RE / UNSAFE_ID_KEYS) is declared near
+// the top of this file and enforced by validate(). runUpdate still checks
+// the provided phaseId independently because the caller passes it on the
+// command line, bypassing the manifest validator.
 
 /**
  * Testable update entry point. Returns { ok: true, status_file, phase,

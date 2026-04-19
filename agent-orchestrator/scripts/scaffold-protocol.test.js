@@ -299,6 +299,98 @@ test('missing manifest file: clean error', () => {
   assert.match(result.error, /not found/);
 });
 
+// -------------------- Path safety --------------------
+
+test('hostile phase.id ("../../outside") is rejected by validation, writes nothing', () => {
+  const fx = makeFixture({
+    manifest: {
+      name: 'hostile',
+      phases: [
+        {
+          id: '../../outside',
+          completion_signal: 'signals/a.md',
+          agent: { role: 'impl' },
+        },
+      ],
+    },
+  });
+  const result = scaffoldProtocol({
+    manifestPath: fx.manifestPath,
+    pluginDir: fx.pluginDir,
+  });
+  assert.strictEqual(result.ok, false);
+  assert.ok(
+    result.errors.some(
+      (e) =>
+        e.path === 'phases[0].id' &&
+        /not safe as a filesystem/.test(e.message)
+    )
+  );
+  // And nothing was written outside phases/:
+  assert.ok(!fs.existsSync(path.join(fx.root, '..', 'outside')));
+  assert.ok(!fs.existsSync(path.join(fx.protoDir, 'phases')));
+});
+
+test('phase id with backslash / forward slash / whitespace all rejected', () => {
+  for (const id of ['with/slash', 'with\\backslash', 'with space', 'with:colon', '']) {
+    const fx = makeFixture({
+      manifest: {
+        name: `bad-${Math.random()}`,
+        phases: [
+          { id, completion_signal: 'sig.md', agent: { role: 'impl' } },
+        ],
+      },
+    });
+    const result = scaffoldProtocol({
+      manifestPath: fx.manifestPath,
+      pluginDir: fx.pluginDir,
+    });
+    assert.strictEqual(result.ok, false, `expected "${id}" to be rejected`);
+  }
+});
+
+// -------------------- Partial-copy recovery --------------------
+
+test('zero-byte existing template copy is recovered (not preserved as "user edit")', () => {
+  const fx = makeFixture({
+    manifest: threePhaseManifest,
+    templates: ['protocol-header.md'],
+  });
+  scaffoldProtocol({
+    manifestPath: fx.manifestPath,
+    pluginDir: fx.pluginDir,
+  });
+
+  // Simulate a prior-run crash mid-copy: destination exists but is empty.
+  const dstTemplate = path.join(fx.protoDir, 'templates', 'protocol-header.md');
+  fs.writeFileSync(dstTemplate, '');
+  assert.strictEqual(fs.statSync(dstTemplate).size, 0);
+
+  const result2 = scaffoldProtocol({
+    manifestPath: fx.manifestPath,
+    pluginDir: fx.pluginDir,
+  });
+  assert.strictEqual(result2.ok, true);
+  // Zero-byte file was recovered by re-copy, not skipped-as-user-edit.
+  assert.ok(fs.statSync(dstTemplate).size > 0);
+});
+
+test('no stale .tmp files after successful copy', () => {
+  const fx = makeFixture({
+    manifest: threePhaseManifest,
+    templates: ['protocol-header.md', 'impl-prompt.md'],
+  });
+  scaffoldProtocol({
+    manifestPath: fx.manifestPath,
+    pluginDir: fx.pluginDir,
+  });
+  const templatesDir = path.join(fx.protoDir, 'templates');
+  const leftoverTmps = fs
+    .readdirSync(templatesDir)
+    .filter((f) => f.includes('.tmp'));
+  assert.strictEqual(leftoverTmps.length, 0, leftoverTmps.join(','));
+});
+
 // -------------------- Integration with Unit 1 plugin --------------------
 
 test("consumes the plugin's own schema/manifest-example.yaml (integration)", () => {
