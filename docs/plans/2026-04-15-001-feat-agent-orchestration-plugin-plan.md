@@ -876,3 +876,38 @@ template file.
 
 **No fundamental revisions required.** All findings are implementation-
 detail tuning for later units.
+
+## PR #2 QA Validation (2026-04-19)
+
+Third empirical validation: QA session spawned via `session-handoff
+assign qa` ran a full E2E test of PR #2 (Unit 3 — file-protocol
+scaffolding). Four scenarios, all PASS, zero source modifications,
+zero real Claude token burn (QA used a `cmd /c echo qa-placeholder`
+launcher override and simulated signals via `New-Item -Force`).
+
+**Highlights:**
+- Scaffolder works against manifests outside the plugin's own tree.
+- Idempotency verified end-to-end: user artifacts + event log +
+  user-edited template copies all survive reruns.
+- Scaffolder + Unit 0 prototype coexist cleanly.
+- Hostile phase ids (`../../escape`, `__proto__`) rejected at
+  validation time, before any filesystem write. Path-traversal guard
+  works as designed.
+
+**New finding (prototype DX):**
+- **Prototype CLI should accept `--default-timeout-minutes`.** QA's
+  initial run polled for 60 minutes when signal-touching missed the
+  window. Manifests should set per-phase `timeout_minutes`, but the
+  prototype's 60-min default is not configurable without editing the
+  file. Low-effort drive-by improvement; Unit 11 supersedes with
+  better defaults.
+
+**Dogfood-of-dogfood signal:**
+- The QA session was itself kicked off via a `session-handoff assign
+  qa -- <4 scenarios>` invocation. Report came back in exactly the
+  expected shape (PR comment + local file). First real-world QA
+  coordination via session-handoff — V1 design works.
+- Structured `[warning: ... -- ... -- ...]` propagation was
+  round-trip clean: warnings emitted by session-handoff (unknown-
+  token, missing CLAUDE.md, missing checkpoint) surfaced in the
+  returning coord briefing unchanged.
