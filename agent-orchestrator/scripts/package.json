@@ -1,0 +1,18 @@
+{
+  "name": "agent-orchestrator-scripts",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Node.js scripts consumed by the agent-orchestrator plugin: manifest parser/validator, session spawner, prompt generator, health checker, orchestrator event loop.",
+  "bin": {
+    "parse-manifest": "./parse-manifest.js"
+  },
+  "scripts": {
+    "test": "node --test parse-manifest.test.js"
+  },
+  "dependencies": {
+    "js-yaml": "^4.1.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

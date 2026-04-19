@@ -115,12 +115,24 @@ phases:
 
 # ---- Validation rules (enforced by Unit 2's parse-manifest.js) -------
 #
+# Authoritative implementation: ../scripts/parse-manifest.js
+# Run `node scripts/parse-manifest.js <manifest.yaml>` for full validation.
+# Run the test suite: `cd agent-orchestrator/scripts && npm test`.
+#
+# Summary of rules:
 # - `phases[]` must be non-empty.
-# - Every `phase.id` must be unique (V1; prototype only checks presence).
-# - Every `phase.completion_signal` must be non-empty.
+# - Every `phase.id` is required, non-empty, and unique across phases.
+# - Every `phase.completion_signal` is required (non-empty path string).
+# - Every phase must define either `agent` (shorthand) or `agents` (list).
+#   If both are present, `agents` wins and a warning is emitted.
 # - Every `depends_on` reference must resolve to an existing `phase.id`.
-# - The `depends_on` graph must be acyclic.
-# - `launcher.shell` must be `powershell` or `cmd`.
-# - `timeout_minutes` must be a positive integer.
-# - Unknown top-level fields produce a warning, not an error, so future
-#   V1+ fields don't break older manifests.
+# - The `depends_on` graph must be acyclic (topological sort succeeds).
+# - `launcher.shell` must be `powershell` or `cmd` — any other value errors.
+# - `launcher.binary` must be a non-empty string if present.
+# - `launcher.passthrough_flags` must be an array of strings if present.
+# - `timeout_minutes`, `defaults.phase_timeout_minutes`,
+#   `defaults.heartbeat_timeout_minutes`, and
+#   `review_loop.max_iterations` must be positive integers if present.
+# - `defaults.notifications.enabled` must be a boolean if present.
+# - Unknown top-level / launcher / defaults / phase fields produce a
+#   warning, not an error — future V1+ fields don't break older manifests.
