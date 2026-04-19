@@ -779,3 +779,100 @@ Codex `review` pass on the initial commit surfaced 2 P1 and 5 P2 findings. Addre
 - **P2:** Manifest reference stopped claiming prototype enforces `phase.id` uniqueness (it only checks presence). Corrected `title` docs (runtime title is `orch-<id>-<role> — <title>`, not `id`).
 - **P2:** Top-level README opening paragraph no longer describes review loops, crash recovery, and notifications as present — it names the current shipped scope explicitly (Unit 0 only).
 - **P2 (this section):** Findings above are now split into "Prototype-validated" vs "Empirical run observations" so the reader can tell which claims are anchored in the Unit 0 code and which are from the real-world test run.
+
+## Track B Dogfood Findings — session-handoff Units 3–5 (2026-04-19)
+
+Second orchestration run on the same `claude-skills` session-handoff plan,
+this time Units 3–5. Ran in parallel with Track A Unit 2 (plugin-side
+manifest parser). All three phases completed unsupervised — one paste
+per phase for kickoff, then zero intervention until "Orchestration
+finished."
+
+**Execution summary:** Phase 2 (Unit 3) = 6m 00s, Phase 3 (Unit 4) = 9m 01s,
+Phase 4 (Unit 5) = 5m 30s. Total 20m 31s for three phases. Faster per-phase
+than the 2-phase Units-1+2 run (avg 6.8 min vs 9.8 min) — plausibly because
+later phases had narrower scope with clearer inputs from predecessor signal
+files, not because agents were "faster."
+
+**Deliverables verified by file inspection:**
+- `skills/session-handoff/SKILL.md` grew from 482 to 1178 lines with
+  complete Phase 3 (Sanitize), Auto-cleanup, Phase 4 (Assemble, 4a–4i),
+  Phase 5 (Output, 5.1–5.7), Quick Start, Prerequisites, and Example
+  Output sections. Phase ordering in the file: HARD GATE → Quick Start
+  → Prerequisites → Pre-resolved context → Preamble → Auto-cleanup →
+  Phase 1 → Phase 2 → Phase 3 → Phase 4 → Phase 5 → Source precedence →
+  Finalize → Important rules → Example Output.
+- `references/sanitization-patterns.md` grew from 3 to 184 lines with
+  4 labeled regex categories + fallback contract + out-of-scope section.
+- `references/message-templates.md` unchanged from Unit 2 (Phase 3 and
+  later correctly respected it as consumer-only).
+
+**Scope discipline held across all three phases.** Phase 2 (Unit 3) did
+not touch `references/message-templates.md`. Phase 3 (Unit 4) did not
+touch either `references/` file. Phase 4 (Unit 5) did not touch any
+`references/` file and did not modify any Phase section of SKILL.md —
+only added the three documentation blocks as instructed.
+
+**Dogfood of Unit 1's `protocol-header.md`.** Agents were given the
+structured completion-signal schema (`schema_version`, `files_modified`,
+`files_deliberately_not_modified`, `design_calls_next_phase_should_know`,
+`blockers`, `verification_performed`) in their prompts and produced
+clean, parseable handoffs that each built on the predecessor's design
+calls. This validates the schema design before Unit 6 ships the
+template file.
+
+### Findings to fold into Units 6–11
+
+1. **Scope-prompts can silence forward-propagated instructions from prior
+   phases.** Phase 3's handoff flagged "HARD GATE + Important rules have
+   stale 'Unit 4 pending' parentheticals — Unit 5 should fix." The
+   Phase-4-unit5 prompt I authored constrained Unit 5 to "only adding"
+   the three new blocks. The agent correctly noted the tension and
+   deferred the polish, but the forward-instruction from Phase 3 was
+   silently unenforced. **Action:** Unit 7 (`generate-prompt.js`) must
+   read predecessor signals' "Design calls the next phase should know
+   about" sections and merge relevant items into the current phase's
+   scope before writing the prompt. Otherwise prompts are de-facto
+   isolation and agents respect the strict prompt over the handoff.
+
+2. **Phase completion times are much shorter than plan defaults suggest.**
+   Six phases across both tracks averaged 8.5 min; none exceeded 10 min.
+   The current plan sets `defaults.phase_timeout_minutes = 120` and the
+   example manifest uses `timeout_minutes: 120`. That's a 14x safety
+   margin. **Action:** Unit 11 should default to 30-minute phase timeouts
+   with an explicit per-phase override path. Unit 8's health-checker
+   should treat "no signal within 2x typical completion time" as a
+   stronger hung-agent signal than the crude timeout alone. Collect
+   more data: as more phases run, write per-phase typical-completion
+   times to a `phase-timings.jsonl` log so Unit 11 can auto-tune.
+
+3. **Structured handoff-notes carry dense, load-bearing coordination.**
+   Phase 3's `Design calls Phase 4 should know about` section alone was
+   ~35 lines covering six distinct contracts (pipeline ordering,
+   provenance tracking, warning shape, output-tier sanitization,
+   protected zones, category ordering). Phase 4's equivalent section was
+   similar density. This is real inter-agent contract negotiation, not
+   filler. **Action:** Unit 6's `protocol-header.md` schema should keep
+   this section open-ended (no line cap) but add a soft heuristic: if a
+   phase's Design-calls section exceeds ~50 lines, the prompt likely
+   under-specified scope — worth surfacing as a diagnostic.
+
+4. **Poll-cadence detection lag is consistently tiny.** Each phase
+   advanced within 30s of the signal write — often the same poll tick.
+   Unit 0 finding #8 (30s cadence adequate) holds for 5 out of 5 phases
+   across both runs. Confident to keep 30s–2min as the configurable
+   range for Unit 11, with 30s as the default for phases under
+   ~15 min and 2min for long-running phases.
+
+5. **The structured handoff schema is doing real work.** Agents produce
+   richer coordination artifacts when given a schema than they did with
+   the freeform "anything the next phase needs" wording in the Units-1+2
+   run. Compare: Unit-2's handoff from the first run was ~40 lines of
+   prose design notes; Unit 3's handoff was 50+ lines of structured
+   design-calls organized by topic. **Action:** Unit 6 should ship the
+   `protocol-header.md` template as the authoritative handoff spec and
+   Unit 7 should enforce it in generated prompts — do not regress to
+   freeform wording.
+
+**No fundamental revisions required.** All findings are implementation-
+detail tuning for later units.
