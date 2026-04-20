@@ -302,7 +302,18 @@ function buildSpawnCommand({
     shellPart = `powershell ${preflags} "${innerCmd}"`;
   } else {
     const preflags = shell_args || '/k';
-    shellPart = `cmd ${preflags} ${innerCmd}`;
+    // cmd /k has a well-known quote-stripping quirk: `cmd /k "foo.exe"
+    // --bar` strips the quotes around foo.exe (cmd's "special-case 1"
+    // fails for executables-with-spaces-then-args because there are
+    // more than two quote chars on the command line, so it falls back
+    // to stripping the first+last quote). Wrapping the ENTIRE inner
+    // command in outer double-quotes makes cmd strip those outermost
+    // quotes and preserve any inner quoted executable path verbatim.
+    // Codex P2: without this, `cmd /k "C:\Program Files\..." --foo`
+    // tries to run C:\Program instead. With the wrap, cmd receives
+    // `"C:\Program Files\..." --foo` after strip — which tokenizes
+    // correctly. The wrap is a no-op for the space-free case.
+    shellPart = `cmd ${preflags} "${innerCmd}"`;
   }
 
   // wt args: always double-quote path/title values so users with spaces

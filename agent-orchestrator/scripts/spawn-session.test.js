@@ -45,10 +45,13 @@ test('default launcher: cmd /k claude command shape', () => {
   assert.match(command, /--suppressApplicationTitle/);
   assert.match(command, /--title "orch-phase-0-impl"/);
   assert.match(command, /--startingDirectory "C:\\projects\\test"/);
-  assert.match(command, /cmd \/k claude --permission-mode auto/);
+  assert.match(command, /cmd \/k "claude --permission-mode auto /);
   assert.match(command, /--name orch-phase-0-impl/);
   assert.match(command, /--model sonnet/);
   assert.match(command, /--plugin-dir "C:\\plugins\\agent-orchestrator"/);
+  // The inner command is wrapped in outer double-quotes so cmd's /k
+  // quote-stripping preserves any "quoted executable path" verbatim.
+  assert.ok(command.endsWith('"'), `expected trailing " for cmd /k wrap: ${command}`);
 });
 
 test('agency launcher: powershell -NoExit -Command "agency claude ..."', () => {
@@ -488,10 +491,12 @@ test('buildSpawnCommand: path-with-spaces binary launches correctly (cmd)', () =
       shell_args: '/k',
     },
   });
-  // Binary itself is quoted so cmd runs the full path, not "C:\Program".
+  // Binary itself is quoted AND the entire inner command is wrapped in
+  // outer double-quotes so cmd's /k quote-stripping leaves the binary
+  // path's quotes intact (codex P2 round 5).
   assert.match(
     command,
-    /cmd \/k "C:\\Program Files\\Claude\\claude\.exe" --name orch-a/
+    /cmd \/k ""C:\\Program Files\\Claude\\claude\.exe" --name orch-a/
   );
 });
 
