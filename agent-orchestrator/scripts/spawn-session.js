@@ -360,7 +360,15 @@ function parseTasklistCsv(stdout, name) {
     const pidRaw = cols[1];
     const titleCol = cols[cols.length - 1];
     if (!pidRaw || !/^\d+$/.test(pidRaw)) continue;
-    if (typeof titleCol === 'string' && titleCol.startsWith(name)) {
+    // Strict boundary: exact match OR `name + ' '` (the next char must
+    // be whitespace). A naive prefix match confuses `orch-phase-1-impl`
+    // with `orch-phase-10-impl` (codex P2). Our own titles are always
+    // either `name` or `name — <suffix>` (which starts `name ` with a
+    // space before the em-dash), so this condition holds.
+    if (
+      typeof titleCol === 'string' &&
+      (titleCol === name || titleCol.startsWith(name + ' '))
+    ) {
       return parseInt(pidRaw, 10);
     }
   }

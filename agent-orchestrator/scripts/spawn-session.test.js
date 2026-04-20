@@ -339,6 +339,23 @@ test('parseTasklistCsv: empty / non-matching input returns null', () => {
   assert.strictEqual(parseTasklistCsv(null, 'orch-a'), null);
 });
 
+// Codex P2 round 4: naive prefix match confuses `orch-phase-1-impl`
+// with `orch-phase-10-impl`. Boundary must be exact or `name + ' '`.
+test('parseTasklistCsv: rejects near-prefix collisions (codex P2)', () => {
+  const stdout = [
+    '"cmd.exe","10000","Console","1","5,000 K","Running","u","0:00:01","orch-phase-10-impl — Ten"',
+    '"cmd.exe","10001","Console","1","5,000 K","Running","u","0:00:01","orch-phase-1-impl — One"',
+  ].join('\r\n');
+  assert.strictEqual(parseTasklistCsv(stdout, 'orch-phase-1-impl'), 10001);
+  assert.strictEqual(parseTasklistCsv(stdout, 'orch-phase-10-impl'), 10000);
+});
+
+test('parseTasklistCsv: exact-title match succeeds (no suffix)', () => {
+  const stdout =
+    '"cmd.exe","7777","Console","1","5,000 K","Running","u","0:00:01","orch-a"\r\n';
+  assert.strictEqual(parseTasklistCsv(stdout, 'orch-a'), 7777);
+});
+
 test('parseTasklistCsv: ignores rows without numeric PIDs', () => {
   const stdout =
     '"cmd.exe","PID","Console","1","-","Running","user","-","orch-header-row"\r\n' +
