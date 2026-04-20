@@ -161,6 +161,41 @@ function quoteBinary(binary, shell) {
   return `"${binary.replace(/"/g, '""')}"`;
 }
 
+// Tokenize a `shell_args` string into argv elements, preserving
+// double-quoted segments (including embedded whitespace). Used for the
+// argv-form passed to execFileSync; the display-form `command` string
+// leaves shell_args inline and relies on the user's original quoting.
+// Codex P2 round 11: a naive split(/\s+/) dropped the quotes from
+// configs like `-NoExit -File "C:\Program Files\wrapper.ps1"`, so the
+// wrapper-script path got split at the space and the launch failed.
+function tokenizeShellArgs(s) {
+  if (!s || typeof s !== 'string') return [];
+  const tokens = [];
+  let cur = '';
+  let inQuote = false;
+  let consumed = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '"') {
+      inQuote = !inQuote;
+      consumed = true; // empty quoted region still produces a token
+      continue;
+    }
+    if (!inQuote && /\s/.test(c)) {
+      if (consumed || cur !== '') {
+        tokens.push(cur);
+        cur = '';
+        consumed = false;
+      }
+      continue;
+    }
+    cur += c;
+    consumed = true;
+  }
+  if (consumed || cur !== '') tokens.push(cur);
+  return tokens;
+}
+
 // -------------------- Launcher resolution --------------------
 
 /**
@@ -331,10 +366,10 @@ function buildSpawnCommand({
   // values arrive at cmd /k or powershell -Command intact.
   let shellArgv;
   if (shell === 'powershell') {
-    const preflags = (shell_args || '-NoExit -Command').split(/\s+/);
+    const preflags = tokenizeShellArgs(shell_args || '-NoExit -Command');
     shellArgv = ['powershell', ...preflags, innerCmd];
   } else {
-    const preflags = (shell_args || '/k').split(/\s+/);
+    const preflags = tokenizeShellArgs(shell_args || '/k');
     shellArgv = ['cmd', ...preflags, innerCmd];
   }
 
@@ -704,6 +739,7 @@ module.exports = {
   loadLauncherFromManifest,
   buildPidLookupArgs,
   parsePidLookupOutput,
+  tokenizeShellArgs,
   quoteCmd,
   quoteCmdAlways,
   quotePs,

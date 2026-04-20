@@ -24,6 +24,7 @@ const {
   loadLauncherFromManifest,
   buildPidLookupArgs,
   parsePidLookupOutput,
+  tokenizeShellArgs,
   quoteCmd,
   quotePs,
   quoteBinary,
@@ -623,6 +624,61 @@ test('quoteBinary: exe subcommand form without path-spaces stays verbatim', () =
   const b = 'claude.exe --foo';
   assert.strictEqual(quoteBinary(b, 'cmd'), b);
   assert.strictEqual(quoteBinary(b, 'powershell'), b);
+});
+
+// -------------------- tokenizeShellArgs (codex P2 round 11) --------------------
+
+test('tokenizeShellArgs: simple whitespace split', () => {
+  assert.deepStrictEqual(tokenizeShellArgs('-NoExit -Command'), [
+    '-NoExit',
+    '-Command',
+  ]);
+  assert.deepStrictEqual(tokenizeShellArgs('/k'), ['/k']);
+  assert.deepStrictEqual(tokenizeShellArgs(''), []);
+  assert.deepStrictEqual(tokenizeShellArgs(null), []);
+});
+
+test('tokenizeShellArgs: preserves quoted path with spaces (codex P2 round 11)', () => {
+  // Without quote-aware tokenizing, -File "C:\Program Files\..." would
+  // split at the first space inside the path and land the wrapper
+  // script under a nonexistent path. Quotes are stripped in the output
+  // so Node's CreateProcess serializer re-quotes cleanly.
+  assert.deepStrictEqual(
+    tokenizeShellArgs('-NoExit -File "C:\\Program Files\\wrapper.ps1"'),
+    ['-NoExit', '-File', 'C:\\Program Files\\wrapper.ps1']
+  );
+});
+
+test('tokenizeShellArgs: empty quoted segment produces an empty token', () => {
+  // For completeness: `-Command ""` should keep the empty argument.
+  assert.deepStrictEqual(tokenizeShellArgs('-Command ""'), ['-Command', '']);
+});
+
+test('tokenizeShellArgs: multiple consecutive spaces collapse', () => {
+  assert.deepStrictEqual(tokenizeShellArgs('  -a   -b  '), ['-a', '-b']);
+});
+
+test('buildSpawnCommand: quoted path in shell_args survives into argv (codex P2 round 11)', () => {
+  const { argv } = buildSpawnCommand({
+    name: 'orch-a',
+    workdir: 'C:\\w',
+    launcher: {
+      shell: 'powershell',
+      binary: 'pwsh',
+      auto_mode_flag: '',
+      shell_args: '-NoExit -File "C:\\Program Files\\wrapper.ps1"',
+    },
+  });
+  // Find the shell-wrapper portion: 'powershell', '-NoExit', '-File',
+  // 'C:\\Program Files\\wrapper.ps1', innerCmd.
+  const psIdx = argv.indexOf('powershell');
+  assert.ok(psIdx >= 0);
+  assert.deepStrictEqual(argv.slice(psIdx, psIdx + 4), [
+    'powershell',
+    '-NoExit',
+    '-File',
+    'C:\\Program Files\\wrapper.ps1',
+  ]);
 });
 
 test('buildSpawnCommand: path-with-spaces binary launches correctly (cmd)', () => {
