@@ -120,17 +120,38 @@ function quotePsAlways(value) {
   return `'${s.replace(/'/g, "''")}'`;
 }
 
-// `launcher.binary` is a dual-purpose field: it might be a bare command
-// ("claude"), a "program + arg" string ("agency claude"), or an absolute
-// executable path that may contain spaces ("C:\Program Files\Claude\claude.exe").
-// If we unconditionally quote, "agency claude" becomes a single token the
-// shell can't find. If we never quote, "C:\Program Files\..." splits at the
-// first space. Heuristic: only quote when the string contains a path
-// separator AND whitespace — the telltale of case 3. For PowerShell we
-// also prefix the call operator (`& 'path'`) so the quoted path is
-// executed rather than emitted as a string literal.
+// `launcher.binary` is a multi-purpose field. The shapes we handle:
+//
+//   1. bare command                  "claude"
+//   2. program + subcommand          "agency claude"
+//   3. exe path, no spaces           "C:\tools\claude.exe"
+//   4. exe path with spaces          "C:\Program Files\Claude\claude.exe"
+//   5. exe path with spaces + sub    "C:\Program Files\Agency\agency.exe claude"
+//                                    (codex P2 round 10 — quote exe only)
+//
+// Strategy: if the string matches /^(.+\.exe)\s+(.+)$/i (case 5), split
+// at the .exe boundary — quote the exe part (which may have spaces) and
+// pass the subcommand through verbatim. Otherwise apply the simpler
+// heuristic: quote only when the whole string is BOTH path-like AND has
+// whitespace (case 4). Bare / "prog + sub" / no-space-path stay verbatim.
+// PowerShell uses the call operator (`& 'path'`) so a quoted path
+// actually executes instead of being emitted as a string literal.
 function quoteBinary(binary, shell) {
   if (typeof binary !== 'string' || binary === '') return binary;
+  const exeSplit = binary.match(/^(.+\.exe)\s+(.+)$/i);
+  if (exeSplit) {
+    const exePart = exeSplit[1];
+    const subPart = exeSplit[2];
+    // Still only quote the exe if it's path-like-with-space (case 5).
+    // If the exe is bare (`claude.exe command`, no path separator), skip
+    // the quote to keep output clean.
+    const exeNeedsQuote = /[\\/]/.test(exePart) && /\s/.test(exePart);
+    if (!exeNeedsQuote) return binary;
+    if (shell === 'powershell') {
+      return `& '${exePart.replace(/'/g, "''")}' ${subPart}`;
+    }
+    return `"${exePart.replace(/"/g, '""')}" ${subPart}`;
+  }
   const hasPathSep = /[\\/]/.test(binary);
   const hasSpace = /\s/.test(binary);
   if (!(hasPathSep && hasSpace)) return binary;
@@ -413,6 +434,23 @@ function escapeRegex(s) {
  * both carry the --name flag); the first is fine because either dying
  * indicates session loss.
  */
+// Heuristic: is the process a shell-wrapper that should NOT be treated
+// as the session's primary PID? The bundled launchers intentionally keep
+// cmd /k and powershell open after Claude exits so the user can inspect
+// output post-mortem. If Unit 8's health check watches the wrapper's
+// PID, it'll report the agent alive forever. Codex P1 round 10.
+// We detect by looking at the first token of the CommandLine (with or
+// without a .exe suffix, case-insensitive).
+const SHELL_WRAPPERS = new Set(['cmd', 'cmd.exe', 'powershell', 'powershell.exe']);
+
+function isShellWrapperCmdline(cmdline) {
+  if (typeof cmdline !== 'string') return false;
+  const first = cmdline.trim().split(/\s+/)[0] || '';
+  // Strip any leading quote and any path prefix, lowercase, and compare.
+  const bare = first.replace(/^"/, '').replace(/^.*[\\/]/, '').toLowerCase();
+  return SHELL_WRAPPERS.has(bare);
+}
+
 function parsePidLookupOutput(stdout, name) {
   if (typeof stdout !== 'string' || stdout.trim() === '') return null;
   if (!name || typeof name !== 'string') return null;
@@ -425,14 +463,21 @@ function parsePidLookupOutput(stdout, name) {
   if (parsed === null || parsed === undefined) return null;
   const rows = Array.isArray(parsed) ? parsed : [parsed];
   const re = new RegExp(`(?:^|\\s)--name\\s+${escapeRegex(name)}(?=\\s|$)`);
+
+  // Two-pass: prefer non-wrapper matches (the claude / agency binary)
+  // so Unit 8's health check watches something that actually dies when
+  // Claude exits. Fall back to any match if only the wrapper is visible.
+  let wrapperPid = null;
   for (const row of rows) {
     const pid = Number(row && row.ProcessId);
     const cmdline = row && row.CommandLine;
     if (!Number.isInteger(pid)) continue;
     if (typeof cmdline !== 'string') continue;
-    if (re.test(cmdline)) return pid;
+    if (!re.test(cmdline)) continue;
+    if (!isShellWrapperCmdline(cmdline)) return pid;
+    if (wrapperPid === null) wrapperPid = pid;
   }
-  return null;
+  return wrapperPid;
 }
 
 /**

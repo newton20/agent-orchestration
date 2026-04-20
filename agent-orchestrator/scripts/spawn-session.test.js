@@ -423,9 +423,42 @@ test('parsePidLookupOutput: underscore in name (SQL LIKE wildcard) matches exact
   assert.strictEqual(parsePidLookupOutput(stdout, 'orch-a_impl'), 8001);
 });
 
-test('parsePidLookupOutput: returns first matching PID when multiple (wrapper + child)', () => {
+test('parsePidLookupOutput: prefers non-shell-wrapper over wrapper (codex P1 round 10)', () => {
+  // cmd /k and powershell -NoExit outlive Claude on purpose (keeps the
+  // tab open post-exit). Tracking the wrapper PID would make Unit 8
+  // report the agent alive forever after /exit or a crash.
+  const stdout = JSON.stringify([
+    { ProcessId: 1111, CommandLine: 'cmd /k claude --name orch-a --model sonnet' },
+    { ProcessId: 2222, CommandLine: 'claude.exe --name orch-a --model sonnet' },
+  ]);
+  assert.strictEqual(parsePidLookupOutput(stdout, 'orch-a'), 2222);
+});
+
+test('parsePidLookupOutput: skips powershell wrapper in favor of agency/claude child', () => {
+  const stdout = JSON.stringify([
+    {
+      ProcessId: 3333,
+      CommandLine:
+        'powershell -NoExit -Command "agency claude --enable-auto-mode --name orch-a"',
+    },
+    { ProcessId: 4444, CommandLine: 'agency.exe claude --name orch-a' },
+  ]);
+  assert.strictEqual(parsePidLookupOutput(stdout, 'orch-a'), 4444);
+});
+
+test('parsePidLookupOutput: falls back to wrapper PID if no child visible yet', () => {
+  // During spawn window, only the wrapper may be up. Better to return
+  // SOMETHING than null so the orchestrator can retry later.
+  const stdout = JSON.stringify([
+    { ProcessId: 5555, CommandLine: 'cmd /k claude --name orch-a --model sonnet' },
+  ]);
+  assert.strictEqual(parsePidLookupOutput(stdout, 'orch-a'), 5555);
+});
+
+test('parsePidLookupOutput: returns first non-wrapper PID when multiple children (agency wrapper + claude)', () => {
   // The agency wrapper's process and the claude child process both carry
-  // --name on their CommandLine. Either dying = session loss.
+  // --name on their CommandLine. Both count as non-shell-wrappers; the
+  // first wins. Either dying = session loss.
   const stdout = JSON.stringify([
     { ProcessId: 1111, CommandLine: 'agency claude --name orch-a --model sonnet' },
     { ProcessId: 2222, CommandLine: 'claude.exe --name orch-a --model sonnet' },
@@ -565,6 +598,31 @@ test('quoteBinary: path without spaces unquoted', () => {
   const p = 'C:\\tools\\claude.exe';
   assert.strictEqual(quoteBinary(p, 'cmd'), p);
   assert.strictEqual(quoteBinary(p, 'powershell'), p);
+});
+
+// Codex P2 round 10: `binary: "C:\Program Files\Agency\agency.exe claude"`
+// — path with spaces PLUS a subcommand. Quote only the exe portion.
+test('quoteBinary: path-with-spaces + subcommand splits at .exe (cmd)', () => {
+  const b = 'C:\\Program Files\\Agency\\agency.exe claude';
+  assert.strictEqual(
+    quoteBinary(b, 'cmd'),
+    '"C:\\Program Files\\Agency\\agency.exe" claude'
+  );
+});
+
+test('quoteBinary: path-with-spaces + subcommand splits at .exe (powershell)', () => {
+  const b = 'C:\\Program Files\\Agency\\agency.exe claude';
+  assert.strictEqual(
+    quoteBinary(b, 'powershell'),
+    "& 'C:\\Program Files\\Agency\\agency.exe' claude"
+  );
+});
+
+test('quoteBinary: exe subcommand form without path-spaces stays verbatim', () => {
+  // `claude.exe --foo` — no path separator, no meaningful quoting needed.
+  const b = 'claude.exe --foo';
+  assert.strictEqual(quoteBinary(b, 'cmd'), b);
+  assert.strictEqual(quoteBinary(b, 'powershell'), b);
 });
 
 test('buildSpawnCommand: path-with-spaces binary launches correctly (cmd)', () => {
