@@ -276,25 +276,62 @@ test('buildSpawnCommand: omits --model and --plugin-dir when not provided', () =
 
 // -------------------- spawnSession: full wiring via injected runner --------------------
 
-test('spawnSession: invokes runner with built command, returns metadata', () => {
+test('spawnSession: invokes runner with (program, argv), returns metadata', () => {
   const calls = [];
   const result = spawnSession({
     name: 'orch-phase-0-impl',
     workdir: 'C:\\work',
     model: 'sonnet',
-    _runner: (cmd) => {
-      calls.push(cmd);
+    _runner: (program, argv) => {
+      calls.push({ program, argv });
     },
     _tasklistRunner: () => '',
     _now: () => '2026-04-20T12:00:00.000Z',
   });
   assert.strictEqual(calls.length, 1);
-  assert.match(calls[0], /^wt -w 0 new-tab /);
+  assert.strictEqual(calls[0].program, 'wt');
+  assert.ok(Array.isArray(calls[0].argv));
+  assert.strictEqual(calls[0].argv[0], '-w');
+  assert.strictEqual(calls[0].argv[1], '0');
+  assert.strictEqual(calls[0].argv[2], 'new-tab');
   assert.strictEqual(result.sessionName, 'orch-phase-0-impl');
   assert.strictEqual(result.title, 'orch-phase-0-impl');
   assert.strictEqual(result.spawnedAt, '2026-04-20T12:00:00.000Z');
   assert.strictEqual(result.pid, null); // empty tasklist → null
   assert.strictEqual(typeof result.command, 'string');
+  assert.ok(Array.isArray(result.argv));
+});
+
+// Codex P1 round 9: the argv passed to execFileSync must keep each
+// token discrete so Node's MSVC-style quoting preserves embedded `"`
+// inside the innerCmd (e.g. --plugin-dir "C:\Program Files\ao").
+test('buildSpawnCommand: argv keeps innerCmd as a single element', () => {
+  const { argv } = buildSpawnCommand({
+    name: 'orch-a',
+    workdir: 'C:\\w',
+    pluginDir: 'C:\\Program Files\\ao',
+  });
+  // Everything before `cmd` is wt-level args; from `cmd` onward is the
+  // subshell invocation.
+  const cmdIdx = argv.indexOf('cmd');
+  assert.ok(cmdIdx > 0, `expected 'cmd' in argv: ${JSON.stringify(argv)}`);
+  assert.strictEqual(argv[cmdIdx + 1], '/k');
+  const innerCmd = argv[cmdIdx + 2];
+  // The innerCmd is ONE argv element — Node escapes its internal quotes
+  // via MSVC rules when serializing for CreateProcess.
+  assert.match(innerCmd, /^claude --permission-mode auto --name orch-a /);
+  assert.match(innerCmd, /--plugin-dir "C:\\Program Files\\ao"/);
+  // No wt-level tokens leak into innerCmd.
+  assert.ok(!/--title|--startingDirectory|--suppressApplicationTitle/.test(innerCmd));
+});
+
+test('buildSpawnCommand: argv does NOT include `wt` (execFileSync passes it as program)', () => {
+  const { argv } = buildSpawnCommand({
+    name: 'orch-a',
+    workdir: 'C:\\w',
+  });
+  assert.notStrictEqual(argv[0], 'wt');
+  assert.strictEqual(argv[0], '-w');
 });
 
 test('spawnSession: returns pid when pid-lookup fixture matches', () => {

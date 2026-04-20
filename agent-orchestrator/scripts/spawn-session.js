@@ -44,7 +44,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { execSync, execFileSync } = require('child_process');
+const { execFileSync } = require('child_process');
 const yaml = require('js-yaml');
 
 const { validateLauncher } = require('./parse-manifest');
@@ -293,37 +293,55 @@ function buildSpawnCommand({
   }
   const innerCmd = innerTokens.filter((t) => t !== '').join(' ');
 
-  // Serialize the shell invocation. shell_args is a flat string so it
-  // survives "-NoExit -Command" as one logical flag pair without splitting
-  // the PowerShell literal command-block boundary.
+  // Two parallel representations:
+  //   `argv` — the argv passed to execFileSync('wt', argv). Each element
+  //            is ONE token; Node serializes via MSVC CreateProcess rules
+  //            so embedded quotes survive cleanly. This is what we
+  //            actually execute.
+  //   `command` — a human-readable shell-string rendering for logging,
+  //            --dry-run output, and test assertions. Same content, but
+  //            NOT the string we execute (going through execSync → cmd.exe
+  //            would eat `%` and mangle nested quotes, codex P1 round 8/9).
+  //
+  // For the shell part, wt expects the subcommand's argv as separate
+  // tokens after `new-tab`. We hand each of {shell-binary, shell-args,
+  // innerCmd-as-one-token} as its own wt argv element — wt itself joins
+  // them with spaces when it spawns the subcommand, so the quoted-inner
+  // values arrive at cmd /k or powershell -Command intact.
+  let shellArgv;
+  if (shell === 'powershell') {
+    const preflags = (shell_args || '-NoExit -Command').split(/\s+/);
+    shellArgv = ['powershell', ...preflags, innerCmd];
+  } else {
+    const preflags = (shell_args || '/k').split(/\s+/);
+    shellArgv = ['cmd', ...preflags, innerCmd];
+  }
+
+  const argv = [
+    '-w',
+    windowTarget,
+    'new-tab',
+    '--title',
+    effectiveTitle,
+    '--suppressApplicationTitle',
+    '--startingDirectory',
+    workdir,
+    ...shellArgv,
+  ];
+
+  // Render the shell-string form for logging/dry-run. Uses the same
+  // quoting rules as before (always-quote paths/title for wt, outer-
+  // wrap cmd's innerCmd so the wt→cmd handoff preserves inner quotes).
+  // The shell-string is never executed — it's documentation.
   let shellPart;
   if (shell === 'powershell') {
     const preflags = shell_args || '-NoExit -Command';
-    // Wrap the inner command in DOUBLE quotes so PowerShell's -Command
-    // receives it as a single scriptblock argument. Inner values are
-    // already single-quoted by quotePs, so no nesting conflict.
     shellPart = `powershell ${preflags} "${innerCmd}"`;
   } else {
     const preflags = shell_args || '/k';
-    // cmd /k has a well-known quote-stripping quirk: `cmd /k "foo.exe"
-    // --bar` strips the quotes around foo.exe (cmd's "special-case 1"
-    // fails for executables-with-spaces-then-args because there are
-    // more than two quote chars on the command line, so it falls back
-    // to stripping the first+last quote). Wrapping the ENTIRE inner
-    // command in outer double-quotes makes cmd strip those outermost
-    // quotes and preserve any inner quoted executable path verbatim.
-    // Codex P2: without this, `cmd /k "C:\Program Files\..." --foo`
-    // tries to run C:\Program instead. With the wrap, cmd receives
-    // `"C:\Program Files\..." --foo` after strip — which tokenizes
-    // correctly. The wrap is a no-op for the space-free case.
     shellPart = `cmd ${preflags} "${innerCmd}"`;
   }
-
-  // wt args: always double-quote path/title values so users with spaces
-  // in their project paths work out of the box. wt itself is consumed by
-  // Windows — double-quotes are the right grouping regardless of which
-  // shell wt hands off to.
-  const wtParts = [
+  const command = [
     'wt',
     '-w',
     windowTarget,
@@ -334,10 +352,9 @@ function buildSpawnCommand({
     '--startingDirectory',
     quoteCmdAlways(workdir),
     shellPart,
-  ];
+  ].join(' ');
 
-  const command = wtParts.join(' ');
-  return { command, sessionName, title: effectiveTitle };
+  return { command, argv, sessionName, title: effectiveTitle };
 }
 
 // -------------------- getSessionPid --------------------
@@ -471,7 +488,7 @@ function spawnSession({
   _tasklistRunner,
   _now,
 }) {
-  const { command, sessionName, title: resolvedTitle } = buildSpawnCommand({
+  const { command, argv, sessionName, title: resolvedTitle } = buildSpawnCommand({
     name,
     workdir,
     model,
@@ -481,8 +498,15 @@ function spawnSession({
     windowTarget,
   });
 
-  const runner = _runner || ((cmd) => execSync(cmd, { stdio: 'ignore' }));
-  runner(command);
+  // Injectable runner receives (program, argv) so it matches getSessionPid
+  // and so tests can assert on each arg individually. Default uses
+  // execFileSync which does NOT go through cmd.exe — critical for
+  // preserving nested double quotes through the wt → subshell handoff
+  // (codex P1 round 9: execSync'd through cmd.exe corrupted our
+  // --plugin-dir "C:\Program Files\..." before wt ever saw it).
+  const runner =
+    _runner || ((program, args) => execFileSync(program, args, { stdio: 'ignore' }));
+  runner('wt', argv);
 
   const now =
     typeof _now === 'function'
@@ -493,7 +517,7 @@ function spawnSession({
   // this returns. Orchestrator callers retry via getSessionPid() later.
   const pid = getSessionPid(sessionName, { _runner: _tasklistRunner });
 
-  return { pid, command, sessionName, title: resolvedTitle, spawnedAt: now };
+  return { pid, command, argv, sessionName, title: resolvedTitle, spawnedAt: now };
 }
 
 // -------------------- CLI --------------------
