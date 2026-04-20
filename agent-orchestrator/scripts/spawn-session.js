@@ -162,26 +162,33 @@ function quoteBinary(binary, shell) {
 }
 
 // Tokenize a `shell_args` string into argv elements, preserving
-// double-quoted segments (including embedded whitespace). Used for the
-// argv-form passed to execFileSync; the display-form `command` string
-// leaves shell_args inline and relies on the user's original quoting.
-// Codex P2 round 11: a naive split(/\s+/) dropped the quotes from
-// configs like `-NoExit -File "C:\Program Files\wrapper.ps1"`, so the
-// wrapper-script path got split at the space and the launch failed.
+// quoted segments (including embedded whitespace). Handles BOTH
+// double-quote and single-quote grouping — PowerShell treats `'...'`
+// as a literal string, and users write wrapper paths like
+// `-File 'C:\Program Files\wrapper.ps1'` as a matter of style
+// (codex P2 round 12).
+//
+// Used for the argv-form passed to execFileSync; the display-form
+// `command` string leaves shell_args inline and relies on the user's
+// original quoting.
 function tokenizeShellArgs(s) {
   if (!s || typeof s !== 'string') return [];
   const tokens = [];
   let cur = '';
-  let inQuote = false;
+  let quoteChar = null; // null | '"' | "'"
   let consumed = false;
   for (let i = 0; i < s.length; i++) {
     const c = s[i];
-    if (c === '"') {
-      inQuote = !inQuote;
-      consumed = true; // empty quoted region still produces a token
+    if (quoteChar === null && (c === '"' || c === "'")) {
+      quoteChar = c;
+      consumed = true;
       continue;
     }
-    if (!inQuote && /\s/.test(c)) {
+    if (quoteChar !== null && c === quoteChar) {
+      quoteChar = null;
+      continue;
+    }
+    if (quoteChar === null && /\s/.test(c)) {
       if (consumed || cur !== '') {
         tokens.push(cur);
         cur = '';
@@ -497,7 +504,14 @@ function parsePidLookupOutput(stdout, name) {
   }
   if (parsed === null || parsed === undefined) return null;
   const rows = Array.isArray(parsed) ? parsed : [parsed];
-  const re = new RegExp(`(?:^|\\s)--name\\s+${escapeRegex(name)}(?=\\s|$)`);
+  // Trailing boundary allows whitespace, end-of-line, OR a closing
+  // quote (single or double). When --name is the last flag on a
+  // wrapper command line like `cmd /k "claude --name orch-a"`, WMI
+  // includes the trailing `"`; codex P2 round 12 would otherwise miss
+  // that row entirely.
+  const re = new RegExp(
+    `(?:^|\\s)--name\\s+${escapeRegex(name)}(?=\\s|$|['"])`
+  );
 
   // Two-pass: prefer non-wrapper matches (the claude / agency binary)
   // so Unit 8's health check watches something that actually dies when

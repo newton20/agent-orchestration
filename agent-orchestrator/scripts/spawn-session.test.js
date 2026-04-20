@@ -474,6 +474,27 @@ test('parsePidLookupOutput: empty / null / unparseable input returns null', () =
   assert.strictEqual(parsePidLookupOutput('[]', 'orch-a'), null);
 });
 
+// Codex P2 round 12: wrapper command lines quote the whole inner
+// command when --name is the last flag (`cmd /k "claude --name orch-a"`).
+// WMI reports the CommandLine verbatim including the closing quote.
+test('parsePidLookupOutput: matches when --name is followed by closing quote (codex P2 round 12)', () => {
+  const stdout = JSON.stringify([
+    // Wrapper only — child not up yet. Regex must accept the closing ".
+    { ProcessId: 1234, CommandLine: 'cmd /k "claude --name orch-a"' },
+  ]);
+  assert.strictEqual(parsePidLookupOutput(stdout, 'orch-a'), 1234);
+});
+
+test('parsePidLookupOutput: matches when --name is followed by closing single-quote', () => {
+  const stdout = JSON.stringify([
+    {
+      ProcessId: 4567,
+      CommandLine: "powershell -Command 'agency claude --name orch-a'",
+    },
+  ]);
+  assert.strictEqual(parsePidLookupOutput(stdout, 'orch-a'), 4567);
+});
+
 test('parsePidLookupOutput: null parsed (CIM returned no rows) → null', () => {
   // PowerShell ConvertTo-Json emits "null" when the input array is
   // empty AND the @(...) wrapper is missing. Defensive.
@@ -636,6 +657,22 @@ test('tokenizeShellArgs: simple whitespace split', () => {
   assert.deepStrictEqual(tokenizeShellArgs('/k'), ['/k']);
   assert.deepStrictEqual(tokenizeShellArgs(''), []);
   assert.deepStrictEqual(tokenizeShellArgs(null), []);
+});
+
+test('tokenizeShellArgs: preserves single-quoted path (PowerShell style, codex P2 round 12)', () => {
+  // PowerShell users naturally write literals with single quotes.
+  assert.deepStrictEqual(
+    tokenizeShellArgs("-NoExit -File 'C:\\Program Files\\wrapper.ps1'"),
+    ['-NoExit', '-File', 'C:\\Program Files\\wrapper.ps1']
+  );
+});
+
+test('tokenizeShellArgs: single and double quotes do not interact inside each other', () => {
+  // Inside single quotes, a `"` is literal. Inside double quotes, a `'` is literal.
+  assert.deepStrictEqual(
+    tokenizeShellArgs(`-Arg1 'foo"bar' -Arg2 "baz'qux"`),
+    ['-Arg1', 'foo"bar', '-Arg2', "baz'qux"]
+  );
 });
 
 test('tokenizeShellArgs: preserves quoted path with spaces (codex P2 round 11)', () => {
