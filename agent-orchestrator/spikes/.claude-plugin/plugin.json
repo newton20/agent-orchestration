@@ -1,0 +1,7 @@
+{
+  "name": "agent-orchestrator-hook-spike",
+  "version": "0.0.1",
+  "description": "Unit 4.5 spike: dumps SessionStart hook env + stdin so we can see what Claude Code exposes to hooks under direct `claude` vs `agency claude --enable-auto-mode`. Not part of the shipped plugin; load via `claude --plugin-dir <path>/agent-orchestrator/spikes` from the launch commands in launcher-compat-findings.md.",
+  "author": "agent-orchestrator",
+  "license": "internal"
+}

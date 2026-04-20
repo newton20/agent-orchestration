@@ -201,37 +201,9 @@ function validate(manifest) {
 
   // ---- launcher
   if (manifest.launcher !== undefined) {
-    if (typeof manifest.launcher !== 'object' || Array.isArray(manifest.launcher))
-      push('launcher', 'must be an object');
-    else {
-      const L = manifest.launcher;
-      for (const k of Object.keys(L)) {
-        if (!KNOWN_LAUNCHER.has(k))
-          warn(`launcher.${k}`, `unknown launcher field "${k}"`);
-      }
-      if (L.shell !== undefined && !KNOWN_SHELLS.includes(L.shell))
-        push(
-          'launcher.shell',
-          `must be one of ${KNOWN_SHELLS.join(' | ')}, got ${JSON.stringify(L.shell)}`
-        );
-      if (L.binary !== undefined) {
-        if (typeof L.binary !== 'string' || L.binary.trim() === '')
-          push('launcher.binary', 'must be a non-empty string');
-      }
-      if (L.auto_mode_flag !== undefined && typeof L.auto_mode_flag !== 'string')
-        push('launcher.auto_mode_flag', 'must be a string (empty string to omit)');
-      if (L.shell_args !== undefined && typeof L.shell_args !== 'string')
-        push('launcher.shell_args', 'must be a string');
-      if (L.passthrough_flags !== undefined) {
-        if (!Array.isArray(L.passthrough_flags))
-          push('launcher.passthrough_flags', 'must be an array of strings');
-        else
-          L.passthrough_flags.forEach((v, i) => {
-            if (typeof v !== 'string')
-              push(`launcher.passthrough_flags[${i}]`, 'must be a string');
-          });
-      }
-    }
+    const L = validateLauncher(manifest.launcher);
+    L.errors.forEach((e) => push(e.path, e.message));
+    L.warnings.forEach((w) => warn(w.path, w.message));
   }
 
   // ---- defaults
@@ -380,6 +352,67 @@ function validate(manifest) {
   }
 
   return { valid: false, errors, warnings };
+}
+
+/**
+ * Validate a launcher block in isolation. Shared between manifest-level
+ * validation (via validate()) and callers that receive a launcher object
+ * out of band (e.g. spawn-session.js builds a command from a launcher
+ * and must refuse an unknown shell the same way the manifest parser does).
+ *
+ * Returns { errors: [{path, message}], warnings: [{path, message}] }.
+ * A non-object launcher yields a single error under path 'launcher'.
+ */
+function validateLauncher(launcher) {
+  const errors = [];
+  const warnings = [];
+  if (
+    launcher === null ||
+    typeof launcher !== 'object' ||
+    Array.isArray(launcher)
+  ) {
+    errors.push({ path: 'launcher', message: 'must be an object' });
+    return { errors, warnings };
+  }
+  for (const k of Object.keys(launcher)) {
+    if (!KNOWN_LAUNCHER.has(k))
+      warnings.push({ path: `launcher.${k}`, message: `unknown launcher field "${k}"` });
+  }
+  if (launcher.shell !== undefined && !KNOWN_SHELLS.includes(launcher.shell))
+    errors.push({
+      path: 'launcher.shell',
+      message: `must be one of ${KNOWN_SHELLS.join(' | ')}, got ${JSON.stringify(launcher.shell)}`,
+    });
+  if (launcher.binary !== undefined) {
+    if (typeof launcher.binary !== 'string' || launcher.binary.trim() === '')
+      errors.push({ path: 'launcher.binary', message: 'must be a non-empty string' });
+  }
+  if (
+    launcher.auto_mode_flag !== undefined &&
+    typeof launcher.auto_mode_flag !== 'string'
+  )
+    errors.push({
+      path: 'launcher.auto_mode_flag',
+      message: 'must be a string (empty string to omit)',
+    });
+  if (launcher.shell_args !== undefined && typeof launcher.shell_args !== 'string')
+    errors.push({ path: 'launcher.shell_args', message: 'must be a string' });
+  if (launcher.passthrough_flags !== undefined) {
+    if (!Array.isArray(launcher.passthrough_flags))
+      errors.push({
+        path: 'launcher.passthrough_flags',
+        message: 'must be an array of strings',
+      });
+    else
+      launcher.passthrough_flags.forEach((v, i) => {
+        if (typeof v !== 'string')
+          errors.push({
+            path: `launcher.passthrough_flags[${i}]`,
+            message: 'must be a string',
+          });
+      });
+  }
+  return { errors, warnings };
 }
 
 function validateAgent(a, p_, push) {
@@ -746,9 +779,11 @@ if (require.main === module) main();
 module.exports = {
   loadManifest,
   validate,
+  validateLauncher,
   findDanglingDeps,
   analyzeDeps,
   normalizePhases,
   statusPathFor,
   runUpdate,
+  KNOWN_SHELLS,
 };

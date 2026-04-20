@@ -5,10 +5,11 @@
   "description": "Node.js scripts consumed by the agent-orchestrator plugin: manifest parser/validator, session spawner, prompt generator, health checker, orchestrator event loop.",
   "bin": {
     "parse-manifest": "./parse-manifest.js",
-    "scaffold-protocol": "./scaffold-protocol.js"
+    "scaffold-protocol": "./scaffold-protocol.js",
+    "spawn-session": "./spawn-session.js"
   },
   "scripts": {
-    "test": "node --test parse-manifest.test.js scaffold-protocol.test.js"
+    "test": "node --test parse-manifest.test.js scaffold-protocol.test.js spawn-session.test.js"
   },
   "dependencies": {
     "js-yaml": "^4.1.0"
