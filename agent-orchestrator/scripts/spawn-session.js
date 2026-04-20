@@ -31,10 +31,13 @@
  * Exits 0 on success, 1 on validation or spawn error.
  *
  * Exports:
- *   spawnSession(opts) -> { pid, command, sessionName, spawnedAt }
+ *   spawnSession(opts) -> { pid, command, sessionName, title, spawnedAt }
  *   getSessionPid(name) -> number | null
  *   buildSpawnCommand(opts) -> { command, sessionName, title } (pure)
  *   DEFAULT_LAUNCHER, AGENCY_LAUNCHER  (for reference + tests)
+ *
+ * PID lookup uses WMI CommandLine matching (not tasklist title matching)
+ * so background wt tabs stay discoverable. See getSessionPid for details.
  */
 
 'use strict';
@@ -339,57 +342,63 @@ function buildSpawnCommand({
 
 // -------------------- getSessionPid --------------------
 
-// Sample Windows `tasklist /V /FO CSV` row:
-//   "WindowsTerminal.exe","12345","Console","1","45,678 K","Running","...","0:00:01","orch-phase-0-impl — Scaffold"
-// We match on the trailing "Window Title" column, not the process name,
-// because the session's PID may be tied to any of: WindowsTerminal, cmd,
-// powershell, claude, or a wrapper process — all we care about is which
-// PID owns a window titled `orch-*`.
-const TASKLIST_WINDOW_TITLE_INDEX_HINT = 8;
+// Finding the PID of a specific tab in `wt -w 0` is hard: tasklist /V
+// only surfaces the active tab's window title, so background tabs are
+// invisible by title alone (codex P1). Instead we match on the spawned
+// process's COMMAND LINE — every session's inner command contains the
+// distinctive `--name orch-<phase>-<role>` flag, and WMI exposes
+// CommandLine for every running process regardless of which wt tab is
+// foreground.
+//
+// We use PowerShell's Get-CimInstance Win32_Process (wmic is deprecated
+// in Windows 11 24H2+). The filter pushes the LIKE match into CIM so we
+// only read back the ProcessId, which keeps output small and parsing
+// trivial: one PID per line, no header.
 
 /**
- * Parse Windows `tasklist /V /FO CSV` output and return the first PID
- * whose Window Title starts with `name`. Exposed for tests; consumers
- * use getSessionPid().
+ * Build the PowerShell command that finds PIDs whose CommandLine
+ * contains `--name <name>`. Exposed so tests can verify the escaping
+ * without shelling out.
  *
- * CSV rows look like: "img","pid","sess","sessN","mem","status","user","time","title"
- * The title may contain commas and quotes. We split on `","` after
- * stripping the outer quotes, which is sufficient because tasklist
- * escapes embedded quotes by doubling them — which we don't rely on
- * inside the title.
+ * Security: `name` is validated upstream (VALID_ID_RE on phase ids →
+ * session names are `orch-<id>-<role>` where id/role are `[A-Za-z0-9._-]+`)
+ * so the single-quote escape is defensive; no path for CIM-injection.
  */
-function parseTasklistCsv(stdout, name) {
-  if (typeof stdout !== 'string' || stdout.trim() === '') return null;
-  const lines = stdout.split(/\r?\n/).filter((l) => l.trim() !== '');
-  for (const line of lines) {
-    // Strip leading/trailing quote; split on "," to get columns.
-    if (!line.startsWith('"')) continue;
-    const cols = line
-      .slice(1, line.endsWith('"') ? -1 : undefined)
-      .split('","');
-    if (cols.length < TASKLIST_WINDOW_TITLE_INDEX_HINT + 1) continue;
-    const pidRaw = cols[1];
-    const titleCol = cols[cols.length - 1];
-    if (!pidRaw || !/^\d+$/.test(pidRaw)) continue;
-    // Strict boundary: exact match OR `name + ' '` (the next char must
-    // be whitespace). A naive prefix match confuses `orch-phase-1-impl`
-    // with `orch-phase-10-impl` (codex P2). Our own titles are always
-    // either `name` or `name — <suffix>` (which starts `name ` with a
-    // space before the em-dash), so this condition holds.
-    if (
-      typeof titleCol === 'string' &&
-      (titleCol === name || titleCol.startsWith(name + ' '))
-    ) {
-      return parseInt(pidRaw, 10);
-    }
+function buildPidLookupCommand(name) {
+  const safe = String(name).replace(/'/g, "''");
+  return (
+    'powershell -NoProfile -NoLogo -Command ' +
+    `"Get-CimInstance Win32_Process -Filter ""CommandLine LIKE '%--name ${safe}%'"" ` +
+    '| Select-Object -ExpandProperty ProcessId"'
+  );
+}
+
+/**
+ * Parse the PowerShell output — one integer per line, possibly with
+ * leading/trailing whitespace or empty lines. Returns the first
+ * valid PID, or `null` if none. Matching more than one line is
+ * possible (wrapper + inner claude both carry the --name flag); the
+ * first is fine because any of them dying indicates session loss.
+ */
+function parsePidLookupOutput(stdout) {
+  if (typeof stdout !== 'string') return null;
+  for (const line of stdout.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (/^\d+$/.test(trimmed)) return parseInt(trimmed, 10);
   }
   return null;
 }
 
 /**
- * Return the PID of the spawned Windows Terminal tab whose title starts
- * with `name`, or `null` if no match. Injectable runner makes this
- * testable without shelling out.
+ * Return a PID for the spawned session, or `null` if none found.
+ * Matches on `--name <session-name>` in the process command line (NOT
+ * the window title — wt tabs share a window and only expose the active
+ * tab's title). Injectable runner makes this testable without shelling
+ * out.
+ *
+ * Caveat: if multiple sessions share the same name, the first-returned
+ * PID is used. Our session naming scheme (`orch-<phase>-<role>`)
+ * guarantees uniqueness per-phase-per-role.
  */
 function getSessionPid(name, { _runner } = {}) {
   if (!name || typeof name !== 'string') return null;
@@ -402,11 +411,11 @@ function getSessionPid(name, { _runner } = {}) {
       }));
   let out;
   try {
-    out = runner('tasklist /V /FO CSV /NH');
+    out = runner(buildPidLookupCommand(name));
   } catch (_) {
     return null;
   }
-  return parseTasklistCsv(out, name);
+  return parsePidLookupOutput(out);
 }
 
 // -------------------- spawnSession --------------------
@@ -592,7 +601,8 @@ module.exports = {
   buildSpawnCommand,
   resolveLauncher,
   loadLauncherFromManifest,
-  parseTasklistCsv,
+  buildPidLookupCommand,
+  parsePidLookupOutput,
   quoteCmd,
   quoteCmdAlways,
   quotePs,

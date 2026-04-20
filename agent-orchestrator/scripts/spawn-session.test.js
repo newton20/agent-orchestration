@@ -22,7 +22,8 @@ const {
   buildSpawnCommand,
   resolveLauncher,
   loadLauncherFromManifest,
-  parseTasklistCsv,
+  buildPidLookupCommand,
+  parsePidLookupOutput,
   quoteCmd,
   quotePs,
   quoteBinary,
@@ -296,10 +297,9 @@ test('spawnSession: invokes runner with built command, returns metadata', () => 
   assert.strictEqual(typeof result.command, 'string');
 });
 
-test('spawnSession: returns pid when tasklist fixture matches', () => {
-  const fixture = [
-    '"cmd.exe","4321","Console","1","5,000 K","Running","user","0:00:00","orch-phase-0-impl — Scaffold"',
-  ].join('\r\n');
+test('spawnSession: returns pid when pid-lookup fixture matches', () => {
+  // Get-CimInstance stdout is just one PID per line, no header.
+  const fixture = '4321\r\n';
   const result = spawnSession({
     name: 'orch-phase-0-impl',
     workdir: 'C:\\w',
@@ -323,65 +323,67 @@ test('spawnSession: propagates launcher validation errors', () => {
   );
 });
 
-// -------------------- tasklist CSV parsing --------------------
+// -------------------- pid lookup command + parser --------------------
 
-test('parseTasklistCsv: matches by window-title prefix', () => {
-  const stdout = [
-    '"WindowsTerminal.exe","10000","Console","1","30,000 K","Running","u","0:00:10","Windows Terminal"',
-    '"cmd.exe","12345","Console","1","5,000 K","Running","u","0:00:01","orch-phase-0-impl"',
-    '"cmd.exe","22222","Console","1","5,000 K","Running","u","0:00:01","orch-phase-1-impl — Build feature"',
-  ].join('\r\n');
-  assert.strictEqual(parseTasklistCsv(stdout, 'orch-phase-0-impl'), 12345);
-  assert.strictEqual(parseTasklistCsv(stdout, 'orch-phase-1-impl'), 22222);
-  assert.strictEqual(parseTasklistCsv(stdout, 'orch-phase-99'), null);
+// Codex P1: tasklist /V only surfaces the active tab's title under
+// wt -w 0, so background tabs are undiscoverable by window title.
+// We match on --name <session> in the process CommandLine via WMI.
+test('buildPidLookupCommand: emits a Get-CimInstance WMI query with --name <name>', () => {
+  const cmd = buildPidLookupCommand('orch-phase-0-impl');
+  assert.match(cmd, /^powershell -NoProfile -NoLogo -Command /);
+  assert.match(cmd, /Get-CimInstance Win32_Process -Filter /);
+  assert.match(cmd, /CommandLine LIKE '%--name orch-phase-0-impl%'/);
+  assert.match(cmd, /Select-Object -ExpandProperty ProcessId/);
 });
 
-test('parseTasklistCsv: empty / non-matching input returns null', () => {
-  assert.strictEqual(parseTasklistCsv('', 'orch-a'), null);
-  assert.strictEqual(parseTasklistCsv('INFO: No tasks are running', 'orch-a'), null);
-  assert.strictEqual(parseTasklistCsv(null, 'orch-a'), null);
+test('buildPidLookupCommand: escapes single quotes in the name', () => {
+  // Defensive: name validation elsewhere already rejects these, but the
+  // escape keeps injection impossible if someone bypasses validation.
+  const cmd = buildPidLookupCommand("orch-a'; evil");
+  assert.match(cmd, /%--name orch-a''; evil%/);
 });
 
-// Codex P2 round 4: naive prefix match confuses `orch-phase-1-impl`
-// with `orch-phase-10-impl`. Boundary must be exact or `name + ' '`.
-test('parseTasklistCsv: rejects near-prefix collisions (codex P2)', () => {
-  const stdout = [
-    '"cmd.exe","10000","Console","1","5,000 K","Running","u","0:00:01","orch-phase-10-impl — Ten"',
-    '"cmd.exe","10001","Console","1","5,000 K","Running","u","0:00:01","orch-phase-1-impl — One"',
-  ].join('\r\n');
-  assert.strictEqual(parseTasklistCsv(stdout, 'orch-phase-1-impl'), 10001);
-  assert.strictEqual(parseTasklistCsv(stdout, 'orch-phase-10-impl'), 10000);
+test('parsePidLookupOutput: parses single PID line', () => {
+  assert.strictEqual(parsePidLookupOutput('4321\r\n'), 4321);
+  assert.strictEqual(parsePidLookupOutput('  777  \n'), 777);
 });
 
-test('parseTasklistCsv: exact-title match succeeds (no suffix)', () => {
+test('parsePidLookupOutput: returns first PID when multiple (wrapper + child)', () => {
+  // When the session uses `agency claude`, both the agency wrapper and
+  // the claude child can carry --name on their CommandLine — so CIM
+  // returns multiple PIDs. Either one dying means session loss, so the
+  // first is fine.
+  assert.strictEqual(parsePidLookupOutput('1111\r\n2222\r\n'), 1111);
+});
+
+test('parsePidLookupOutput: empty / no-match input returns null', () => {
+  assert.strictEqual(parsePidLookupOutput(''), null);
+  assert.strictEqual(parsePidLookupOutput('\r\n\r\n'), null);
+  assert.strictEqual(parsePidLookupOutput(null), null);
+});
+
+test('parsePidLookupOutput: ignores non-numeric lines', () => {
+  // If Get-CimInstance errors (e.g. CIM service unavailable) it writes
+  // text to stdout before the PID. We skip non-numeric lines.
   const stdout =
-    '"cmd.exe","7777","Console","1","5,000 K","Running","u","0:00:01","orch-a"\r\n';
-  assert.strictEqual(parseTasklistCsv(stdout, 'orch-a'), 7777);
-});
-
-test('parseTasklistCsv: ignores rows without numeric PIDs', () => {
-  const stdout =
-    '"cmd.exe","PID","Console","1","-","Running","user","-","orch-header-row"\r\n' +
-    '"cmd.exe","777","Console","1","1,000 K","Running","user","0:00:01","orch-real-row"\r\n';
-  assert.strictEqual(parseTasklistCsv(stdout, 'orch-header-row'), null);
-  assert.strictEqual(parseTasklistCsv(stdout, 'orch-real-row'), 777);
+    'Get-CimInstance : Access denied\r\nProcessId\r\n--------\r\n4242\r\n';
+  assert.strictEqual(parsePidLookupOutput(stdout), 4242);
 });
 
 // -------------------- getSessionPid (injected runner) --------------------
 
-test('getSessionPid: uses injected runner, returns parsed PID', () => {
-  const fixture =
-    '"cmd.exe","9999","Console","1","5,000 K","Running","u","0:00:01","orch-x"\r\n';
+test('getSessionPid: uses injected runner, invokes the WMI command', () => {
   const calls = [];
   const pid = getSessionPid('orch-x', {
     _runner: (cmd) => {
       calls.push(cmd);
-      return fixture;
+      return '9999\r\n';
     },
   });
   assert.strictEqual(pid, 9999);
   assert.strictEqual(calls.length, 1);
-  assert.match(calls[0], /tasklist.*\/V.*CSV/);
+  assert.match(calls[0], /Get-CimInstance Win32_Process/);
+  assert.match(calls[0], /CommandLine LIKE '%--name orch-x%'/);
 });
 
 test('getSessionPid: returns null when runner throws', () => {
@@ -548,16 +550,16 @@ test('buildSpawnCommand: custom title "<name> — <suffix>" is preserved verbati
   assert.strictEqual(title, 'orch-phase-0-impl — Feature X');
 });
 
-test('spawnSession end-to-end: custom title auto-prefixed, getSessionPid still matches', () => {
-  // Tasklist fixture advertises the resolved (prefixed) title.
-  const fixture =
-    '"cmd.exe","8888","Console","1","5,000 K","Running","u","0:00:01","orch-phase-0-impl — Scaffold"\r\n';
+test('spawnSession end-to-end: custom title auto-prefixed, pid lookup still matches', () => {
+  // Pid lookup is now command-line-based, so the title change doesn't
+  // matter — as long as `--name <session>` is on the spawned command
+  // line, CIM returns the pid.
   const result = spawnSession({
     name: 'orch-phase-0-impl',
     workdir: 'C:\\w',
     title: 'Scaffold',
     _runner: () => {},
-    _tasklistRunner: () => fixture,
+    _tasklistRunner: () => '8888\r\n',
     _now: () => '2026-04-20T12:00:00.000Z',
   });
   assert.strictEqual(result.title, 'orch-phase-0-impl — Scaffold');
