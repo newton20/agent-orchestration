@@ -117,6 +117,26 @@ function quotePsAlways(value) {
   return `'${s.replace(/'/g, "''")}'`;
 }
 
+// `launcher.binary` is a dual-purpose field: it might be a bare command
+// ("claude"), a "program + arg" string ("agency claude"), or an absolute
+// executable path that may contain spaces ("C:\Program Files\Claude\claude.exe").
+// If we unconditionally quote, "agency claude" becomes a single token the
+// shell can't find. If we never quote, "C:\Program Files\..." splits at the
+// first space. Heuristic: only quote when the string contains a path
+// separator AND whitespace — the telltale of case 3. For PowerShell we
+// also prefix the call operator (`& 'path'`) so the quoted path is
+// executed rather than emitted as a string literal.
+function quoteBinary(binary, shell) {
+  if (typeof binary !== 'string' || binary === '') return binary;
+  const hasPathSep = /[\\/]/.test(binary);
+  const hasSpace = /\s/.test(binary);
+  if (!(hasPathSep && hasSpace)) return binary;
+  if (shell === 'powershell') {
+    return `& '${binary.replace(/'/g, "''")}'`;
+  }
+  return `"${binary.replace(/"/g, '""')}"`;
+}
+
 // -------------------- Launcher resolution --------------------
 
 /**
@@ -174,9 +194,18 @@ function loadLauncherFromManifest(manifestPath) {
   const parsed = yaml.load(raw);
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
     throw new Error(`launcher manifest must be a YAML object: ${abs}`);
-  return Object.prototype.hasOwnProperty.call(parsed, 'launcher')
-    ? parsed.launcher
-    : null;
+  if (!Object.prototype.hasOwnProperty.call(parsed, 'launcher')) return null;
+  // `launcher:` with nothing after it parses to null in YAML. That's
+  // ambiguous with "no launcher", so treat a present-but-null value as
+  // the error it almost certainly is (codex P2: explicit null must not
+  // silently fall back to defaults).
+  if (parsed.launcher === null)
+    throw new Error(
+      `launcher manifest has an explicit null launcher at ${abs} — ` +
+        `either remove the key entirely or provide an object. ` +
+        `(YAML parses bare "launcher:" as null.)`
+    );
+  return parsed.launcher;
 }
 
 // -------------------- Command construction --------------------
@@ -231,9 +260,16 @@ function buildSpawnCommand({
   const qPath = shell === 'powershell' ? quotePsAlways : quoteCmdAlways;
 
   // Build inner Claude invocation as tokens. `binary` may contain a
-  // space (e.g. "agency claude") and is passed verbatim — the shell
-  // tokenizes it into program + arg1 at runtime.
-  const innerTokens = [binary];
+  // space in two very different ways:
+  //   1. "agency claude" — program + first arg. Pass verbatim so the
+  //      shell tokenizes it at runtime.
+  //   2. "C:\\Program Files\\Claude\\claude.exe" — a single path with
+  //      a space. Must be quoted or the shell runs "C:\\Program" as
+  //      the program. Codex P2.
+  // Heuristic: if the binary contains a path separator AND whitespace,
+  // it's case 2 and needs quoting. Otherwise it's case 1 (or a bare
+  // word) and stays verbatim.
+  const innerTokens = [quoteBinary(binary, shell)];
   if (auto_mode_flag) innerTokens.push(auto_mode_flag);
   innerTokens.push('--name', q(name));
   if (model) innerTokens.push('--model', q(model));
@@ -531,6 +567,7 @@ module.exports = {
   quoteCmdAlways,
   quotePs,
   quotePsAlways,
+  quoteBinary,
   DEFAULT_LAUNCHER,
   AGENCY_LAUNCHER,
 };

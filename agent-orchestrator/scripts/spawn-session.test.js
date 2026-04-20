@@ -25,6 +25,7 @@ const {
   parseTasklistCsv,
   quoteCmd,
   quotePs,
+  quoteBinary,
   DEFAULT_LAUNCHER,
   AGENCY_LAUNCHER,
 } = require('./spawn-session');
@@ -415,4 +416,92 @@ test('resolveLauncher: rejects launcher: false from a manifest (codex P2)', () =
     () => resolveLauncher(false),
     /invalid launcher.*must be an object/
   );
+});
+
+// Codex P2 round 2: explicit `launcher: null` in a manifest must error,
+// not silently fall back to DEFAULT_LAUNCHER via resolveLauncher(null).
+test('loadLauncherFromManifest: explicit null rejected (codex P2)', () => {
+  const p = writeManifestTmp('name: x\nlauncher:\nphases:\n  - id: p\n');
+  assert.throws(
+    () => loadLauncherFromManifest(p),
+    /explicit null launcher/
+  );
+});
+
+test('loadLauncherFromManifest: explicit "launcher: null" rejected (codex P2)', () => {
+  const p = writeManifestTmp('name: x\nlauncher: null\nphases:\n  - id: p\n');
+  assert.throws(
+    () => loadLauncherFromManifest(p),
+    /explicit null launcher/
+  );
+});
+
+// -------------------- quoteBinary (codex P2 round 2) --------------------
+
+test('quoteBinary: bare command unquoted', () => {
+  assert.strictEqual(quoteBinary('claude', 'cmd'), 'claude');
+  assert.strictEqual(quoteBinary('claude', 'powershell'), 'claude');
+});
+
+test('quoteBinary: "agency claude" (program + arg) stays verbatim', () => {
+  assert.strictEqual(quoteBinary('agency claude', 'cmd'), 'agency claude');
+  assert.strictEqual(quoteBinary('agency claude', 'powershell'), 'agency claude');
+});
+
+test('quoteBinary: path with spaces quoted per shell', () => {
+  const p = 'C:\\Program Files\\Claude\\claude.exe';
+  assert.strictEqual(quoteBinary(p, 'cmd'), `"${p}"`);
+  assert.strictEqual(quoteBinary(p, 'powershell'), `& '${p}'`);
+});
+
+test('quoteBinary: path without spaces unquoted', () => {
+  const p = 'C:\\tools\\claude.exe';
+  assert.strictEqual(quoteBinary(p, 'cmd'), p);
+  assert.strictEqual(quoteBinary(p, 'powershell'), p);
+});
+
+test('buildSpawnCommand: path-with-spaces binary launches correctly (cmd)', () => {
+  const { command } = buildSpawnCommand({
+    name: 'orch-a',
+    workdir: 'C:\\w',
+    launcher: {
+      shell: 'cmd',
+      binary: 'C:\\Program Files\\Claude\\claude.exe',
+      auto_mode_flag: '',
+      shell_args: '/k',
+    },
+  });
+  // Binary itself is quoted so cmd runs the full path, not "C:\Program".
+  assert.match(
+    command,
+    /cmd \/k "C:\\Program Files\\Claude\\claude\.exe" --name orch-a/
+  );
+});
+
+test('buildSpawnCommand: path-with-spaces binary launches correctly (powershell)', () => {
+  const { command } = buildSpawnCommand({
+    name: 'orch-a',
+    workdir: 'C:\\w',
+    launcher: {
+      shell: 'powershell',
+      binary: 'C:\\Program Files\\Claude\\claude.exe',
+      auto_mode_flag: '',
+      shell_args: '-NoExit -Command',
+    },
+  });
+  // PowerShell needs the call operator `&` to actually execute a quoted path.
+  assert.match(
+    command,
+    /powershell -NoExit -Command "& 'C:\\Program Files\\Claude\\claude\.exe' --name orch-a/
+  );
+});
+
+test('buildSpawnCommand: "agency claude" binary is still emitted unquoted', () => {
+  const { command } = buildSpawnCommand({
+    name: 'orch-a',
+    workdir: 'C:\\w',
+    launcher: AGENCY_LAUNCHER,
+  });
+  assert.match(command, /"agency claude --enable-auto-mode/);
+  assert.ok(!/"& 'agency claude'/.test(command));
 });
