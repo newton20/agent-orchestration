@@ -44,7 +44,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { execSync } = require('child_process');
+const { execSync, execFileSync } = require('child_process');
 const yaml = require('js-yaml');
 
 const { validateLauncher } = require('./parse-manifest');
@@ -356,24 +356,30 @@ function buildSpawnCommand({
 // trivial: one PID per line, no header.
 
 /**
- * Build the PowerShell command that retrieves PID + CommandLine for
- * every process with `--name` on its command line, as a JSON array.
- * The exact boundary check is done in JS (parsePidLookupOutput) with
- * a regex — not in the WMI filter — because (a) SQL LIKE uses `_` as
- * a wildcard and phase ids allow `_` per VALID_ID_RE, and (b) LIKE
- * can't express "the name is followed by whitespace or end-of-line",
- * so `--name foo` wrongly matches `--name foo-bar`. Codex P2 round 7.
+ * Build the PowerShell argv that retrieves PID + CommandLine for every
+ * process with `--name` on its command line, as a JSON array.
+ *
+ * The exact boundary check is done in JS (parsePidLookupOutput) with a
+ * regex — not in the WMI filter — because (a) SQL LIKE uses `_` as a
+ * wildcard and phase ids allow `_`, and (b) LIKE can't express "the
+ * name is followed by whitespace or end-of-line", so `--name foo`
+ * wrongly matches `--name foo-bar`.
+ *
+ * Returned as argv (not a shell string) so getSessionPid can invoke
+ * via `execFileSync('powershell', argv)` — which bypasses cmd.exe.
+ * cmd.exe eagerly expands `%...%` as environment variables, which
+ * would mangle our `%--name %` LIKE filter into an empty string
+ * (codex P1: through execSync, `%--name %` becomes `` because the
+ * phantom env var `--name ` doesn't exist).
  *
  * @{...} wraps the CIM result so ConvertTo-Json always emits an array,
  * even for zero or one result. -Depth 1 keeps the output shallow.
  */
-function buildPidLookupCommand() {
-  return (
-    'powershell -NoProfile -NoLogo -Command ' +
-    '"@(Get-CimInstance Win32_Process -Filter ""CommandLine LIKE ' +
-    "'%--name %'" +
-    '"" | Select-Object ProcessId, CommandLine) | ConvertTo-Json -Compress -Depth 1"'
-  );
+function buildPidLookupArgs() {
+  const script =
+    "@(Get-CimInstance Win32_Process -Filter \"CommandLine LIKE '%--name %'\" " +
+    '| Select-Object ProcessId, CommandLine) | ConvertTo-Json -Compress -Depth 1';
+  return ['-NoProfile', '-NoLogo', '-Command', script];
 }
 
 function escapeRegex(s) {
@@ -425,16 +431,19 @@ function parsePidLookupOutput(stdout, name) {
  */
 function getSessionPid(name, { _runner } = {}) {
   if (!name || typeof name !== 'string') return null;
+  // _runner is invoked with (program, argv) so tests can verify both.
+  // Default uses execFileSync — which does NOT go through cmd.exe, so
+  // `%` in the WMI filter survives unmolested.
   const runner =
     _runner ||
-    ((cmd) =>
-      execSync(cmd, {
+    ((program, argv) =>
+      execFileSync(program, argv, {
         stdio: ['ignore', 'pipe', 'ignore'],
         encoding: 'utf8',
       }));
   let out;
   try {
-    out = runner(buildPidLookupCommand());
+    out = runner('powershell', buildPidLookupArgs());
   } catch (_) {
     return null;
   }
@@ -624,7 +633,7 @@ module.exports = {
   buildSpawnCommand,
   resolveLauncher,
   loadLauncherFromManifest,
-  buildPidLookupCommand,
+  buildPidLookupArgs,
   parsePidLookupOutput,
   quoteCmd,
   quoteCmdAlways,

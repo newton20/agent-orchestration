@@ -22,7 +22,7 @@ const {
   buildSpawnCommand,
   resolveLauncher,
   loadLauncherFromManifest,
-  buildPidLookupCommand,
+  buildPidLookupArgs,
   parsePidLookupOutput,
   quoteCmd,
   quotePs,
@@ -330,14 +330,20 @@ test('spawnSession: propagates launcher validation errors', () => {
 // every process with `--name` on its cmdline and filters in JS so
 // phase-id underscores (SQL wildcard) and suffix collisions
 // (orch-a vs orch-a-review) can't false-match.
-test('buildPidLookupCommand: retrieves PID + CommandLine as JSON', () => {
-  const cmd = buildPidLookupCommand();
-  assert.match(cmd, /^powershell -NoProfile -NoLogo -Command /);
-  assert.match(cmd, /Get-CimInstance Win32_Process -Filter /);
+test('buildPidLookupArgs: emits argv array (bypasses cmd.exe % expansion)', () => {
+  const argv = buildPidLookupArgs();
+  assert.ok(Array.isArray(argv));
+  assert.deepStrictEqual(
+    argv.slice(0, 3),
+    ['-NoProfile', '-NoLogo', '-Command']
+  );
+  const script = argv[3];
+  assert.match(script, /Get-CimInstance Win32_Process -Filter /);
   // Broad LIKE; exact boundary is checked in JS.
-  assert.match(cmd, /CommandLine LIKE '%--name %'/);
-  assert.match(cmd, /Select-Object ProcessId, CommandLine/);
-  assert.match(cmd, /ConvertTo-Json -Compress -Depth 1/);
+  assert.match(script, /CommandLine LIKE '%--name %'/);
+  assert.match(script, /Select-Object ProcessId, CommandLine/);
+  assert.match(script, /ConvertTo-Json -Compress -Depth 1/);
+  // No shell-level `%` doubling — we rely on execFileSync skipping cmd.exe.
 });
 
 test('parsePidLookupOutput: exact --name boundary match (JSON array)', () => {
@@ -405,27 +411,33 @@ test('parsePidLookupOutput: null parsed (CIM returned no rows) → null', () => 
 
 // -------------------- getSessionPid (injected runner) --------------------
 
-test('getSessionPid: uses injected runner, invokes the WMI command, applies boundary regex', () => {
+test('getSessionPid: uses injected runner with (program, argv), applies boundary regex', () => {
   const calls = [];
   const stdout = JSON.stringify([
     { ProcessId: 9999, CommandLine: 'claude --name orch-x --model sonnet' },
   ]);
   const pid = getSessionPid('orch-x', {
-    _runner: (cmd) => {
-      calls.push(cmd);
+    _runner: (program, argv) => {
+      calls.push({ program, argv });
       return stdout;
     },
   });
   assert.strictEqual(pid, 9999);
   assert.strictEqual(calls.length, 1);
-  assert.match(calls[0], /Get-CimInstance Win32_Process/);
-  assert.match(calls[0], /ConvertTo-Json/);
+  assert.strictEqual(calls[0].program, 'powershell');
+  assert.ok(Array.isArray(calls[0].argv));
+  assert.deepStrictEqual(calls[0].argv.slice(0, 3), [
+    '-NoProfile',
+    '-NoLogo',
+    '-Command',
+  ]);
+  assert.match(calls[0].argv[3], /Get-CimInstance Win32_Process/);
 });
 
 test('getSessionPid: returns null when runner throws', () => {
   const pid = getSessionPid('orch-x', {
     _runner: () => {
-      throw new Error('tasklist not found');
+      throw new Error('powershell not found');
     },
   });
   assert.strictEqual(pid, null);
