@@ -496,6 +496,52 @@ test('buildSpawnCommand: path-with-spaces binary launches correctly (powershell)
   );
 });
 
+// Codex P2 round 3: custom titles that don't begin with `name` must be
+// auto-prefixed so getSessionPid (title-prefix matcher) stays correct.
+test('buildSpawnCommand: custom title without name prefix gets prefixed (codex P2)', () => {
+  const { title, command } = buildSpawnCommand({
+    name: 'orch-phase-0-impl',
+    workdir: 'C:\\w',
+    title: 'Scaffold monorepo',
+  });
+  assert.strictEqual(title, 'orch-phase-0-impl — Scaffold monorepo');
+  assert.match(command, /--title "orch-phase-0-impl — Scaffold monorepo"/);
+});
+
+test('buildSpawnCommand: custom title already starting with name is preserved', () => {
+  const { title } = buildSpawnCommand({
+    name: 'orch-phase-0-impl',
+    workdir: 'C:\\w',
+    title: 'orch-phase-0-impl',
+  });
+  assert.strictEqual(title, 'orch-phase-0-impl');
+});
+
+test('buildSpawnCommand: custom title "<name> — <suffix>" is preserved verbatim', () => {
+  const { title } = buildSpawnCommand({
+    name: 'orch-phase-0-impl',
+    workdir: 'C:\\w',
+    title: 'orch-phase-0-impl — Feature X',
+  });
+  assert.strictEqual(title, 'orch-phase-0-impl — Feature X');
+});
+
+test('spawnSession end-to-end: custom title auto-prefixed, getSessionPid still matches', () => {
+  // Tasklist fixture advertises the resolved (prefixed) title.
+  const fixture =
+    '"cmd.exe","8888","Console","1","5,000 K","Running","u","0:00:01","orch-phase-0-impl — Scaffold"\r\n';
+  const result = spawnSession({
+    name: 'orch-phase-0-impl',
+    workdir: 'C:\\w',
+    title: 'Scaffold',
+    _runner: () => {},
+    _tasklistRunner: () => fixture,
+    _now: () => '2026-04-20T12:00:00.000Z',
+  });
+  assert.strictEqual(result.title, 'orch-phase-0-impl — Scaffold');
+  assert.strictEqual(result.pid, 8888);
+});
+
 test('buildSpawnCommand: "agency claude" binary is still emitted unquoted', () => {
   const { command } = buildSpawnCommand({
     name: 'orch-a',

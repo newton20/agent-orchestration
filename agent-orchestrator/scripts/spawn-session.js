@@ -249,8 +249,19 @@ function buildSpawnCommand({
     passthrough_flags,
   } = resolved;
 
+  // getSessionPid matches tab rows in tasklist by window-title prefix,
+  // so the session name MUST be the leading substring of the tab title.
+  // The prototype follows the same convention (`${name} — ${title}`). If
+  // the caller supplied a custom title that doesn't already start with
+  // name, prepend it with an em-dash separator so the PID lookup stays
+  // discoverable. Codex P2: custom titles without the name prefix were
+  // previously undiscoverable.
   const sessionName = name;
-  const effectiveTitle = title || sessionName;
+  let effectiveTitle;
+  if (!title) effectiveTitle = sessionName;
+  else if (title === sessionName || title.startsWith(sessionName + ' '))
+    effectiveTitle = title;
+  else effectiveTitle = `${sessionName} — ${title}`;
 
   // Quoter depends on which shell the inner command lands inside.
   // Simple tokens use conditional quoting (cleaner output); path-typed
