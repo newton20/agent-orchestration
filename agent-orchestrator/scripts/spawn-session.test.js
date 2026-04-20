@@ -12,11 +12,16 @@
 const { test } = require('node:test');
 const assert = require('node:assert');
 
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+
 const {
   spawnSession,
   getSessionPid,
   buildSpawnCommand,
   resolveLauncher,
+  loadLauncherFromManifest,
   parseTasklistCsv,
   quoteCmd,
   quotePs,
@@ -202,6 +207,26 @@ test('resolveLauncher: partial override merges on top of default', () => {
   assert.strictEqual(merged.binary, 'claude-next');
 });
 
+// Codex P2: partial powershell launcher must NOT inherit cmd-style defaults.
+test('resolveLauncher: partial powershell launcher inherits agency defaults (codex P2)', () => {
+  const merged = resolveLauncher({ shell: 'powershell', binary: 'agency claude' });
+  assert.strictEqual(merged.auto_mode_flag, AGENCY_LAUNCHER.auto_mode_flag);
+  assert.strictEqual(merged.shell_args, AGENCY_LAUNCHER.shell_args);
+  // Regression: make sure we do NOT get cmd's "/k" here.
+  assert.notStrictEqual(merged.shell_args, DEFAULT_LAUNCHER.shell_args);
+});
+
+test('buildSpawnCommand: partial powershell launcher produces valid PS cmdline', () => {
+  const { command } = buildSpawnCommand({
+    name: 'orch-a',
+    workdir: 'C:\\w',
+    launcher: { shell: 'powershell', binary: 'agency claude' },
+  });
+  // Must NOT contain `/k` (cmd flag) — must contain `-NoExit -Command`.
+  assert.ok(!/\/k /.test(command), `unexpected /k in ${command}`);
+  assert.match(command, /powershell -NoExit -Command "agency claude --enable-auto-mode /);
+});
+
 // -------------------- buildSpawnCommand — arg validation --------------------
 
 test('buildSpawnCommand: missing name throws', () => {
@@ -350,4 +375,44 @@ test('getSessionPid: returns null when runner throws', () => {
 test('getSessionPid: returns null for empty/invalid name', () => {
   assert.strictEqual(getSessionPid('', { _runner: () => '' }), null);
   assert.strictEqual(getSessionPid(null, { _runner: () => '' }), null);
+});
+
+// -------------------- loadLauncherFromManifest --------------------
+
+function writeManifestTmp(contents) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spawn-session-load-'));
+  const p = path.join(dir, 'manifest.yaml');
+  fs.writeFileSync(p, contents);
+  return p;
+}
+
+test('loadLauncherFromManifest: missing key returns null', () => {
+  const p = writeManifestTmp('name: x\nphases:\n  - id: p\n');
+  assert.strictEqual(loadLauncherFromManifest(p), null);
+});
+
+test('loadLauncherFromManifest: valid launcher block returns object', () => {
+  const p = writeManifestTmp(
+    'name: x\nlauncher:\n  shell: cmd\n  binary: claude\nphases:\n  - id: p\n'
+  );
+  const l = loadLauncherFromManifest(p);
+  assert.deepStrictEqual(l, { shell: 'cmd', binary: 'claude' });
+});
+
+// Codex P2: a typo like `launcher: false` or `launcher: ""` must NOT be
+// silently coerced to "no launcher" — the value must round-trip so
+// resolveLauncher's validator rejects it.
+test('loadLauncherFromManifest: falsy launcher round-trips (codex P2)', () => {
+  const falseP = writeManifestTmp('name: x\nlauncher: false\nphases:\n  - id: p\n');
+  assert.strictEqual(loadLauncherFromManifest(falseP), false);
+  const emptyP = writeManifestTmp('name: x\nlauncher: ""\nphases:\n  - id: p\n');
+  assert.strictEqual(loadLauncherFromManifest(emptyP), '');
+});
+
+test('resolveLauncher: rejects launcher: false from a manifest (codex P2)', () => {
+  // loadLauncherFromManifest returns false; resolveLauncher must surface it.
+  assert.throws(
+    () => resolveLauncher(false),
+    /invalid launcher.*must be an object/
+  );
 });

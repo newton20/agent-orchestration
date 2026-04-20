@@ -122,7 +122,12 @@ function quotePsAlways(value) {
 /**
  * Merge a user-provided launcher with the default. Unknown fields pass
  * through (parse-manifest warns; spawnSession just ignores them in
- * command construction). Missing fields inherit from DEFAULT_LAUNCHER.
+ * command construction). Missing fields inherit from the preset whose
+ * shell matches the user's `shell` field — so a partial PowerShell
+ * launcher picks up AGENCY_LAUNCHER's `-NoExit -Command` and
+ * `--enable-auto-mode` rather than cmd's `/k` + `--permission-mode auto`.
+ * Addresses codex P2: cross-shell default bleed would produce invalid
+ * command lines like `powershell /k claude --permission-mode auto`.
  *
  * If `launcher` is `null`/`undefined`, returns DEFAULT_LAUNCHER.
  * If `launcher` is a preset alias string ('default' | 'agency'),
@@ -144,14 +149,22 @@ function resolveLauncher(launcher) {
     const msg = errors.map((e) => `${e.path}: ${e.message}`).join('; ');
     throw new Error(`invalid launcher: ${msg}`);
   }
-  return { ...DEFAULT_LAUNCHER, ...launcher };
+  // Baseline defaults per shell — cmd and powershell want different
+  // shell_args / auto_mode_flag defaults. User-supplied fields override.
+  const baseline =
+    launcher.shell === 'powershell' ? AGENCY_LAUNCHER : DEFAULT_LAUNCHER;
+  return { ...baseline, ...launcher };
 }
 
 /**
  * Load a launcher block from a manifest YAML file on disk. Used by the
  * CLI wrapper when the caller points at `manifest.yaml` instead of
- * supplying the block inline. Returns the (possibly absent) launcher
- * object — `null` if the manifest has none.
+ * supplying the block inline. Returns `null` only when the `launcher`
+ * key is absent — any present-but-malformed value (e.g. `launcher: false`
+ * or `launcher: ""`) is returned verbatim so resolveLauncher's validator
+ * can surface the real error rather than silently falling back to the
+ * default. Addresses codex P2: a typo like `launcher: false` must not
+ * masquerade as "no launcher configured".
  */
 function loadLauncherFromManifest(manifestPath) {
   const abs = path.resolve(manifestPath);
@@ -161,7 +174,9 @@ function loadLauncherFromManifest(manifestPath) {
   const parsed = yaml.load(raw);
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
     throw new Error(`launcher manifest must be a YAML object: ${abs}`);
-  return parsed.launcher || null;
+  return Object.prototype.hasOwnProperty.call(parsed, 'launcher')
+    ? parsed.launcher
+    : null;
 }
 
 // -------------------- Command construction --------------------
