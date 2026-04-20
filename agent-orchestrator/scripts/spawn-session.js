@@ -53,6 +53,17 @@ const { validateLauncher } = require('./parse-manifest');
 
 // Default ships as direct `claude` invoked by cmd. Lowest dependency
 // surface — works on any Windows box with Claude Code + Windows Terminal.
+//
+// Note: the Unit 0 PROTOTYPE uses `agency claude` + powershell as its
+// default because the prototype author's dev environment runs Claude
+// through Microsoft's agency wrapper. For Unit 4 (the shippable module)
+// the plan explicitly calls for `cmd + claude` as the default and
+// `agency` as a named preset (see plan §"Key Technical Decisions" →
+// "Session spawning via wt + configurable launcher" and §"Unit 4 …
+// Default launcher (direct claude, cmd)"). Agency users set
+// `launcher.shell: powershell` + `launcher.binary: agency claude` in
+// their manifest (or use `--launcher agency` on the CLI). This
+// divergence from the prototype is intentional and documented.
 const DEFAULT_LAUNCHER = Object.freeze({
   shell: 'cmd',
   binary: 'claude',
@@ -487,9 +498,20 @@ const SHELL_WRAPPERS = new Set(['cmd', 'cmd.exe', 'powershell', 'powershell.exe'
 
 function isShellWrapperCmdline(cmdline) {
   if (typeof cmdline !== 'string') return false;
-  const first = cmdline.trim().split(/\s+/)[0] || '';
-  // Strip any leading quote and any path prefix, lowercase, and compare.
-  const bare = first.replace(/^"/, '').replace(/^.*[\\/]/, '').toLowerCase();
+  const trimmed = cmdline.trim();
+  // First token may be a quoted path like `"C:\...\powershell.exe"` —
+  // extract through the closing quote if the first char is a quote,
+  // else up to the first whitespace. Codex P2 round 13: without
+  // trailing-quote handling, the basename included the `"` and the
+  // wrapper check missed quoted exe paths.
+  let first;
+  if (trimmed.startsWith('"')) {
+    const end = trimmed.indexOf('"', 1);
+    first = end > 0 ? trimmed.slice(1, end) : trimmed.slice(1);
+  } else {
+    first = trimmed.split(/\s+/)[0] || '';
+  }
+  const bare = first.replace(/^.*[\\/]/, '').toLowerCase();
   return SHELL_WRAPPERS.has(bare);
 }
 

@@ -447,6 +447,38 @@ test('parsePidLookupOutput: skips powershell wrapper in favor of agency/claude c
   assert.strictEqual(parsePidLookupOutput(stdout, 'orch-a'), 4444);
 });
 
+// Codex P2 round 13: first token may be a quoted absolute path like
+// `"C:\Windows\System32\powershell.exe" -NoExit ...`. isShellWrapperCmdline
+// must strip through the closing quote before basename extraction.
+test('parsePidLookupOutput: quoted wrapper-exe path still recognized (codex P2 round 13)', () => {
+  const stdout = JSON.stringify([
+    {
+      ProcessId: 6001,
+      CommandLine:
+        '"C:\\Windows\\System32\\powershell.exe" -NoExit -Command "agency claude --name orch-a"',
+    },
+    {
+      ProcessId: 6002,
+      CommandLine: 'claude.exe --name orch-a --model sonnet',
+    },
+  ]);
+  // The child claude.exe should win; the quoted powershell.exe path
+  // must be correctly classified as a wrapper.
+  assert.strictEqual(parsePidLookupOutput(stdout, 'orch-a'), 6002);
+});
+
+test('parsePidLookupOutput: quoted wrapper falls back as last-resort', () => {
+  const stdout = JSON.stringify([
+    {
+      ProcessId: 6001,
+      CommandLine:
+        '"C:\\Windows\\System32\\powershell.exe" -NoExit -Command "agency claude --name orch-a"',
+    },
+  ]);
+  // No non-wrapper visible yet → wrapper PID returned (spawn race window).
+  assert.strictEqual(parsePidLookupOutput(stdout, 'orch-a'), 6001);
+});
+
 test('parsePidLookupOutput: falls back to wrapper PID if no child visible yet', () => {
   // During spawn window, only the wrapper may be up. Better to return
   // SOMETHING than null so the orchestrator can retry later.
