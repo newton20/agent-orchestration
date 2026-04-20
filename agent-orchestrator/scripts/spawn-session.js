@@ -356,35 +356,58 @@ function buildSpawnCommand({
 // trivial: one PID per line, no header.
 
 /**
- * Build the PowerShell command that finds PIDs whose CommandLine
- * contains `--name <name>`. Exposed so tests can verify the escaping
- * without shelling out.
+ * Build the PowerShell command that retrieves PID + CommandLine for
+ * every process with `--name` on its command line, as a JSON array.
+ * The exact boundary check is done in JS (parsePidLookupOutput) with
+ * a regex — not in the WMI filter — because (a) SQL LIKE uses `_` as
+ * a wildcard and phase ids allow `_` per VALID_ID_RE, and (b) LIKE
+ * can't express "the name is followed by whitespace or end-of-line",
+ * so `--name foo` wrongly matches `--name foo-bar`. Codex P2 round 7.
  *
- * Security: `name` is validated upstream (VALID_ID_RE on phase ids →
- * session names are `orch-<id>-<role>` where id/role are `[A-Za-z0-9._-]+`)
- * so the single-quote escape is defensive; no path for CIM-injection.
+ * @{...} wraps the CIM result so ConvertTo-Json always emits an array,
+ * even for zero or one result. -Depth 1 keeps the output shallow.
  */
-function buildPidLookupCommand(name) {
-  const safe = String(name).replace(/'/g, "''");
+function buildPidLookupCommand() {
   return (
     'powershell -NoProfile -NoLogo -Command ' +
-    `"Get-CimInstance Win32_Process -Filter ""CommandLine LIKE '%--name ${safe}%'"" ` +
-    '| Select-Object -ExpandProperty ProcessId"'
+    '"@(Get-CimInstance Win32_Process -Filter ""CommandLine LIKE ' +
+    "'%--name %'" +
+    '"" | Select-Object ProcessId, CommandLine) | ConvertTo-Json -Compress -Depth 1"'
   );
 }
 
+function escapeRegex(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 /**
- * Parse the PowerShell output — one integer per line, possibly with
- * leading/trailing whitespace or empty lines. Returns the first
- * valid PID, or `null` if none. Matching more than one line is
- * possible (wrapper + inner claude both carry the --name flag); the
- * first is fine because any of them dying indicates session loss.
+ * Parse the JSON CIM output and return the first PID whose CommandLine
+ * contains `--name <name>` bounded by whitespace (or end-of-line) on
+ * both sides. This avoids the substring-collision issues of WMI LIKE
+ * (`_` is a wildcard; suffix-extension false-positives).
+ *
+ * Matching more than one row is possible (the wrapper + inner claude
+ * both carry the --name flag); the first is fine because either dying
+ * indicates session loss.
  */
-function parsePidLookupOutput(stdout) {
-  if (typeof stdout !== 'string') return null;
-  for (const line of stdout.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (/^\d+$/.test(trimmed)) return parseInt(trimmed, 10);
+function parsePidLookupOutput(stdout, name) {
+  if (typeof stdout !== 'string' || stdout.trim() === '') return null;
+  if (!name || typeof name !== 'string') return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch (_) {
+    return null;
+  }
+  if (parsed === null || parsed === undefined) return null;
+  const rows = Array.isArray(parsed) ? parsed : [parsed];
+  const re = new RegExp(`(?:^|\\s)--name\\s+${escapeRegex(name)}(?=\\s|$)`);
+  for (const row of rows) {
+    const pid = Number(row && row.ProcessId);
+    const cmdline = row && row.CommandLine;
+    if (!Number.isInteger(pid)) continue;
+    if (typeof cmdline !== 'string') continue;
+    if (re.test(cmdline)) return pid;
   }
   return null;
 }
@@ -411,11 +434,11 @@ function getSessionPid(name, { _runner } = {}) {
       }));
   let out;
   try {
-    out = runner(buildPidLookupCommand(name));
+    out = runner(buildPidLookupCommand());
   } catch (_) {
     return null;
   }
-  return parsePidLookupOutput(out);
+  return parsePidLookupOutput(out, name);
 }
 
 // -------------------- spawnSession --------------------

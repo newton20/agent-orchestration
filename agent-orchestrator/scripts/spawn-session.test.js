@@ -298,8 +298,9 @@ test('spawnSession: invokes runner with built command, returns metadata', () => 
 });
 
 test('spawnSession: returns pid when pid-lookup fixture matches', () => {
-  // Get-CimInstance stdout is just one PID per line, no header.
-  const fixture = '4321\r\n';
+  const fixture = JSON.stringify([
+    { ProcessId: 4321, CommandLine: 'claude --name orch-phase-0-impl --model sonnet' },
+  ]);
   const result = spawnSession({
     name: 'orch-phase-0-impl',
     workdir: 'C:\\w',
@@ -325,65 +326,100 @@ test('spawnSession: propagates launcher validation errors', () => {
 
 // -------------------- pid lookup command + parser --------------------
 
-// Codex P1: tasklist /V only surfaces the active tab's title under
-// wt -w 0, so background tabs are undiscoverable by window title.
-// We match on --name <session> in the process CommandLine via WMI.
-test('buildPidLookupCommand: emits a Get-CimInstance WMI query with --name <name>', () => {
-  const cmd = buildPidLookupCommand('orch-phase-0-impl');
+// Codex P1 → P2 round 7: lookup now retrieves PID + CommandLine for
+// every process with `--name` on its cmdline and filters in JS so
+// phase-id underscores (SQL wildcard) and suffix collisions
+// (orch-a vs orch-a-review) can't false-match.
+test('buildPidLookupCommand: retrieves PID + CommandLine as JSON', () => {
+  const cmd = buildPidLookupCommand();
   assert.match(cmd, /^powershell -NoProfile -NoLogo -Command /);
   assert.match(cmd, /Get-CimInstance Win32_Process -Filter /);
-  assert.match(cmd, /CommandLine LIKE '%--name orch-phase-0-impl%'/);
-  assert.match(cmd, /Select-Object -ExpandProperty ProcessId/);
+  // Broad LIKE; exact boundary is checked in JS.
+  assert.match(cmd, /CommandLine LIKE '%--name %'/);
+  assert.match(cmd, /Select-Object ProcessId, CommandLine/);
+  assert.match(cmd, /ConvertTo-Json -Compress -Depth 1/);
 });
 
-test('buildPidLookupCommand: escapes single quotes in the name', () => {
-  // Defensive: name validation elsewhere already rejects these, but the
-  // escape keeps injection impossible if someone bypasses validation.
-  const cmd = buildPidLookupCommand("orch-a'; evil");
-  assert.match(cmd, /%--name orch-a''; evil%/);
+test('parsePidLookupOutput: exact --name boundary match (JSON array)', () => {
+  const stdout = JSON.stringify([
+    { ProcessId: 1111, CommandLine: 'claude --name orch-phase-1-impl --model sonnet' },
+  ]);
+  assert.strictEqual(parsePidLookupOutput(stdout, 'orch-phase-1-impl'), 1111);
 });
 
-test('parsePidLookupOutput: parses single PID line', () => {
-  assert.strictEqual(parsePidLookupOutput('4321\r\n'), 4321);
-  assert.strictEqual(parsePidLookupOutput('  777  \n'), 777);
+test('parsePidLookupOutput: single-object result (ConvertTo-Json compact form)', () => {
+  // PowerShell's ConvertTo-Json emits a scalar object (not an array)
+  // when given a single item; @(...) wraps it, but be defensive.
+  const stdout = JSON.stringify({
+    ProcessId: 2222,
+    CommandLine: 'agency claude --name orch-x --model sonnet',
+  });
+  assert.strictEqual(parsePidLookupOutput(stdout, 'orch-x'), 2222);
 });
 
-test('parsePidLookupOutput: returns first PID when multiple (wrapper + child)', () => {
-  // When the session uses `agency claude`, both the agency wrapper and
-  // the claude child can carry --name on their CommandLine — so CIM
-  // returns multiple PIDs. Either one dying means session loss, so the
-  // first is fine.
-  assert.strictEqual(parsePidLookupOutput('1111\r\n2222\r\n'), 1111);
+test('parsePidLookupOutput: rejects suffix-extension collisions (codex P2 round 7)', () => {
+  // `orch-phase-1-impl` must NOT match `orch-phase-1-impl-review`.
+  const stdout = JSON.stringify([
+    { ProcessId: 7001, CommandLine: 'claude --name orch-phase-1-impl-review --model sonnet' },
+    { ProcessId: 7002, CommandLine: 'claude --name orch-phase-1-impl --model sonnet' },
+  ]);
+  assert.strictEqual(parsePidLookupOutput(stdout, 'orch-phase-1-impl'), 7002);
+  assert.strictEqual(
+    parsePidLookupOutput(stdout, 'orch-phase-1-impl-review'),
+    7001
+  );
 });
 
-test('parsePidLookupOutput: empty / no-match input returns null', () => {
-  assert.strictEqual(parsePidLookupOutput(''), null);
-  assert.strictEqual(parsePidLookupOutput('\r\n\r\n'), null);
-  assert.strictEqual(parsePidLookupOutput(null), null);
+test('parsePidLookupOutput: underscore in name (SQL LIKE wildcard) matches exactly', () => {
+  // `_` is a SQL LIKE wildcard; naive LIKE filtering would also match
+  // `orch-aXimpl`. Our JS regex matches only literal underscores.
+  const stdout = JSON.stringify([
+    { ProcessId: 8001, CommandLine: 'claude --name orch-a_impl --model sonnet' },
+    { ProcessId: 8002, CommandLine: 'claude --name orch-aZimpl --model sonnet' },
+  ]);
+  assert.strictEqual(parsePidLookupOutput(stdout, 'orch-a_impl'), 8001);
 });
 
-test('parsePidLookupOutput: ignores non-numeric lines', () => {
-  // If Get-CimInstance errors (e.g. CIM service unavailable) it writes
-  // text to stdout before the PID. We skip non-numeric lines.
-  const stdout =
-    'Get-CimInstance : Access denied\r\nProcessId\r\n--------\r\n4242\r\n';
-  assert.strictEqual(parsePidLookupOutput(stdout), 4242);
+test('parsePidLookupOutput: returns first matching PID when multiple (wrapper + child)', () => {
+  // The agency wrapper's process and the claude child process both carry
+  // --name on their CommandLine. Either dying = session loss.
+  const stdout = JSON.stringify([
+    { ProcessId: 1111, CommandLine: 'agency claude --name orch-a --model sonnet' },
+    { ProcessId: 2222, CommandLine: 'claude.exe --name orch-a --model sonnet' },
+  ]);
+  assert.strictEqual(parsePidLookupOutput(stdout, 'orch-a'), 1111);
+});
+
+test('parsePidLookupOutput: empty / null / unparseable input returns null', () => {
+  assert.strictEqual(parsePidLookupOutput('', 'orch-a'), null);
+  assert.strictEqual(parsePidLookupOutput(null, 'orch-a'), null);
+  assert.strictEqual(parsePidLookupOutput('not-json', 'orch-a'), null);
+  assert.strictEqual(parsePidLookupOutput('[]', 'orch-a'), null);
+});
+
+test('parsePidLookupOutput: null parsed (CIM returned no rows) → null', () => {
+  // PowerShell ConvertTo-Json emits "null" when the input array is
+  // empty AND the @(...) wrapper is missing. Defensive.
+  assert.strictEqual(parsePidLookupOutput('null', 'orch-a'), null);
 });
 
 // -------------------- getSessionPid (injected runner) --------------------
 
-test('getSessionPid: uses injected runner, invokes the WMI command', () => {
+test('getSessionPid: uses injected runner, invokes the WMI command, applies boundary regex', () => {
   const calls = [];
+  const stdout = JSON.stringify([
+    { ProcessId: 9999, CommandLine: 'claude --name orch-x --model sonnet' },
+  ]);
   const pid = getSessionPid('orch-x', {
     _runner: (cmd) => {
       calls.push(cmd);
-      return '9999\r\n';
+      return stdout;
     },
   });
   assert.strictEqual(pid, 9999);
   assert.strictEqual(calls.length, 1);
   assert.match(calls[0], /Get-CimInstance Win32_Process/);
-  assert.match(calls[0], /CommandLine LIKE '%--name orch-x%'/);
+  assert.match(calls[0], /ConvertTo-Json/);
 });
 
 test('getSessionPid: returns null when runner throws', () => {
@@ -554,12 +590,15 @@ test('spawnSession end-to-end: custom title auto-prefixed, pid lookup still matc
   // Pid lookup is now command-line-based, so the title change doesn't
   // matter — as long as `--name <session>` is on the spawned command
   // line, CIM returns the pid.
+  const fixture = JSON.stringify([
+    { ProcessId: 8888, CommandLine: 'claude --name orch-phase-0-impl --model sonnet' },
+  ]);
   const result = spawnSession({
     name: 'orch-phase-0-impl',
     workdir: 'C:\\w',
     title: 'Scaffold',
     _runner: () => {},
-    _tasklistRunner: () => '8888\r\n',
+    _tasklistRunner: () => fixture,
     _now: () => '2026-04-20T12:00:00.000Z',
   });
   assert.strictEqual(result.title, 'orch-phase-0-impl — Scaffold');
