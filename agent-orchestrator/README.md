@@ -22,7 +22,7 @@ what's done and what's pending.
 | 3 | File-protocol scaffolding (`scripts/scaffold-protocol.js` + tests) | **Done** |
 | 4 | Session spawner (Node.js) | **Done** — see [`scripts/spawn-session.js`](./scripts/spawn-session.js) |
 | 4.5 | SessionStart hook + agency launcher spike | **Done (findings landed)** — see [`spikes/launcher-compat-findings.md`](./spikes/launcher-compat-findings.md) |
-| 5 | SessionStart hook for prompt injection | Pending |
+| 5 | SessionStart hook for prompt injection | **Done (pending Unit 11 integration)** — see [`hooks/`](./hooks/) |
 | 6 | Protocol header + prompt templates | Pending |
 | 7 | Template-based prompt generator | Pending |
 | 8 | Health checker (PID + timeout + heartbeat) | Pending |
