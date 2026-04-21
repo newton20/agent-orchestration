@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p3
 issue_id: "004"
 tags: [code-review, security, unit-4, spawn-session, launcher, yaml]
@@ -108,13 +108,22 @@ are sound.
 
 ## Recommended Action
 
-_(to be filled during triage)_
+**Option B + pull forward F3 — approved 2026-04-20.** Ship in the
+cleanup PR bundle with todos #001 and #002. Three changes:
 
-Preference: **Option B** immediately (module-header doc comment is
-free and valuable), then revisit A's specific fixes as part of
-Unit 11's launcher-handling work. F3 (yaml schema pin) is the
-one I'd pull forward if anything — it's one line with zero
-compatibility risk.
+1. **Module-header doc in `spawn-session.js`.** Explicitly name the
+   launcher fields (`binary`, `shell_args`, `auto_mode_flag`,
+   `passthrough_flags`) as trusted pass-through. No validator change.
+2. **F3 yaml schema pin.** Change `loadLauncherFromManifest`'s
+   `yaml.load(raw)` to `yaml.load(raw, { schema: yaml.CORE_SCHEMA })`.
+   One line, zero compatibility risk at our pinned js-yaml version,
+   prevents a future downgrade from silently reintroducing
+   `!!js/function` execution.
+3. **No other changes.** F1 (shell-metacharacter rejection) and F2
+   (`windowTarget` format guard) are deferred to Unit 11 where the
+   real launcher-handling policy is finalized.
+
+Dispatch as part of the "cleanup PR" handoff after Unit 5 merges.
 
 ## Technical Details
 

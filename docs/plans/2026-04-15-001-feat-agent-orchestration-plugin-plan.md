@@ -372,7 +372,7 @@ flowchart TD
 
 ### Phase 2: Session Spawning + Hook-Based Prompt Injection
 
-- [ ] **Unit 4: Session spawner script (Node.js)**
+- [x] **Unit 4: Session spawner script (Node.js) — SHIPPED in PR #3 (2026-04-20, `231ec99`). See "Unit 4 + 4.5 Shipped Amendments" below for 5 deviations from the as-designed spec.**
 
   **Goal:** Node.js module that opens a new Windows Terminal tab running an interactive Claude Code session with a specific name. (Changed from PowerShell to Node.js — /autoplan Eng review: eliminate unnecessary language.)
 
@@ -406,7 +406,7 @@ flowchart TD
 
   **Verification:** Running the module opens a new Windows Terminal tab with an interactive Claude session named `orch-test` under both default and agency launchers.
 
-- [ ] **Unit 4.5: SessionStart hook API spike + launcher compatibility (NEW — added by /autoplan review, expanded for agency CLI)**
+- [x] **Unit 4.5: SessionStart hook API spike + launcher compatibility — SHIPPED in PR #3 (2026-04-20). Outcome: flag-file fallback (row 3) is mandatory under every tested launcher. See "Unit 4 + 4.5 Shipped Amendments" below, Δ5.**
 
   **Goal:** Determine (a) what environment variables and stdin data are available inside a Claude Code SessionStart hook, and (b) whether hooks fire under wrapper CLIs like Microsoft's `agency` in addition to direct `claude`. This is the highest-risk unknown in the plan — the entire prompt injection mechanism depends on it, and the launcher mechanism is user-environment-specific.
 
@@ -456,6 +456,15 @@ flowchart TD
   **Verification:** We know exactly which launcher configurations support orchestration, which need the flag-file fallback, and which are incompatible. User can choose their launcher accordingly.
 
 - [ ] **Unit 5: SessionStart hook for prompt injection**
+
+  > **Spec updated by Unit 4.5 findings (2026-04-20).** The
+  > SessionStart hook receives only `session_id` (random UUID) and
+  > `CLAUDE_PROJECT_DIR` — it CANNOT read a session name, because
+  > `--name` is not exposed to the hook under any tested launcher.
+  > Use the flag-file fallback protocol (see "Unit 4 + 4.5 Shipped
+  > Amendments" → Δ5 below) instead of the name-based detection
+  > described in the original spec. Original bullets below are
+  > retained for archaeology; the shipped mechanism differs.
 
   **Goal:** When a Claude session starts with an `orch-*` name, the hook reads the corresponding prompt file and injects it as the initial context.
 
@@ -911,3 +920,106 @@ launcher override and simulated signals via `New-Item -Force`).
   round-trip clean: warnings emitted by session-handoff (unknown-
   token, missing CLAUDE.md, missing checkpoint) surfaced in the
   returning coord briefing unchanged.
+
+## Unit 4 + 4.5 Shipped Amendments (2026-04-20)
+
+PR #3 (`231ec99`) shipped Unit 4 (`spawn-session.js`) and Unit 4.5
+(SessionStart hook + launcher compatibility spike) after 13 codex
+rounds + QA PASS on 4/4 scenarios. Five in-body deltas between the
+as-planned design and the as-shipped code. All additive/
+corrective — none break prior assumptions, but Unit 5 must read
+them before starting because its mechanism is directly reshaped by
+delta #5.
+
+### Δ1 — `--suppressApplicationTitle` is required on every spawn
+
+The plan's Unit 4 example commands (lines 389-390) do not include
+`--suppressApplicationTitle`. The shipped code hard-codes it in
+every `wt new-tab ...` invocation. Reason: Unit 0 finding §2
+demonstrated that without this flag, wt's tab title reverts to
+"Claude Code" within seconds, breaking the orchestrator's ability
+to find tabs by title. This flag is load-bearing, not cosmetic —
+future simplification passes must preserve it.
+
+### Δ2 — `getSessionPid` uses WMI `Get-CimInstance`, not `tasklist`
+
+The plan says `tasklist`. Shipped code uses
+`Get-CimInstance Win32_Process` via PowerShell and matches
+`CommandLine` containing `--name <value>` at a word boundary.
+Reason: `tasklist /V` collapses all `wt -w 0` tabs under a single
+WindowsTerminal process, so title-match fails for orchestrator-
+spawned tabs. WMI CommandLine inspection is the only mechanism
+that reliably identifies the inner claude process by the
+`--name` argument the orchestrator passed at spawn.
+
+Implication for downstream units: any code that needs "which
+process serves session X" must invoke the exported
+`getSessionPid(name)` (or its internal helpers
+`buildPidLookupArgs` / `parsePidLookupOutput`) rather than
+reimplementing tasklist-based detection.
+
+### Δ3 — Baseline-per-shell default resolution in `resolveLauncher`
+
+`resolveLauncher(partialLauncher)` picks `DEFAULT_LAUNCHER` (cmd)
+or `AGENCY_LAUNCHER` (PowerShell) as the baseline **based on the
+caller-supplied `shell` value**, then overlays the partial. This
+prevents a user-supplied `shell: powershell` from inheriting cmd's
+`/k` and `--permission-mode auto` defaults (which would produce a
+broken PowerShell invocation). Codex P2 round 2 caught this during
+review; the guard is load-bearing and must stay.
+
+### Δ4 — `spawnSession` return shape includes `argv` and `title`
+
+The plan specifies `{ pid, command, sessionName, spawnedAt }`.
+Shipped code returns `{ pid, command, argv, sessionName, title,
+spawnedAt }`. `argv` is the authoritative argv-form command
+(single source of truth for `execFileSync`); `command` is a
+logging-only shell-string rendering of the same content.
+Downstream consumers (including Unit 11) should prefer `argv` for
+any programmatic use and `command` for human-readable logs.
+
+### Δ5 — Unit 4.5 decision matrix: row 3 is the shipped outcome
+
+~~Row 1 ("Direct claude, name in env → name-based detection")~~
+**closed**: `--name` is never exposed to the SessionStart hook
+under any of the three tested launchers (direct claude from cmd,
+agency from PowerShell, direct claude from PowerShell). The hook
+sees only `session_id` (a random UUID the orchestrator cannot
+predict) and `CLAUDE_PROJECT_DIR`. See
+`agent-orchestrator/spikes/launcher-compat-findings.md` for the
+full evidence.
+
+**Row 3 (flag-file fallback) is the shipped outcome for every
+launcher.** Unit 5 must be designed accordingly:
+
+- Orchestrator writes `docs/orchestration/.pending-<session-name>`
+  atomically immediately before the `wt new-tab` call in
+  `spawnSession()`.
+- The SessionStart hook scans
+  `$CLAUDE_PROJECT_DIR/docs/orchestration/` for any
+  `.pending-*` file younger than a TTL (default 60s), reads the
+  oldest match, deletes it atomically, and injects the prompt
+  content as `additionalContext`. No `.pending-*` match → hook
+  outputs `{}` and is a no-op.
+- Race safety: atomic write on the orchestrator side (tmp +
+  rename), atomic delete on the hook side (rename-to-unique-tmp
+  then read). "First hook to delete wins" holds under concurrent
+  spawns.
+
+**Side-finding from the spike run:** Claude Code on Windows
+executes hook commands through Git Bash (`/usr/bin/bash`), not
+`cmd.exe`. Any path in `hooks.json`'s `command` field must use
+forward slashes; backslashes are interpreted as C-escapes by
+bash. The `.cmd` wrapper pattern still works (bash can exec
+`.cmd` files), but Unit 5's `hooks.json` must use forward-slash
+paths regardless of wrapper choice.
+
+**Side-finding on plugin-dir hook activation:** Loading hooks via
+`--plugin-dir <path>` (the original plan approach) was unreliable
+for activating SessionStart hooks on this machine. The spike
+pivoted to `<repo>/.claude/settings.json` registration, which
+worked under all three launchers. Unit 5 ships hooks under the
+plugin's standard layout (`agent-orchestrator/hooks/hooks.json`)
+as originally designed; if plugin-dir activation continues to be
+unreliable for end users, a settings.json install path can be
+documented as a fallback.
