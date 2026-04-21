@@ -21,7 +21,7 @@ what's done and what's pending.
 | 2 | Manifest parser + validator (`scripts/parse-manifest.js` + tests) | **Done** |
 | 3 | File-protocol scaffolding (`scripts/scaffold-protocol.js` + tests) | **Done** |
 | 4 | Session spawner (Node.js) | **Done** — see [`scripts/spawn-session.js`](./scripts/spawn-session.js) |
-| 4.5 | SessionStart hook + agency launcher spike | **Done (pending hook-spike results)** — see [`spikes/launcher-compat-findings.md`](./spikes/launcher-compat-findings.md) |
+| 4.5 | SessionStart hook + agency launcher spike | **Done (findings landed)** — see [`spikes/launcher-compat-findings.md`](./spikes/launcher-compat-findings.md) |
 | 5 | SessionStart hook for prompt injection | Pending |
 | 6 | Protocol header + prompt templates | Pending |
 | 7 | Template-based prompt generator | Pending |
