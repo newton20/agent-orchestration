@@ -1,0 +1,17 @@
+{
+  "_comment": "Reference copy of the hook registration used by the Unit 4.5 spike. The live file Claude Code reads is hooks/hooks.json (same directory layout as the superpowers plugin). This top-level copy exists because the handoff named this exact file as a deliverable.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-spike.cmd\"",
+            "async": false
+          }
+        ]
+      }
+    ]
+  }
+}
