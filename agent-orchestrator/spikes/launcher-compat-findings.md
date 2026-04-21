@@ -1,182 +1,202 @@
 # Unit 4.5 — SessionStart hook + launcher compatibility findings
 
-Status: **template — awaiting coord to run the three launch commands below.**
+Status: **COMPLETE — run 2026-04-20.**
 
-This document captures what Claude Code exposes to a SessionStart hook
-under three launcher configurations. The answers decide whether Unit 5's
-prompt-injection mechanism can use `--name`-based detection (the design
-in the plan) or must fall back to the flag-file protocol.
+Ran all three tests via settings.json-registered hook (pivoted from
+`--plugin-dir` after observing plugin-dir hook registration wasn't
+activating). Results identical across all three launcher paths.
 
-## How to run the spike
+## Verdict
 
-1. From the repo root, confirm the spike plugin loads:
-   ```
-   dir agent-orchestrator\spikes\.claude-plugin\plugin.json
-   dir agent-orchestrator\spikes\hooks\hooks.json
-   ```
+**Hook fires under every launcher** (direct claude from cmd, agency
+from PowerShell, direct claude from PowerShell). The agency wrapper
+does NOT block or suppress SessionStart hooks.
 
-2. Pick an **absolute path** for `--plugin-dir` that points at
-   `agent-orchestrator\spikes`. All three tests below use the same path
-   — only the launcher shell + binary change.
+**`--name` is NOT exposed to the hook via any channel** — not in env
+vars, not in the stdin JSON payload, not in `argv`. The session is
+identified only by a random `session_id` UUID that the orchestrator
+cannot predict before spawn.
 
-3. Run the three launch commands (one at a time, any order). Each opens
-   a Claude Code session. Let the hook fire (SessionStart runs
-   immediately), type `/exit` to close the session, and copy the
-   env-dump file out of `%USERPROFILE%` before the next test (each run
-   appends, so you can also diff between runs if you prefer).
+**Unit 5 reshape: flag-file fallback is mandatory.** The plan's
+original name-based detection design (SessionStart reads
+`CLAUDE_SESSION_NAME`, matches `orch-<phase>-<role>`, loads prompt) is
+not viable. Unit 5 must use the flag-file protocol from the plan's
+Unit 4.5 decision matrix "row 3".
 
-4. Fill in the three `### Test N` sections below with the relevant
-   chunks of the dump — `env.CLAUDE_PLUGIN_ROOT`, any field containing
-   `orch-test-spike`, the stdin JSON payload — then fill in the
-   **Decision matrix** at the bottom.
+## How the spike was actually run
+
+The plan originally called for loading a mini-plugin via
+`--plugin-dir agent-orchestrator/spikes`. That turned out to be
+unreliable for hook activation on this machine — Claude started the
+session but the hook never fired (no error, no dump). Pivoted to
+registering the hook in `<repo>/.claude/settings.json` directly. With
+that, Claude prompted once to approve the hook, then fired it on
+every subsequent session start.
+
+Side-finding worth capturing: **Claude Code on Windows executes hook
+commands through Git Bash (`/usr/bin/bash`), not `cmd.exe`.** The
+initial command string used backslashes (`C:\Users\...`) which bash
+interpreted as C-escapes and collapsed to `C:Users...` → `command not
+found`. Fixed by using forward slashes (`C:/Users/...`) which Windows
+accepts natively and bash doesn't mangle. This constraint means the
+superpowers-style `.cmd` wrapper is still fine (bash can exec .cmd
+files), but the **command path in settings.json must use forward
+slashes**, and hook authors should assume the execution shell is bash.
 
 ## Env-dump location
 
-Every hook invocation appends a dated block to:
-
-```
-%USERPROFILE%\.claude-hook-spike-dump.txt
-```
-
-(The script is `agent-orchestrator/spikes/hook-env-spike.js`; it writes
-to `os.homedir() + .claude-hook-spike-dump.txt` unconditionally.)
-
-## The three launch commands
-
-Replace `C:\path\to\agent-orchestration` with the repo root on your box.
-
-### Test 1 — Direct `claude` from cmd (baseline)
-
-Open **cmd.exe** and run:
-
-```
-claude --plugin-dir "C:\path\to\agent-orchestration\agent-orchestrator\spikes" --name orch-test-spike
-```
-
-Goal: baseline. Does the hook fire at all? Does `--name` land in env or
-stdin? What's the shape of the hook JSON payload?
-
-### Test 2 — Agency wrapper from PowerShell
-
-Open **PowerShell** and run:
-
-```
-agency claude --enable-auto-mode --plugin-dir "C:\path\to\agent-orchestration\agent-orchestrator\spikes" --name orch-test-spike
-```
-
-Goal: the critical one. The `agency` wrapper is the actual runtime on
-this machine. Does `--name` survive the wrapper? Does `--plugin-dir`?
-Does the hook even fire under auto-mode?
-
-### Test 3 — Direct `claude` from PowerShell
-
-Open **PowerShell** and run:
-
-```
-claude --plugin-dir "C:\path\to\agent-orchestration\agent-orchestrator\spikes" --name orch-test-spike
-```
-
-Goal: isolates the shell variable from the wrapper variable. If Test 1
-works and Test 3 works but Test 2 doesn't, the fault is with `agency`.
-If Test 1 works and Test 3 doesn't, the hook is sensitive to the
-invoking shell.
+`%USERPROFILE%\.claude-hook-spike-dump.txt` — cleaned up post-run.
 
 ## Findings
 
 ### Test 1 — direct claude from cmd
 
-_Hook fired?_ **{TODO: yes / no}**
+_Launch command:_ `claude --name orch-test-spike` (from
+`C:\Users\dunliu\projects\agent-orchestration`, cmd.exe)
+
+_Hook fired?_ **YES** at `2026-04-21T03:38:46.451Z`.
 
 _Relevant env vars:_
 
 ```
-TODO: paste CLAUDE_PLUGIN_ROOT and any CLAUDE_* var from the dump
+CLAUDE_CODE_ENTRYPOINT = "cli"
+CLAUDE_CODE_USE_POWERSHELL_TOOL = "1"
+CLAUDE_ENV_FILE = "C:\Users\dunliu\.claude\session-env\<session_id>\sessionstart-hook-0.sh"
+CLAUDE_PROJECT_DIR = "C:/Users/dunliu/projects/agent-orchestration"
 ```
 
-_Stdin payload:_
+No `CLAUDE_SESSION_NAME` or equivalent. `grep -c orch-test-spike` on
+the full env dump = 0.
 
-```
-TODO: paste the JSON stdin block from the dump (or "(empty)")
+_Stdin payload (340 bytes):_
+
+```json
+{
+  "session_id": "ce5486ae-fdd4-4b0f-9b30-f8d5f311634a",
+  "transcript_path": "C:\\Users\\dunliu\\.claude\\projects\\C--Users-dunliu-projects-agent-orchestration\\ce5486ae-fdd4-4b0f-9b30-f8d5f311634a.jsonl",
+  "cwd": "C:\\Users\\dunliu\\projects\\agent-orchestration",
+  "hook_event_name": "SessionStart",
+  "source": "startup",
+  "model": "claude-opus-4-7[1m]"
+}
 ```
 
-_Session name reachable?_ **{TODO: yes / no — via which field}**
+_Session name reachable?_ **NO** — not via any env var, not in stdin
+JSON. Only opaque `session_id` UUID.
 
 ### Test 2 — agency claude from PowerShell
 
-_Hook fired?_ **{TODO: yes / no}**
+_Launch command:_ `agency claude --enable-auto-mode --name orch-test-spike`
+(from the same repo dir, PowerShell)
 
-_Relevant env vars:_
+_Hook fired?_ **YES** at `2026-04-21T03:45:43.821Z`.
 
-```
-TODO: paste CLAUDE_PLUGIN_ROOT and any CLAUDE_* var
-```
-
-_Stdin payload:_
+_Relevant env vars:_ same `CLAUDE_*` set as Test 1, PLUS agency-
+specific vars surfacing that the launch went through the wrapper:
 
 ```
-TODO: paste the JSON stdin block
+AGENCY_LOG_SESSION_DIR = "C:\Users\dunliu\.agency\logs\session_20260420_204533_35796"
+AGENCY_OPERATION_ID = "00-cec889e343cfc1e1e914334ae6e518e7-ec209deed404e15c-00"
+AGENCY_REPO_DIR = "C:/Users/dunliu/projects/agent-orchestration"
 ```
 
-_Session name reachable?_ **{TODO: yes / no — via which field}**
+`AGENCY_*` vars could be used by the hook to detect "am I under the
+agency wrapper" if that ever mattered, but they do NOT encode the
+session name.
 
-_`--plugin-dir` survived?_ **{TODO: yes / no}**
+_Stdin payload (340 bytes):_ same shape as Test 1 — only `session_id`
+differs (`8fb7f6b2-a71a-48c3-8436-f8b52ea0a535`).
+
+_Session name reachable?_ **NO** — identical result to Test 1.
+`--name` survives to Claude Code (tab title shows `orch-test-spike`)
+but never reaches the hook.
+
+_`--plugin-dir` survived?_ N/A — tests run via settings.json hook
+registration instead of plugin-dir. But given the hook DOES fire under
+agency, we can assume `--plugin-dir` would also survive; that's a
+secondary question Unit 5 can verify when it lands.
 
 ### Test 3 — direct claude from PowerShell
 
-_Hook fired?_ **{TODO: yes / no}**
+_Launch command:_ `claude --name orch-test-spike` (same repo dir,
+PowerShell)
 
-_Relevant env vars:_
+_Hook fired?_ **YES** at `2026-04-21T03:50:43.286Z`.
 
-```
-TODO: paste CLAUDE_PLUGIN_ROOT and any CLAUDE_* var
-```
+_Relevant env vars:_ same `CLAUDE_*` set as Test 1. No agency vars
+(PowerShell shell, but no agency wrapper). `CLAUDE_CODE_USE_POWERSHELL_TOOL = "1"`
+is present under ALL three launchers including cmd — this is a
+user-set env var that Claude Code exports on start, not a shell-
+specific signal.
 
-_Stdin payload:_
+_Stdin payload:_ same shape; `session_id = c47a52e6-4a9a-4c8e-9116-1542298cdf65`.
 
-```
-TODO: paste the JSON stdin block
-```
+_Session name reachable?_ **NO** — identical result.
 
-_Session name reachable?_ **{TODO: yes / no — via which field}**
-
-## Decision matrix (reproduced from plan §Unit 4.5)
+## Decision matrix (filled in)
 
 | Scenario | Session name available? | Hook fires? | Plan path |
 |---|---|---|---|
-| Direct claude (Test 1), name in env | **{TODO}** | **{TODO}** | Use name-based detection (Unit 5 as designed) |
-| Agency (Test 2), name survives, hook fires | **{TODO}** | **{TODO}** | Same as above, launcher config just swaps binary |
-| Agency (Test 2), name lost | **{TODO}** | **{TODO}** | Flag-file fallback: orchestrator writes `.pending-{name}` before spawn |
-| Agency (Test 2), hook doesn't fire | **{N/A}** | **{TODO}** | Escalate: prompt-as-first-message mode (orchestrator pastes prompt as first user message, manual) |
+| Direct claude (Test 1), name in env | **NO** | **YES** | ~~Use name-based detection~~ → flag-file |
+| Agency (Test 2), name survives, hook fires | **NO** | **YES** | Flag-file — agency is otherwise compatible |
+| Agency (Test 2), name lost | **YES (name is always lost)** | **YES** | **Flag-file fallback** ← ALL THREE LAUNCHERS |
+| Agency (Test 2), hook doesn't fire | N/A | N/A — hook DOES fire | Not applicable |
 
-_Which row applies?_ **{TODO — coord fills in after running the tests}**
+**Applicable row: row 3 for every launcher.** Name is never
+available; hook always fires.
 
 ## Implications for Unit 5
 
-Unit 5 (`SessionStart hook for prompt injection`) will read from whichever
-mechanism Test 2 validates:
+Unit 5 (SessionStart hook for prompt injection) cannot use
+`process.env.CLAUDE_SESSION_NAME` because no such variable exists.
+The design must be:
 
-- **Row 1/2 (name in env):** Unit 5 reads
-  `process.env.CLAUDE_SESSION_NAME` (or whichever var the dump reveals),
-  matches `orch-{phase-id}-{role}`, loads
-  `docs/orchestration/phases/{phase-id}/{role}-prompt.md`, returns it
-  as `additionalContext`.
+1. **Orchestrator (Unit 11) writes a flag file before spawn.**
+   Immediately before the `wt new-tab ...` call in `spawnSession()`,
+   write `docs/orchestration/.pending-<session-name>` containing the
+   prompt content (or a pointer to `docs/orchestration/phases/<phase-id>/<role>-prompt.md`).
 
-- **Row 3 (name lost, flag-file fallback):** Unit 5 scans
-  `docs/orchestration/.pending-*` on startup, picks the first match
-  younger than 60s, deletes it atomically, returns its content. The
-  orchestrator writes the flag file immediately before `wt` spawn in
-  Unit 4's `spawnSession()`.
+2. **Hook scans for `.pending-*` files on startup.** Reads
+   `CLAUDE_PROJECT_DIR` from env (confirmed present in all three
+   tests), looks under `$CLAUDE_PROJECT_DIR/docs/orchestration/` for
+   any `.pending-*` file younger than a configurable TTL (e.g. 60s
+   — the spawn-to-hook latency is well under 1s in practice, but 60s
+   accommodates clock skew and manual-debug scenarios).
 
-- **Row 4 (hook doesn't fire under agency):** Unit 5 becomes a no-op on
-  agency, and the orchestrator instead copies the prompt to the
-  clipboard / injects as first user message. We document agency as
-  partially unsupported and recommend direct `claude` for orchestrated
-  sessions.
+3. **Hook reads the first match, deletes it atomically, injects the
+   prompt content** as `additionalContext` in the output JSON. If
+   multiple `.pending-*` files exist, the oldest wins and the
+   orchestrator will see its flag file disappear; the orchestrator
+   can then confirm the right session consumed the prompt via some
+   sentinel in the prompt content.
+
+4. **Stale-file handling.** The orchestrator already has a retry-
+   with-backoff design. Flag files older than TTL are stale (either
+   from a spawn that failed, or from a previous failed hook run) and
+   ignored; the orchestrator's retry eventually succeeds.
+
+5. **Race conditions.** Two orchestrator-spawned sessions starting
+   very close in time will each find ONE `.pending-*` file. As long
+   as the orchestrator writes each flag file atomically (tmp + rename)
+   and the hook deletes atomically (fs.renameSync to a unique temp
+   path, then read), the "first hook to delete wins" invariant holds.
+
+## Configuration files used
+
+- Hook registration: `<repo>/.claude/settings.json` (temporary spike
+  artifact, deleted post-run).
+- Hook wrapper: `agent-orchestrator/spikes/hooks/run-spike.cmd`
+  invoked `node ../hook-env-spike.js`.
+- Hook command in settings.json: forward-slash absolute path to the
+  wrapper, bare (no `cmd /c` prefix needed when Claude invokes via
+  bash).
 
 ## Cleanup
 
-After filling in the findings, coord can:
-- `del %USERPROFILE%\.claude-hook-spike-dump.txt` (safe — only written by this spike)
-- Leave `agent-orchestrator/spikes/` in the tree — Unit 5 will reuse the
-  wrapper pattern; only the findings doc rot-resistantly captures what
-  we learned.
+- [x] `%USERPROFILE%\.claude-hook-spike-dump.txt` — removed.
+- [x] `<repo>/.claude/settings.json` — removed (not committed to
+  the repo; was a one-off spike artifact).
+- [x] The spike plugin skeleton (`spikes/.claude-plugin/`, `spikes/hooks/`,
+  `spikes/hook-env-spike.js`, etc.) is kept in the tree so Unit 5 can
+  reuse the wrapper pattern when it builds the real prompt-injection
+  hook.
