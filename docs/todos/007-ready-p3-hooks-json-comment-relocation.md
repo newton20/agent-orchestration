@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p3
 issue_id: "007"
 tags: [code-review, unit-5, hooks, docs, cleanup]
@@ -84,8 +84,27 @@ hooks.json will grep, find README, and learn.
 
 ## Recommended Action
 
-Leave blank for triage. **Leaning Option A** — preserves the anti-
-regression breadcrumb with minimal noise.
+**Option A — approved 2026-04-22 by coord.** Shrink the ~500-char
+`_comment` to a one-line pointer:
+
+```json
+"_comment": "Quoted \"${CLAUDE_PLUGIN_ROOT}\" is load-bearing under Git Bash — see hooks/README.md and spikes/launcher-compat-findings.md"
+```
+
+Preserves the local breadcrumb at the sharp edge (the whole point of
+the comment is to prevent a future "cleanup the weird escapes" pass
+from breaking the hook under Git Bash), while reducing the noise in
+the 5-line functional payload.
+
+Option B (move to `run-hook.cmd`) rejected because `hooks.json` IS
+the file with the escapes — keeping the pointer next to them is the
+maximum-leverage placement. Option C (drop entirely) rejected
+because pure removal undoes the comment's entire purpose (the
+scenario it prevents is exactly a cleanup-driven removal).
+
+Dispatch as part of the post-Unit-6 cleanup PR bundle with todos
+001, 002, 004, 005, 006. Expected change: 1 line in
+`agent-orchestrator/hooks/hooks.json`.
 
 ## Technical Details
 

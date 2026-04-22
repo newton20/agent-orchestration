@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "005"
 tags: [code-review, unit-5, unit-11, hooks, performance, cleanup]
@@ -107,7 +107,26 @@ hard-TTL) and unlink them. Unit 5 stays strictly read-only.
 
 ## Recommended Action
 
-Leave blank for triage.
+**Option B — approved 2026-04-22 by coord.** Add a hard TTL (export
+`STALE_HARD_TTL_MS = 10 * FLAG_TTL_MS` → 600_000ms / 10min). In the
+filter loop, when a flag is stale:
+- Age < hard-TTL → preserve on disk (current behavior — debug window).
+- Age ≥ hard-TTL → `tryUnlink` best-effort (ignore ENOENT).
+
+Preserves the debug invariant for the practically-useful recent
+window (10 minutes is plenty to inspect a failed spawn), bounds
+steady-state `statSync` count to flags created in the last 10
+minutes, and keeps the change fully inside `session-start.js` with
+no cross-module invariant for Unit 11 to remember.
+
+Option C (Unit 11 pre-spawn sweep) was rejected because the invariant
+is easy to forget AND any manual flag writer (debugging, testing)
+would bypass the sweep entirely. Option A rejected because the
+60-second debug window is too short to be useful.
+
+Dispatch as part of the post-Unit-6 cleanup PR bundle with todos
+001, 002, 004, 006, 007. Expected change: ~8 LOC in session-start.js
++ 1 regression test asserting the soft-vs-hard TTL boundary.
 
 ## Technical Details
 
