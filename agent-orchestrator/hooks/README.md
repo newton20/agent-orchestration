@@ -32,7 +32,10 @@ claude` from PowerShell). Name-based detection is dead.
 3. Sort fresh by `mtimeMs` ascending. Atomically rename the oldest to
    `.consuming-<id>-<pid>-<ms>-<i>` (sibling path, does NOT start with
    `.pending-` so leftovers are never re-matched). If the rename races
-   (ENOENT), fall through to the next candidate. Cap at 3 attempts.
+   (ENOENT), fall through to the next candidate and keep trying — there
+   is no arbitrary retry cap. The candidate list is bounded by
+   `readdirSync`, and an N-way concurrent spawn needs up to N attempts
+   to guarantee every hook consumes a flag.
 4. Size guard: reject content > 256 KB (output `{}`, clean up the
    `.consuming-*` tmpfile).
 5. Read the renamed file as UTF-8. Content IS the prompt text (plain
