@@ -455,7 +455,7 @@ flowchart TD
 
   **Verification:** We know exactly which launcher configurations support orchestration, which need the flag-file fallback, and which are incompatible. User can choose their launcher accordingly.
 
-- [ ] **Unit 5: SessionStart hook for prompt injection**
+- [x] **Unit 5: SessionStart hook for prompt injection — SHIPPED in PR #4 (2026-04-22, `540e878`). Flag-file fallback landed as designed in Δ5. See "Unit 5 Shipped Amendments" below for two deviations from the original handoff spec.**
 
   > **Spec updated by Unit 4.5 findings (2026-04-20).** The
   > SessionStart hook receives only `session_id` (random UUID) and
@@ -1023,3 +1023,102 @@ plugin's standard layout (`agent-orchestrator/hooks/hooks.json`)
 as originally designed; if plugin-dir activation continues to be
 unreliable for end users, a settings.json install path can be
 documented as a fallback.
+
+## Unit 5 Shipped Amendments (2026-04-22)
+
+PR #4 (`540e878`) shipped Unit 5 (SessionStart hook, flag-file
+fallback) after 2 codex rounds + QA PASS (9/9 scope rows) + multi-
+agent ce:review (6 reviewers, all MERGE-READY). Two deviations
+between the handoff dispatch and the as-shipped code. Both were
+explicitly accepted by codex during round-2 review; they are
+recorded here for Unit 11's benefit.
+
+### Δ1 — Retry cap removed (no `MAX_CONSUME_ATTEMPTS`)
+
+The original handoff spec said: *"If rename throws ENOENT
+(another hook raced), fall through: remove that candidate and try
+the next. Cap retries at 3 then output `{}` to avoid infinite
+loops under pathological conditions."*
+
+Shipped code iterates **every** fresh candidate, bounded by
+`readdirSync`. Reason: an N-way concurrent orchestrator spawn
+creates N `.pending-*` files; hook N must lose the rename race
+N-1 times before finding its own flag. A cap of 3 would silently
+drop prompts at N ≥ 4, which is the normal case for a 4-role
+phase (impl + qa + review + coord). There is no unbounded-loop
+risk — the candidate list is snapshot at `readdirSync` time and
+never re-fetched inside the consume loop. Codex round-1 P2
+caught this; the cap was removed and two regression tests
+(`race: every candidate loses` + `race: N-1 candidates lose,
+last wins`) lock in the new behavior.
+
+**Implication for Unit 11:** if per-hook latency ever matters,
+Unit 11 must bound concurrent flag count (e.g. sweep stale
+flags before spawning each batch) rather than rely on a cap in
+the hook. See `docs/todos/005-pending-p2-unit-5-stale-flag-accumulation.md`
+for the deferred cleanup-policy decision.
+
+### Δ2 — Consume-path uses `.consuming-` prefix, not suffix
+
+The original handoff spec said the consume rename target should be
+`flagPath + '.consuming-' + process.pid + '-' + Date.now()`.
+
+Shipped code renames to a sibling whose name **begins** with
+`.consuming-`, e.g.
+`path.join(orchDir, \`.consuming-${id}-${pid}-${Date.now()}-${i}\`)`.
+Reason: with the suffix form, a crashed hook that dies between
+`renameSync` and `unlinkSync` leaves a file named
+`.pending-<id>.consuming-<pid>-<ms>` on disk. That name **still
+matches** `FLAG_NAME_RE` (`/^\.pending-[A-Za-z0-9._-]+$/`), so a
+later hook invocation would re-consume the stale content as if it
+were a fresh prompt. Using a prefix that does not start with
+`.pending-` closes that hole structurally, not via cleanup
+hygiene. The author self-surfaced this bug via test-first
+iteration during implementation (before codex round 1) — the
+test suite includes an explicit regression test
+(`.consuming-* orphan files are ignored (no .pending- prefix)`).
+
+### Exported symbols for Unit 11
+
+`session-start.js` exports `{ runHook, FLAG_TTL_MS,
+MAX_FLAG_BYTES, FLAG_NAME_RE }`. Unit 11 should `require()` the
+regex and TTL constants rather than re-literal them, so the two
+modules stay in lockstep automatically. The character class inside
+`FLAG_NAME_RE` duplicates `VALID_ID_RE` in
+`scripts/parse-manifest.js`; see
+`docs/todos/006-pending-p3-unit-5-id-regex-duplication.md` for
+the enforcement-pattern decision.
+
+### Deferred review findings (triage before next unit)
+
+Three todos filed by the pre-merge review pipeline, all non-
+blocking:
+
+- `docs/todos/005-pending-p2-unit-5-stale-flag-accumulation.md`
+  — TTL-expired flags are skipped but not unlinked; steady-state
+  `statSync` count grows with orchestrator crashes. Three
+  solution options (aggressive unlink / two-tier TTL / defer
+  cleanup to Unit 11 pre-spawn sweep).
+- `docs/todos/006-pending-p3-unit-5-id-regex-duplication.md` —
+  cross-module invariant between `FLAG_NAME_RE` and
+  `VALID_ID_RE`. Three enforcement options (build-from-source /
+  cross-reference comments / CI consistency test).
+- `docs/todos/007-pending-p3-hooks-json-comment-relocation.md`
+  — the ~500-char `_comment` in `hooks.json` uses an unsupported
+  JSON convention; three options (shrink to pointer / move into
+  `run-hook.cmd` / drop).
+
+### Verified invariants
+
+- `MAX_FLAG_BYTES = 256 * 1024`, `FLAG_TTL_MS = 60_000` — exported
+  as named constants so Unit 11 can enforce them when writing
+  flag files.
+- Hook never throws and never exits nonzero; every IO error
+  collapses to `{}` with a stderr log prefixed `[unit-5-hook]`.
+- Matcher covers `startup|clear|compact` (all three SessionStart
+  trigger sources per the Unit 4.5 spike's stdin payload
+  inventory).
+- hooks.json command uses `"\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\""`
+  — the escaped double-quotes are load-bearing under Git Bash (bash
+  preserves backslashes inside double-quoted expansions; the raw-
+  literal failure the spike documented was a different case).
