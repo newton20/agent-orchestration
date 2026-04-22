@@ -3,7 +3,7 @@ schema_version: 1
 agent: impl
 phase: phase-0-scaffold
 status: complete
-timestamp: 2026-04-17T04:12:13Z
+ended_at: 2026-04-17T04:12:13Z
 git_commit: a7f3c92
 ---
 
