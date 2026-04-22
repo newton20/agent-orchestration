@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p3
 issue_id: "002"
 tags: [code-review, unit-4, spawn-session, simplification, cleanup]
@@ -117,10 +117,16 @@ gratuitous.
 
 ## Recommended Action
 
-_(to be filled during triage)_
+**Option B — approved 2026-04-20.** Drop finding #1 (`.exe` subcommand
+split in `quoteBinary`) and finding #5 (stale `codex P1/P2 round-N`
+comment annotations replaced with reason-only comments or removed
+where the annotation was pure scaffolding). Findings #2, #3, #4, #6
+are deferred to Unit 11, which will exercise the real launcher
+surface and reveal which quoters/exports are actually load-bearing.
 
-Preference: **Option B** — land the two lowest-risk wins, defer
-the rest until Unit 11 exercises the real launcher surface.
+Dispatch as part of the "cleanup PR" handoff after Unit 5 merges.
+Bundle with todos #001 and #004. Test count must remain 127 → 127
+green.
 
 ## Technical Details
 

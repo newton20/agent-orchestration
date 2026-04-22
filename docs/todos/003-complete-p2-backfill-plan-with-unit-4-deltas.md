@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p2
 issue_id: "003"
 tags: [code-review, plan-hygiene, unit-4, unit-4.5, unit-5-preparation]
@@ -113,12 +113,12 @@ the cross-cutting docs and the PR #3 discussion.
 
 ## Recommended Action
 
-_(to be filled during triage)_
-
-Preference: **Option A** — in-place update with a small "Unit 4
-Validation + Post-ship amendments" section anchored after the Unit
-4 description, mirroring the existing "Unit 0 Validation Findings"
-style. Estimated 20-30 minutes of focused writing.
+**Option A — approved 2026-04-20, executing now by coord.** Plan
+backfill is pure doc work and Unit 5's dispatch depends on the
+correct spec being in-place before the impl session reads it. Coord
+ships the amendment commit on main directly; no impl handoff
+required. Style follows the existing "Unit 0 Validation Findings"
+and "Track B Dogfood Findings" precedents already in the plan.
 
 ## Technical Details
 
@@ -151,7 +151,42 @@ style. Estimated 20-30 minutes of focused writing.
 
 ## Work Log
 
-_(empty)_
+### 2026-04-20 — Plan amendment landed
+
+**By:** Coord (Claude)
+
+**Actions:**
+- Added new section "Unit 4 + 4.5 Shipped Amendments (2026-04-20)"
+  at end of
+  `docs/plans/2026-04-15-001-feat-agent-orchestration-plugin-plan.md`
+  covering all 5 deltas (Δ1-Δ5) per acceptance criteria.
+- Added inline "SHIPPED / see amendments below" pointers to the
+  in-body Unit 4, Unit 4.5, and Unit 5 sections so Unit 5 impl
+  cannot miss the reshape.
+- Added side-findings from the spike run (Git Bash hook shell,
+  plugin-dir vs settings.json activation) since those materially
+  affect Unit 5's hook wiring.
+- Preserved the original Unit 5 bullets as archaeology; the
+  reshape note precedes them so readers see the current spec first.
+
+**Learnings:**
+- In-body "SHIPPED — see amendments below" is a lightweight way to
+  keep historical design text intact while making the current spec
+  authoritative. Works well with the existing "Unit 0 Validation
+  Findings" precedent.
+- Unit 5's preamble note pre-answers the "what shape does the
+  hook read?" question for impl, which is the single most
+  load-bearing fact from the spike.
+
+**Checked against acceptance criteria:**
+- [x] Plan's Unit 4 section mentions `--suppressApplicationTitle`
+  (Δ1).
+- [x] `getSessionPid` uses WMI CommandLine matching (Δ2).
+- [x] Baseline-per-shell default resolution (Δ3).
+- [x] Return shape includes `argv` and `title` (Δ4).
+- [x] Unit 4.5 row 1 closed, row 3 shipped (Δ5).
+- [x] Unit 5 gets preamble note with flag-file fallback pointer
+  (Δ5 + inline Unit 5 preamble).
 
 ## Resources
 

@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "001"
 tags: [code-review, unit-4, spawn-session, windows, cmd, wmi]
@@ -150,12 +150,16 @@ manifest hits it.
 
 ## Recommended Action
 
-_(to be filled during triage)_
+**Option C — approved 2026-04-20.** Ship Gap 2 (regex extension
+allowing optional opening quote before the name) as part of the
+post-Unit-5 follow-up PR bundle. Add 2-3 tests covering bare,
+double-quoted, and single-quoted forms. Gap 1 is deferred to Unit 11
+so the reject-vs-route-vs-escape policy can be decided against a real
+manifest surface.
 
-Preference: **Option C** — land the Gap 2 regex extension as a small
-follow-up PR; punt Gap 1 to Unit 11 when the real manifest surfaces
-arrive. Unit 11 will have to make the reject-vs-route decision
-anyway once it's loading real user configs.
+Dispatch as part of the "cleanup PR" handoff after Unit 5 merges. Do
+not dispatch solo — bundle with todos #002 and #004 to reduce PR
+overhead.
 
 ## Technical Details
 
