@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p3
 issue_id: "006"
 tags: [code-review, unit-5, architecture, cross-module-coupling, dry]
@@ -93,9 +93,25 @@ classes match. Runs on every push.
 
 ## Recommended Action
 
-Leave blank for triage. **Leaning Option B** — cheapest, preserves
-boundary, and the duplication is unlikely to be edited without the
-editor also grepping for the other side.
+**Option B — approved 2026-04-22 by coord.** Add pinned cross-
+reference comments on both sides naming the sister file + this todo
+id. Preserves the zero-dep hook boundary (cold-start budget matters
+— `session-start.js` runs on every SessionStart), preserves the
+shippable test story (no new shared test harness), and makes the
+invariant legible to the next editor of either file.
+
+Option A (runtime `require`) rejected because it pulls js-yaml into
+the hook's cold-start path. Option C (CI test) rejected because the
+hook's `package.json` is currently zero-dep and adding a
+cross-module test would require wiring. Both options' value is
+"mechanical enforcement" but the invariant is unlikely to be edited
+without the editor noticing the comment (the character class is
+visually distinctive: `[A-Za-z0-9._-]`).
+
+Dispatch as part of the post-Unit-6 cleanup PR bundle with todos
+001, 002, 004, 005, 007. Expected change: 4 LOC across two files
+plus a short "Contract invariants" bullet in
+`agent-orchestrator/hooks/README.md` cross-referencing `parse-manifest.js`.
 
 ## Technical Details
 
