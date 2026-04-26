@@ -92,9 +92,11 @@ clean enough that those gates pass without heroics:
 
 ## What NOT to do
 
-- Do NOT touch files outside your phase directory or the specific files
-  enumerated in the plan excerpt, except to update tests for those
-  files.
+- Do NOT touch files outside your working directory (the universal
+  `## Scope boundary` in the protocol header). Within the working
+  directory, prefer the specific files enumerated in the plan
+  excerpt — extra adjacent edits cause merge conflicts with parallel
+  agents. Test files for the code you change are always in scope.
 - Do NOT modify the plan document. If you find that the plan's scope
   does not match reality, flag it in **Blockers / open questions** — a
   coordinator folds the amendment in a follow-up commit.

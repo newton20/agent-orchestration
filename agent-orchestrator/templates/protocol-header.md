@@ -113,8 +113,14 @@ the heartbeat log (JSONL — one compact JSON object per line, no
 trailing commas):
 
 ```
-{"ts": "<ISO 8601 UTC>", "role": "{{role}}", "phase_id": "{{phase_id}}", "message": "<short status>"}
+{"ts": "<ISO 8601 UTC>", "pid": <your OS process PID>, "role": "{{role}}", "phase_id": "{{phase_id}}", "message": "<short status>"}
 ```
+
+The `pid` field is your own process PID (e.g., `process.pid` in Node,
+`os.getpid()` in Python, `$PID` in PowerShell). It lets a recovery
+agent that respawns this phase distinguish your entries from its own
+when reading the log, and lets the orchestrator correlate liveness
+checks against ground truth.
 
 **Cadence.** Append an entry approximately every 5 minutes of active
 work, or after every ~10 file edits, whichever comes first. You may be

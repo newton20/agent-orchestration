@@ -1,6 +1,6 @@
 ---
 required: [role, phase_id, recovery_checkpoint_path, crash_timestamp, completed_checkpoints_block, remaining_work_block]
-optional: [last_heartbeat_timestamp, prior_session_pid, output_paths]
+optional: [last_heartbeat_timestamp, prior_session_pid, output_paths, heartbeat_path]
 ---
 
 # Phase {{phase_id}} — recovery / resume
@@ -64,19 +64,29 @@ missing, incomplete, or inconsistent with the plan's expected output.
 
 Before touching any file:
 
-1. **Check for `.tmp-*` or `.consuming-*` artifacts** in the phase
+1. **Confirm the prior session is actually dead.** Read the last entry
+   in `{{heartbeat_path}}` (if present) and extract its `pid` field.
+   Look that PID up in the OS process table (`tasklist /FI "PID eq
+   <pid>"` on Windows, `ps -p <pid>` elsewhere). If the PID is still
+   running, **stop and write a `status: blocked` signal** — the
+   orchestrator's death-detection was wrong, and writing into a phase
+   directory the prior agent still owns will corrupt its work. Do not
+   proceed under any circumstances. If the heartbeat log is absent or
+   empty, the prior session never emitted one; proceed but note the
+   absence under **Decisions** in your completion signal.
+2. **Check for `.tmp-*` or `.consuming-*` artifacts** in the phase
    directory or the paths the prior session was writing to. These
    indicate a mid-write crash — a file-rename was in flight when the
    process died. Inspect them, then either complete the rename
    yourself or delete them (document the choice under **Blockers /
    open questions** in your completion signal).
-2. **Verify the last completed checkpoint's artifact matches the plan.**
+3. **Verify the last completed checkpoint's artifact matches the plan.**
    Read the file the prior session claimed to ship and confirm it has
    the expected shape. A completed-checkpoint marker with a
    zero-byte, truncated, or syntactically-invalid artifact is a lie —
    re-do that checkpoint and note the re-do under **Decisions** in
    your signal.
-3. **Run the project's test suite** once before making any change. If
+4. **Run the project's test suite** once before making any change. If
    it was green at the last checkpoint and is not green now, something
    is wrong on disk — stop and write a `status: blocked` signal
    describing what you found. Do not try to "fix forward" through an
@@ -101,15 +111,17 @@ Before touching any file:
 
 ## Output contract
 
-When complete, the artifacts expected by the plan (if any) must exist
+The completion signal at the path given in the protocol header is
+always required — the orchestrator polls for it to advance the phase.
+
+In addition, the artifacts expected by the plan (if any) must exist
 and match the plan's expected shape. The expected paths, when the
 orchestrator has them:
 
 {{output_paths}}
 
-If the block above is empty, the only required artifact for this phase
-is the completion signal. Plus the completion signal itself, at the
-path given in the protocol header.
+If the block above is empty, the completion signal is the only
+required artifact for this phase.
 In your signal's **Summary**, explicitly state: "Resumed from crash at
 `{{crash_timestamp}}`; prior session completed [N] of [M] checkpoints;
 I completed the remaining [M-N]." This gives the orchestrator and the

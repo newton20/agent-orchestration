@@ -23,11 +23,12 @@ optional: [test_commands_block]
 - Advisories (non-blocking concerns you noticed while running the
   playbook) are recorded in a separate **Advisories** section at the
   end of your report. Advisories do not gate merge.
-- If a scope row in `qa-prompt.md` disagrees with the original handoff
-  or the plan, verify against the original source and flag the
-  discrepancy as an advisory. Do not silently follow the rewritten row
-  and do not silently follow the original — report both and let the
-  coordinator triage.
+- If a scope row in `qa-prompt.md` disagrees with the impl completion
+  signal at `${phase_dir}/impl-complete.md` or with the plan, verify
+  against those upstream sources and flag the discrepancy as an
+  advisory. Do not silently follow the rewritten row and do not
+  silently follow the upstream — report both and let the coordinator
+  triage.
 
 ## Playbook rows
 
@@ -47,7 +48,9 @@ non-zero exit code.
 
 Record the per-workspace pass counts and the sum in your report. The
 sum is the single number the coordinator cares about — it should match
-the expected count the handoff specified.
+the expected count the impl completion signal at
+`${phase_dir}/impl-complete.md` specified (under **Verification
+performed** or **Summary**).
 
 ### P2 — Working tree is clean after tests
 
@@ -72,7 +75,9 @@ end-to-end exercise:
 - Invoke the shipped entrypoint the way a user would.
 - Observe the externally-visible behavior (stdout, a file written, a
   process exit code, a log entry).
-- Compare against the expected behavior in the plan or handoff.
+- Compare against the expected behavior in the plan or in the impl
+  completion signal's **Summary** / **Design calls the next phase
+  should know about** sections.
 
 **PASS** if externally-visible behavior matches expectation.
 **FAIL** if behavior differs or the entrypoint cannot be invoked as
@@ -99,27 +104,35 @@ Verify every commit on the branch:
 ### P5 — Diff file list cross-check (advisory-only)
 
 Run `git diff --stat origin/main..HEAD` and compare the listed files
-against the handoff's declared file list. Every file touched by the
-branch should appear in the handoff; every file in the handoff should
-appear in the diff.
+against the impl completion signal's **Files modified** section
+(parsed from `${phase_dir}/impl-complete.md`). Every file touched by
+the branch should appear in **Files modified**; every file listed
+under **Files modified** should appear in the diff.
 
 **Verdict:** always **PASS** — this row exists to surface mismatches as
 advisories, not to gate the merge. A genuinely broken branch (e.g., an
 empty diff when impl was supposed to ship) shows up under P1 (test
 suite) or P3 (happy-path end-to-end), which do gate merge.
 
-For each file in the diff that is NOT in the handoff, append an
+If the impl completion signal cannot be read (missing file, malformed
+frontmatter, missing **Files modified** section), record that as an
+advisory and skip the comparison — the row's `PASS` verdict still
+holds because P5 is structurally non-blocking.
+
+For each file in the diff that is NOT in **Files modified**, append an
 advisory:
 
 - **[advisory]** scope-creep candidate: `<path>` appears in the diff
-  but not in the handoff's file list — check whether the extra touch
-  looks intentional or accidental in Evidence.
+  but not in the impl completion signal's **Files modified** —
+  check whether the extra touch looks intentional or accidental
+  in Evidence.
 
-For each file in the handoff that is NOT in the diff, append an
+For each file in **Files modified** that is NOT in the diff, append an
 advisory:
 
-- **[advisory]** missing output: `<path>` declared in the handoff but
-  not present in the diff — impl may have skipped or re-scoped it.
+- **[advisory]** missing output: `<path>` declared in the impl
+  completion signal but not present in the diff — impl may have
+  skipped or re-scoped it.
 
 ### P6 — Test command discoverability
 

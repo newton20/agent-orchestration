@@ -24,11 +24,18 @@ them with a single simple-string replace:
 ```js
 function fill(template, vars) {
   return Object.entries(vars).reduce(
-    (out, [k, v]) => out.replace(new RegExp(`\\{\\{${k}\\}\\}`, 'g'), v ?? ''),
+    (out, [k, v]) => out.replace(new RegExp(`\\{\\{${k}\\}\\}`, 'g'), () => v ?? ''),
     template,
   );
 }
 ```
+
+The function-form replacement is load-bearing: passing `v` directly as
+the second argument to `String.replace` causes JavaScript to interpret
+`$$`, `$&`, `$'`, `` $` ``, and `$<name>` as backreferences. Real
+values like `plan_units` or `previous_phase_briefing` may legitimately
+contain those sequences (shell snippets, regex examples, jq filters);
+the `() => v ?? ''` form passes the value through verbatim.
 
 **No conditionals. No loops. No Handlebars.** If a template wants
 "render this section only when previous_phase_briefing is non-empty",
