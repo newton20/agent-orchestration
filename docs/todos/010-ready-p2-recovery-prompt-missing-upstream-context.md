@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "010"
 tags: [code-review, templates, recovery, agent-native, unit-6]
@@ -53,7 +53,29 @@ Leave recovery-prompt as-is. Document in `templates/README.md` and the recovery-
 
 ## Recommended Action
 
-(filled during triage — Option A is cheapest, Option B is most correct)
+**Option A — approved 2026-04-26 by coord.** Add
+`previous_phase_briefing`, `qa_scope_rows`, `qa_playbook_block` to
+`recovery-prompt.md`'s `optional` frontmatter list. Add a
+"## Original prompt context" section that conditionally renders
+these (per V1 empty-string-fallback contract — empty optionals
+render with empty bodies, which is acceptable). Update
+`templates/README.md`'s catalog if any of these vars need a note
+about cross-template optional usage.
+
+Closes the safety regression where a respawned impl session for a
+phase with upstream deps had no access to the upstream completion-
+signal briefing.
+
+Option B (orchestrator concatenates original-prompt + crash-
+addendum) is structurally more correct but invasive into Unit 7's
+design. Defer to V1.5 — by then we'll have shipped Unit 7 + Unit
+11 and can decide if the additional concatenation pattern is worth
+the design complexity. Option C (defer entirely) rejected: the
+safety regression is real and an ~8-line frontmatter + section
+addition closes it for V1.
+
+Dispatch as part of the pre-Unit-7 template-fixes PR bundle along
+with todos 009, 011, 014.
 
 ## Technical Details
 

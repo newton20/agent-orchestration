@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "014"
 tags: [code-review, templates, agent-native, recovery, qa, coord, unit-6]
@@ -47,7 +47,33 @@ Group as a single "templates agent-native pass" follow-up. Each finding is a sma
 
 ## Recommended Action
 
-(filled during triage)
+**Approved 2026-04-26 by coord** — fix three of the four findings
+in this bundle; the fourth is closed by todo 009.
+
+- **F1 (qa-prompt scope wording)** → fix. Align `qa-prompt.md`'s
+  scope sentence with `protocol-header.md`'s `workdir` boundary,
+  matching the pattern already applied to `impl-prompt.md` in the
+  PR #5 P1-1 fix. Same prose pattern, different file.
+- **F4 (recovery dirty git index)** → fix. Add a verification step
+  in `recovery-prompt.md`'s pre-resume checklist:
+  > Run `git status` and `git diff --cached`. If files are staged,
+  > document the choice in your completion signal: either commit
+  > as `wip(...)` to preserve prior work, or `git reset HEAD` to
+  > unstage. Do not silently inherit a dirty index.
+- **F3 (dispatcher_advisories machine-parse)** → fix. Add
+  `dispatcher_advisories: <count>` to the QA completion-signal
+  frontmatter shape (in `protocol-header.md`'s schema section + the
+  example in `schema/completion-signal-example.md`). Default 0;
+  QA increments when it detects a dispatcher rewrite per
+  `qa-prompt.md:50-58`.
+- **F2 (coord divergence-recording instruction)** → **closed by
+  todo 009**. Option A's rename of `## Instructions` →
+  `## Dispatched next action` removes the unimplementable
+  divergence-recording instruction along with the heading. No
+  separate fix needed here.
+
+Dispatch as part of the pre-Unit-7 template-fixes PR bundle along
+with todos 009, 010, 011.
 
 ## Technical Details
 

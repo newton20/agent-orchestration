@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "009"
 tags: [code-review, templates, coord, session-handoff-coupling, unit-6]
@@ -53,7 +53,29 @@ Defer to Unit 7 or beyond: extract section heading list from message-templates.m
 
 ## Recommended Action
 
-(filled during triage)
+**Option A — approved 2026-04-26 by coord.** Rename
+`coordinator-briefing.md`'s `## Instructions` heading to
+`## Dispatched next action` (and rename `coord_next_actions` →
+`coord_dispatched_next_action` in the catalog if that improves
+clarity, otherwise keep the variable name unchanged for minimal
+churn). The "indistinguishable from session-handoff" goal was
+always going to be a prose pact, not a guarantee — making the
+heading distinct is more honest and eliminates the authority-
+semantics confusion at the source.
+
+This change ALSO closes todo 014 F2 (coord has nowhere to record
+divergence): drop the unimplementable "record divergence under your
+own Decisions block" instruction together with the rename. The
+revised section reads as recommend-only, no implementation gap to
+patch.
+
+Option B (upstream coupling note + version pin) rejected — silent
+drift remains the failure mode; documentation alone doesn't fix
+it. Option C (parity test) rejected for V1 — cross-repo dependency
+in CI is heavy for a problem Option A solves at the source.
+
+Dispatch as part of the pre-Unit-7 template-fixes PR bundle along
+with todos 010, 011, 014.
 
 ## Technical Details
 
