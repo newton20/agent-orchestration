@@ -6,11 +6,16 @@ optional: [plan_reference_block, git_details_block, warnings_block, artifact_poi
 # Coordinator briefing — phase {{phase_id}}
 
 > This section is prepended with the protocol header. This template
-> produces a briefing shape-compatible with the `~/.claude/skills/session-handoff`
-> skill's `brief coord` output: a coordinator reading either one should
-> not be able to tell them apart. If you extend the section list below,
-> also extend the session-handoff skill's fragment list so the two stay
-> aligned.
+> mirrors the `~/.claude/skills/session-handoff` skill's `brief coord`
+> output for sections 1–6 and 8–9 (Status summary, Decisions, Open
+> questions, Plan reference, Project context, Git details, Warnings,
+> Artifact pointer). Section 7 is intentionally divergent: where
+> session-handoff renders `## Instructions` (an authoritative user
+> directive), this template renders `## Dispatched next action` (a
+> recommend-only routing signal the coord may override). The heading
+> divergence is deliberate — same name, different authority semantics
+> would misroute work. If you extend the shared section list, extend
+> the session-handoff skill's fragment list to match.
 
 ## Role preamble
 
@@ -78,16 +83,18 @@ applies.
 The last N commits and a short status or diff stat. The coord uses this
 to confirm the briefing matches reality before acting on it.
 
-## Instructions
+## Dispatched next action
 
 {{coord_next_actions}}
 
-This block names the specific action the coord should take next — for
-example, "triage todos 005/006/007 before dispatching Unit 6" or
-"dispatch Unit 7 impl on branch `feat/unit-7-prompt-generator` cut from
-main @ `<SHA>`". The coord may choose a different next action, but if
-so, should record the divergence and reason under its own **Decisions**
-block.
+This block names the specific action the briefing recommends the coord
+take next — for example, "triage todos 005/006/007 before dispatching
+Unit 6" or "dispatch Unit 7 impl on branch `feat/unit-7-prompt-generator`
+cut from main @ `<SHA>`". The recommendation is non-binding: the coord
+is the routing authority and may choose a different next action based on
+fuller context. The heading is deliberately distinct from
+session-handoff's `## Instructions` so the lower authority is visible at
+a glance.
 
 ## Warnings
 
@@ -115,6 +122,13 @@ is not expected to produce an artifact in this exact shape. When the
 coord writes its own next brief (e.g., handing off to a downstream impl
 session), it uses the `impl-prompt.md` template or the session-handoff
 skill, not this one.
+
+The `## Dispatched next action` heading intentionally diverges from
+session-handoff's `## Instructions` so the recommend-only authority is
+visible at a glance. The other section names (Status summary, Decisions,
+Open questions, Plan reference, Project context, Git details, Warnings,
+Artifact pointer) are kept in shape-parity with session-handoff `brief
+coord` output. Maintain that parity when extending either side.
 
 If any block above appears empty where you expected content, that is a
 briefing-generation bug — file it as an issue rather than proceeding on

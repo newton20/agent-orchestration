@@ -61,6 +61,7 @@ phase: {{phase_id}}
 status: complete          # complete | blocked | partial
 ended_at: <ISO 8601 UTC>
 git_commit: <short SHA, or "none" if you did not commit>
+dispatcher_advisories: 0  # integer count, default 0; QA increments per advisory it raises about a dispatched-row rewrite (see qa-prompt's Cross-verification block); any non-zero value should trigger coord investigation
 ---
 
 ## Summary
@@ -78,6 +79,10 @@ git_commit: <short SHA, or "none" if you did not commit>
 next agent must preserve. Use this instead of a prose handoff note —
 the next agent will parse this section.>
 
+## Decisions
+- <decision 1> — <why; what alternatives you considered>
+- (or: "none")
+
 ## Blockers / open questions
 - <blocker 1> — <what you tried, what would unblock you>
 - (or: "none")
@@ -91,6 +96,28 @@ the next agent will parse this section.>
 The frontmatter carries machine-parseable status; the body carries the
 structured narrative the next agent (and the human reviewer) will read.
 Both are required — do not omit either half.
+
+The **Decisions** section captures choices the agent made during the
+phase that affect the next agent's options but are not invariants the
+next agent must preserve (those go under **Design calls the next
+phase should know about**). Examples: "preserved prior session's
+staged work as wip rather than discarding," "chose Option B from
+todo 011 over Option A because…," "ran tests with `--shard 2/3`
+instead of full suite because of timeout." If you have no such
+decisions, render the section as `- none`. The recovery flow uses
+this section to record dirty-index handling choices; impl phases use
+it for trade-offs that came up during implementation.
+
+The `dispatcher_advisories` field exists so a coord parsing the report
+by frontmatter alone can detect dispatcher / prompt-generation bugs
+without reading prose. The default value `0` means "no dispatcher
+issues observed." A QA agent that runs a row as the impl artifacts
+described it (because the dispatched scope row appeared rewritten in
+transit) increments this count by one and surfaces the detail in the
+report's **Advisories** section per `qa-prompt.md`'s Cross-verification
+guidance. Roles other than QA leave it at `0`. Any non-zero value
+should trigger coord investigation of the dispatcher / prompt
+generator before the next phase is dispatched.
 
 If you genuinely cannot complete the phase, set `status: blocked` in the
 frontmatter and populate **Blockers / open questions**. The orchestrator

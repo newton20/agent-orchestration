@@ -5,6 +5,7 @@ phase: phase-0-scaffold
 status: complete
 ended_at: 2026-04-17T04:12:13Z
 git_commit: a7f3c92
+dispatcher_advisories: 0
 ---
 
 # Phase phase-0-scaffold — impl complete
@@ -49,6 +50,11 @@ without reshaping the tree.
 - **Turborepo pipeline:** `build` depends on `^build`, so every package must declare a `build` script in its `package.json` even if it is a stub. Phase-1 will add the app; do not forget its build script.
 - **ESLint base:** `@repo/eslint-config` exports a flat-config array. Apps extend it as `{ extends: ['@repo/eslint-config'] }`. If the app needs Next.js rules specifically, add them locally — do not modify the shared base.
 - **No Prettier config yet.** Deferred to a future phase to avoid conflicting with ESLint-driven formatting decisions.
+
+## Decisions
+
+- Picked Turborepo 2.x over Nx for the monorepo orchestration — chose Turborepo because the project already uses pnpm and Turborepo's caching ergonomics fit better than Nx's heavier graph model for a 2-app starter. Reversible if Nx-only features become load-bearing later.
+- None of the deferred items above (Prettier, shared billing models package) were considered blocking for phase-0 — they are explicit phase-2/future scope.
 
 ## Blockers / open questions
 
