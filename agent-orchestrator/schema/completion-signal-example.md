@@ -56,9 +56,17 @@ without reshaping the tree.
 - Picked Turborepo 2.x over Nx for the monorepo orchestration — chose Turborepo because the project already uses pnpm and Turborepo's caching ergonomics fit better than Nx's heavier graph model for a 2-app starter. Reversible if Nx-only features become load-bearing later.
 - None of the deferred items above (Prettier, shared billing models package) were considered blocking for phase-0 — they are explicit phase-2/future scope.
 
+<!--
+Empty-state form for `## Decisions` and `## Blockers / open questions`:
+when the section has no items, render it as a single `- none` bullet
+— lowercase, no quotes, no trailing punctuation. The Blockers section
+below shows that empty-state form; the Decisions section above shows
+the populated form. See protocol-header.md L82-89, L100-110.
+-->
+
 ## Blockers / open questions
 
-- None.
+- none
 
 ## Verification performed
 

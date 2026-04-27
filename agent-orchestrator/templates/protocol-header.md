@@ -81,11 +81,11 @@ the next agent will parse this section.>
 
 ## Decisions
 - <decision 1> — <why; what alternatives you considered>
-- (or: "none")
+- (or, if empty: `- none`)
 
 ## Blockers / open questions
 - <blocker 1> — <what you tried, what would unblock you>
-- (or: "none")
+- (or, if empty: `- none`)
 
 ## Verification performed
 - [x] <verification item from the prompt's checklist>
@@ -100,13 +100,17 @@ Both are required — do not omit either half.
 The **Decisions** section captures choices the agent made during the
 phase that affect the next agent's options but are not invariants the
 next agent must preserve (those go under **Design calls the next
-phase should know about**). Examples: "preserved prior session's
+phase should know about**). If the next agent could pick a different
+choice and still ship correctly, it goes here. If the next agent
+would break shipped invariants by picking a different choice, it
+goes under **Design calls**. Examples: "preserved prior session's
 staged work as wip rather than discarding," "chose Option B from
 todo 011 over Option A because…," "ran tests with `--shard 2/3`
 instead of full suite because of timeout." If you have no such
-decisions, render the section as `- none`. The recovery flow uses
-this section to record dirty-index handling choices; impl phases use
-it for trade-offs that came up during implementation.
+decisions, render the section as `- none` (lowercase, no quotes, no
+trailing punctuation). The recovery flow uses this section to record
+dirty-index handling choices; impl phases use it for trade-offs that
+came up during implementation.
 
 The `dispatcher_advisories` field exists so a coord parsing the report
 by frontmatter alone can detect dispatcher / prompt-generation bugs

@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "015"
 tags: [code-review, templates, recovery, agent-native, unit-7]
@@ -46,7 +46,33 @@ The recovery-prompt simplicity trim already targets ~30 LOC reduction in step 3 
 
 ## Recommended Action
 
-(empty — fill in during triage)
+**Option A — approved 2026-04-27 by coord.** Three targeted edits to
+`recovery-prompt.md`:
+
+1. **Cross-role guidance at L301-308:** move the "Document the choice…
+   prefer the wip commit" paragraph INSIDE the `**If your role is
+   `impl` or `coord`:**` branch (indent under that subhead) so it
+   scopes correctly. Split off the universal "prefer `status: blocked`
+   if you can't scope the file list" sentence as a separate
+   role-agnostic paragraph at the outer indent.
+2. **Empty-bucket guards on L278-294:** prepend each numbered step
+   (1 TRACKED-OR-STAGED, 2 UNTRACKED) with an explicit empty-set
+   guard: "If the X bucket from the classification step is empty,
+   skip this step. Otherwise: …"
+3. **Playbook-row coverage on L234:** replace "scope rows" with
+   "scope or playbook rows" (or "rows (scope or playbook)") so a
+   QA-recovery whose dirty state occludes a playbook row gets the
+   same SKIP-marking guidance as for scope rows.
+
+Closes all three literal-reading-agent ambiguities surgically without
+restructuring. Adds ~6 LOC.
+
+Option B (defer to simplicity-trim follow-up todo 020) rejected —
+couples a P2 quality fix to a P3 stylistic cleanup whose timing is
+post-Unit-7. The fixes belong before Unit 7 dispatches.
+
+Dispatch as part of the pre-Unit-7 fixes round 2 PR bundle along
+with todos 016, 017, 019.
 
 ## Technical Details
 

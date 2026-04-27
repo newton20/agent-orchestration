@@ -241,6 +241,18 @@ the caller passes an empty block, not by leaving the variable blank.
    and will conservatively block. The preservation is path-scoped (no
    other agent reads or writes the `.original.md` suffix).
 
+   **Re-recovery briefing invariant.** On a re-recovery dispatch (the
+   second or later recovery for the same phase/role), the
+   `previous_phase_briefing` passed to the recovery prompt MUST equal
+   the briefing from the most-recent prior recovery dispatch (or, if
+   none, the original dispatch). The recovery template's audit step
+   compares against `${role}-prompt.original.md` — drift between the
+   original and a re-recovery's briefing will produce a false
+   `status: blocked`. If a future Unit 7 change ever needs to refresh
+   `previous_phase_briefing` on recovery (e.g., because an upstream
+   completed in the interim), the audit step's contract has to evolve
+   in the same PR — see todo 017 for the full rationale.
+
 ## Open questions for Unit 7
 
 These are the interpolation edge cases the template author expects
@@ -269,6 +281,14 @@ the Unit 7 design doc:
    interpolating? The catalog assumes Unit 7 does it (so the caller
    can pass `""` indifferently) — document this in the Unit 7 design
    so callers do not duplicate the logic.
+5. **`dispatcher_advisories` evolution.** The field is
+   `dispatcher_advisories: <int>` in V1 (count only; evidence in
+   `## Advisories` body section). When a second consumer (Unit 11
+   dashboard, automated triager) appears, evolve to a structured
+   array `dispatcher_advisories: [{row, original_in_handoff,
+   rewritten_in_dispatch}, ...]` so the evidence trail is parseable
+   in the same place as the existence signal. Until then, the
+   integer is sufficient for the single-coord-reads-prose pattern.
 
 If Unit 7's implementation surfaces additional edge cases, fold them
 back into this README rather than letting them live only in code
