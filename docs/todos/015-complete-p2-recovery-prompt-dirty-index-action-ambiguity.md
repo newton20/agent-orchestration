@@ -1,5 +1,5 @@
 ---
-status: ready
+status: complete
 priority: p2
 issue_id: "015"
 tags: [code-review, templates, recovery, agent-native, unit-7]
