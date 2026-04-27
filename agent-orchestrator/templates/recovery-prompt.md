@@ -232,9 +232,9 @@ Before touching any file:
      `qa-prompt.md`'s Output contract: "blocked for any FAIL"),
      regardless of how the rest of the run goes.
    - If the dirty state additionally prevents you from running other
-     scope rows (e.g., it occludes a verification), mark those rows
-     `SKIP (reason: occluded by inherited dirty state — see P2)`
-     rather than silently failing or cleaning.
+     scope or playbook rows (e.g., it occludes a verification), mark
+     those rows `SKIP (reason: occluded by inherited dirty state —
+     see P2)` rather than silently failing or cleaning.
 
    The advisory-only recording reserved by the original QA contract
    is for non-blocking concerns, not for inherited dirty-tree state
@@ -276,36 +276,43 @@ Before touching any file:
        `git restore` can address.
 
      **Then run the appropriate command per set:**
-     1. For **TRACKED-OR-STAGED** paths only: `git restore --staged
-        --worktree -- <tracked-files>` to revert both index and
-        worktree to HEAD in one step. (Running this against
-        untracked paths errors with "pathspec did not match,"
-        which is why the classification step matters.)
-     2. For **UNTRACKED** paths only: `git clean -f -- <untracked-files>`
-        for individual files, or `git clean -fd -- <untracked-dirs>`
-        if the prior session left a whole directory of new files.
-        These invocations are path-scoped, so they never touch
-        sibling agents' untracked work.
-     3. After both steps, re-run `git status -- <original-list>`
-        and confirm the path-scoped state is clean. If anything
-        remains (rare — usually a subtree case the simple status
-        classification missed), STOP and write `status: blocked`
-        rather than improvise additional commands. The coord can
-        triage with full repo context.
+     1. If the **TRACKED-OR-STAGED** bucket from the classification
+        step is empty, skip this step. Otherwise, for the
+        TRACKED-OR-STAGED paths: `git restore --staged --worktree --
+        <tracked-files>` to revert both index and worktree to HEAD
+        in one step. (Running this against untracked paths errors
+        with "pathspec did not match," which is why the
+        classification step matters.)
+     2. If the **UNTRACKED** bucket from the classification step is
+        empty, skip this step. Otherwise, for the UNTRACKED paths:
+        `git clean -f -- <untracked-files>` for individual files, or
+        `git clean -fd -- <untracked-dirs>` if the prior session
+        left a whole directory of new files. These invocations are
+        path-scoped, so they never touch sibling agents' untracked
+        work.
+     3. After running the applicable step(s) above, re-run
+        `git status -- <original-list>` and confirm the path-scoped
+        state is clean. If anything remains (rare — usually a
+        subtree case the simple status classification missed), STOP
+        and write `status: blocked` rather than improvise additional
+        commands. The coord can triage with full repo context.
 
      Do NOT use `git reset --hard HEAD`, `git clean -fd` without a
      path argument, or any other repo-wide destructive command — they
      would also wipe sibling agents' uncommitted work in other
      workdirs of the same tree.
 
-   Document the choice, the path-scoped file list, and the reasoning
-   under **Decisions** in your completion signal so the coord can audit
-   the call. If both options feel risky, prefer the wip commit —
-   preserving evidence is reversible; discarding is not. If you cannot
-   confidently scope the file list (e.g., the recovery checkpoint is
-   empty and you can't tell which files were the prior session's
-   versus a sibling's), prefer `status: blocked` — the coord can
-   triage with full repo context that you don't have.
+   If your role is `impl` or `coord`, document the choice (preserve
+   vs. discard), the path-scoped file list, and the reasoning under
+   **Decisions** in your completion signal so the coord can audit the
+   call. If both options feel risky, prefer the wip commit —
+   preserving evidence is reversible; discarding is not.
+
+   Across all roles (`impl`, `qa`, `coord`): if you cannot confidently
+   scope the file list (e.g., the recovery checkpoint is empty and you
+   can't tell which files were the prior session's versus a
+   sibling's), prefer `status: blocked` — the coord can triage with
+   full repo context that you don't have.
 4. **Verify the last completed checkpoint's artifact matches the plan.**
    Read the file the prior session claimed to ship and confirm it has
    the expected shape. A completed-checkpoint marker with a

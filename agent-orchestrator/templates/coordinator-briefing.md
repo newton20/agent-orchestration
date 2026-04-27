@@ -130,6 +130,16 @@ Open questions, Plan reference, Project context, Git details, Warnings,
 Artifact pointer) are kept in shape-parity with session-handoff `brief
 coord` output. Maintain that parity when extending either side.
 
+The briefing's empty-state placeholders — `(no decisions captured)`,
+`(no open questions)`, `(no warnings)` — deliberately diverge from the
+completion-signal schema's canonical `- none` form (see
+`protocol-header.md`'s **Decisions** section). The briefing is a
+human-read artifact where the descriptive parenthetical makes
+"looked-and-found-nothing" legible at a glance; the completion-signal
+schema's `- none` is parser-friendly for the coord and Unit 7 tooling
+that read signals as data. Both choices are deliberate — do not force
+them into parity.
+
 If any block above appears empty where you expected content, that is a
 briefing-generation bug — file it as an issue rather than proceeding on
 incomplete state.
