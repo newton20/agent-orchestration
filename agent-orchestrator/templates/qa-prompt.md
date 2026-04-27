@@ -1,6 +1,6 @@
 ---
 required: [phase_id, pr_or_branch_under_test, qa_scope_rows, qa_playbook_block, completion_signal_path]
-optional: [previous_phase_briefing]
+optional: [previous_phase_briefing, test_commands_block]
 ---
 
 # Phase {{phase_id}} — QA assignment
@@ -54,8 +54,14 @@ at `${phase_dir}/impl-prompt.md` and `${phase_dir}/impl-complete.md`
 (substitute the phase directory path the protocol header gave you). If
 the impl's own artifacts say something different from the scope row
 above, **run the row as the impl artifacts said** and flag the rewrite
-as an advisory in your report. This protects against prompt-generation
-or dispatcher bugs that would otherwise silently false-FAIL valid work.
+as an advisory in your report. Also **increment the
+`dispatcher_advisories` count in your completion-signal frontmatter**
+by one for each rewrite you detect (see the protocol header's
+Completion-signal-format section) — this gives the coord a
+machine-parseable bridge to the dispatcher-bug signal so it can route
+investigation without scraping prose. This protects against
+prompt-generation or dispatcher bugs that would otherwise silently
+false-FAIL valid work.
 
 ## Playbook (reusable)
 
@@ -93,8 +99,12 @@ sections, the QA report must include:
 - **Do not aggregate.** Every row is its own verdict. A single FAIL
   with four PASSes around it is reported as FAIL, not as "4/5 green."
   The coordinator aggregates; QA records.
-- **Do not modify files outside this phase's workspace** except for
-  invoking tests and running git commands. If a test accidentally
+- **Do not modify files outside your working directory** (the universal
+  `## Scope boundary` in the protocol header, which resolves to the
+  `workdir` value the orchestrator passed) except for invoking tests
+  and running git commands. Running tests and `git` commands inside the
+  working directory is in scope — the boundary is "do not edit files
+  outside it," not "do not act inside it." If a test accidentally
   leaves files on disk, that is a finding (see playbook row P2), not
   something for you to clean up.
 
