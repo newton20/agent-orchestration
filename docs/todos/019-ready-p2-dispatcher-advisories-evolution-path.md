@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "019"
 tags: [code-review, templates, schema, completion-signal, unit-7, future-evolution]
@@ -53,7 +53,32 @@ Keep `dispatcher_advisories: <int>` as required, add `dispatcher_advisory_detail
 
 ## Recommended Action
 
-(empty — fill in during triage)
+**Option A — approved 2026-04-27 by coord.** Add one bullet to
+`templates/README.md`'s "Open questions for Unit 7" section:
+
+> **dispatcher_advisories evolution.** The field is `dispatcher_advisories: <int>`
+> in V1 (count only; evidence in `## Advisories` body section). When
+> a second consumer (Unit 11 dashboard, automated triager) appears,
+> evolve to a structured array `dispatcher_advisories: [{row,
+> original_in_handoff, rewritten_in_dispatch}, ...]` so the evidence
+> trail is parseable in the same place as the existence signal. Until
+> then, the integer is sufficient for the single-coord-reads-prose
+> pattern.
+
+Pure documentation. Records the evolution gate without churning the
+V1 schema; tells future maintainers (Unit 11 author, automated
+triager author) that the integer is a known evolution decision, not
+an oversight.
+
+Option B (promote to structured array now) rejected — heavier V1
+contract for no current consumer; creates more agent burden (QA
+must produce structured records) before any reader needs the
+structure. Option C (hybrid count + optional details) rejected —
+two related fields with overlapping semantics is worse than one
+field with documented evolution path.
+
+Dispatch as part of the pre-Unit-7 fixes round 2 PR bundle along
+with todos 015, 016, 017. Pure documentation.
 
 ## Technical Details
 

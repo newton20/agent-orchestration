@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "017"
 tags: [code-review, templates, recovery, unit-7]
@@ -48,7 +48,31 @@ Recovery's audit currently blocks when the original was non-empty AND the recove
 
 ## Recommended Action
 
-(empty — fill in during triage)
+**Option A — approved 2026-04-27 by coord.** Add one sentence to
+`templates/README.md`'s section 5 (Original-prompt preservation
+contract, around line 242):
+
+> On a re-recovery dispatch, the `previous_phase_briefing` passed to
+> the recovery prompt MUST equal the briefing from the most-recent
+> prior recovery dispatch (or, if none, the original dispatch). The
+> recovery template's audit step compares against
+> `${role}-prompt.original.md` — drift between the original and a
+> re-recovery's briefing will produce a false `status: blocked`.
+
+Pins Unit 7's contract to the audit step's existing assumption.
+Future-proofs against well-meaning "refresh briefing on recovery
+dispatch" PRs that would silently break the audit's trust chain.
+
+Option B (snapshot the briefing alongside the original prompt) is
+overkill for a documentation gap — adds a second preserved-artifact
+path to solve a problem one sentence solves. Defer to V1.5 if the
+audit step's trust chain ever needs harder enforcement. Option C
+(make the audit squishier) loses the codex-round-6 safety property
+that put the "missing context = blocked" tripwire in place.
+
+Dispatch as part of the pre-Unit-7 fixes round 2 PR bundle along
+with todos 015, 016, 019. Pure documentation — no recovery-prompt
+edit needed.
 
 ## Technical Details
 

@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "016"
 tags: [code-review, templates, schema, completion-signal, unit-7]
@@ -53,7 +53,38 @@ PR #6 added a `## Decisions` body section to the completion-signal schema in `pr
 
 ## Recommended Action
 
-(empty — fill in during triage)
+**Option A — approved 2026-04-27 by coord.** Pick `- none` as the
+canonical empty-state form (matches protocol-header.md:106 prose; is
+shortest; is parser-friendly). Three propagation edits + one prose
+sharpening:
+
+1. **Update protocol-header.md:82-84 inline schema box** — replace
+   `- (or: "none")` with `- none` so the inline schema and the prose
+   at L106 agree.
+2. **Add an empty-state worked example** to
+   `schema/completion-signal-example.md`. Either a second `## Decisions`
+   block showing the empty case, or a comment near the existing
+   populated example pointing at the canonical empty-state form.
+3. **Sharpen the partition rule** at protocol-header.md:100-109. Add
+   one sentence: *"If the next agent could pick a different choice
+   and still ship correctly, it goes here. If the next agent would
+   break shipped invariants by picking a different choice, it goes
+   under **Design calls**."*
+4. **Briefing-side parity** (`coordinator-briefing.md`'s
+   `(no decisions captured)` placeholder): align with `- none` for
+   parity, OR document the divergence explicitly. Coord prefers
+   alignment for parser uniformity — pick `- none` here too unless
+   the briefing-side prose truly needs the descriptive form.
+
+Removes parser branches in Unit 7 and gives literal-reading agents a
+single canonical answer to "how do I render empty Decisions."
+
+Option B (document all three forms as equivalent) rejected — pushes
+complexity to Unit 7's parser AND lets the inconsistency rot when a
+fourth form appears. One canonical form is the right move.
+
+Dispatch as part of the pre-Unit-7 fixes round 2 PR bundle along
+with todos 015, 017, 019.
 
 ## Technical Details
 
