@@ -75,6 +75,10 @@ const KNOWN_PHASE = new Set([
 // Phase ids must be safe as filesystem path segments AND YAML map keys.
 // Enforced by validate() so every downstream consumer (scaffold-protocol,
 // spawn-session, runUpdate, future orchestrator) gets the guarantee.
+//
+// ID character class. Must stay in sync with FLAG_NAME_RE in
+// agent-orchestrator/hooks/session-start.js. See docs/todos/006
+// for context; change both or neither.
 const VALID_ID_RE = /^[A-Za-z0-9._-]+$/;
 const UNSAFE_ID_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
 

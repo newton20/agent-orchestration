@@ -1,5 +1,5 @@
 {
-  "_comment": "SessionStart hook command shape — the escaped double-quotes around ${CLAUDE_PLUGIN_ROOT} are load-bearing. Claude Code on Windows invokes this command through Git Bash (spike finding, see agent-orchestrator/spikes/launcher-compat-findings.md). Bash preserves backslashes verbatim inside double-quoted variable expansions (only $, `, \", \\ and newline get escape-interpretation there), so a Windows-style expansion like C:\\Users\\... stays intact as one argv token. The quotes also prevent word-splitting if the expanded path contains spaces. The Unit 4.5 spike's backslash-collapse failure was with raw literal paths in the command text, not quoted expansions — a separate case. This is the same shape as spikes/hook-env-spike-hooks.json, which fired under all three launchers during the spike.",
+  "_comment": "Quoted \"${CLAUDE_PLUGIN_ROOT}\" is load-bearing under Git Bash — see hooks/README.md and spikes/launcher-compat-findings.md",
   "hooks": {
     "SessionStart": [
       {
