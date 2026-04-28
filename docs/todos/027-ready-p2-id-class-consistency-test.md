@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "027"
 tags: [code-review, post-pr-9, ce-review, hooks, scripts, cross-module-coupling, test-coverage]
@@ -97,7 +97,30 @@ require/relative path; explicit "this is a cross-module invariant test."
 
 ## Recommended Action
 
-_(Filled during triage.)_
+**Option B — approved 2026-04-28 by coord.** Add the consistency test
+in `scripts/parse-manifest.test.js` (or a sibling `*.test.js` in
+`scripts/`). The scripts/ test workspace already imports js-yaml and
+has the dependency surface to require both modules; the hooks/ test
+workspace is intentionally zero-dep on parse-manifest.js (cold-start
+budget) so adding a cross-module require there violates that boundary.
+A new repo-root `tests/` workspace (Option C) is overengineering for a
+single 2-line invariant.
+
+The test should:
+1. `require('./parse-manifest').VALID_ID_RE` and
+   `require('../hooks/session-start').FLAG_NAME_RE` (or
+   `__test.FLAG_NAME_RE` if it's under that namespace).
+2. Extract the inner character class from each and assert equivalence
+   (e.g. via the `.source` field, comparing the bracketed class).
+3. Fail loudly if either regex's character class drifts.
+
+Converts the prose-only Option B contract from todo 006 into a CI
+tripwire without violating either the cold-start zero-dep boundary
+(test-time vs runtime require distinction) or the no-shared-test-
+harness story.
+
+Dispatch as part of the pre-Unit-7 round 3 PR bundle along with
+todos 028, 029, 030, 031.
 
 ## Technical Details
 

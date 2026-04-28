@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "029"
 tags: [code-review, post-pr-9, ce-review, hooks, unit-11, docs, plan-update]
@@ -105,7 +105,46 @@ amendments are routinely deferred per project workflow.
 
 ## Recommended Action
 
-_(Filled during triage.)_
+**Option A — approved 2026-04-28 by coord.** Three-part doc update,
+all small, all load-bearing for Unit 11:
+
+1. **Source-comment expansion at `session-start.js:23-29`.** Add the
+   10× ratio rationale inline so future tuners see it without
+   trail-following: e.g. "10 × FLAG_TTL_MS ⇒ 600_000 ms / 10 minutes.
+   The 10× multiplier (vs 5× or 30×) is chosen so the GC window is
+   long enough to inspect a failed spawn (typical post-incident
+   investigation arrives within minutes) and short enough to keep the
+   per-tick `statSync` count bounded by realistic crash recency. See
+   docs/todos/005:108-125 for the soft-vs-hard-TTL framing."
+
+2. **Plan §1083-1090 update.** Edit
+   `docs/plans/2026-04-15-001-feat-agent-orchestration-plugin-plan.md`
+   to update the hook's lockstep export surface from
+   `{ runHook, FLAG_TTL_MS, MAX_FLAG_BYTES, FLAG_NAME_RE }` (4
+   elements) to
+   `{ runHook, FLAG_TTL_MS, STALE_HARD_TTL_MS, MAX_FLAG_BYTES, FLAG_NAME_RE }`
+   (5 elements). Critical for Unit 11 readability since Unit 11
+   reads the plan first and must require the correct exports.
+
+3. **Writer atomic-rename invariant in `hooks/README.md`.** Add a
+   bullet to the "Contract invariants" section: "Writers (Unit 11
+   orchestrator, manual debugging tools) MUST place
+   `.pending-<id>` files via atomic write-then-rename
+   (`writeFileSync(tmpPath, content); renameSync(tmpPath, flagPath)`),
+   never via direct `writeFileSync(flagPath, content)`. Without
+   atomic write, the hook's `statSync` could see a 0-byte mid-write
+   file with mtime=now and pass the freshness gate only to fail
+   size-guard or read mid-stream. The hook deletes via atomic rename
+   on consume; writers must be symmetric on creation."
+
+Option B (just the README writer-invariant; defer source/plan)
+leaves Unit 11's plan-reading on a stale 4-export claim — that's a
+Unit 11 readability bug, not a deferral candidate. Option C (defer
+all until Unit 11 dispatch) misses the chance to fix three small
+gaps now in a single bundle.
+
+Dispatch as part of the pre-Unit-7 round 3 PR bundle along with
+todos 027, 028, 030, 031. ~10-15 LOC across 3 files.
 
 ## Technical Details
 

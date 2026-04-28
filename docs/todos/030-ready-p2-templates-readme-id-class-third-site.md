@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "030"
 tags: [code-review, post-pr-9, ce-review, templates, docs, cross-module-coupling]
@@ -95,7 +95,33 @@ in hooks/README.md. Belt-and-suspenders.
 
 ## Recommended Action
 
-_(Filled during triage.)_
+**Option C — approved 2026-04-28 by coord.** Both A and B:
+
+1. **Back-pointer in `templates/README.md:122`** (the `phase_id`
+   catalog entry). Extend the existing description to cite the
+   lockstep cluster: "Phase identifier matching `VALID_ID_RE`
+   (`[A-Za-z0-9._-]+`). The character class is shared with
+   `parse-manifest.js`'s `VALID_ID_RE` and `session-start.js`'s
+   `FLAG_NAME_RE` — change all three or none. See
+   `hooks/README.md` Contract invariants and docs/todos/006 / 030
+   for context."
+
+2. **Inventory bullet in `hooks/README.md` "Contract invariants"
+   section.** Add `templates/README.md:122` (the `phase_id`
+   catalog entry) to the list of sites encoding the ID character
+   class. The README's invariants section already names two sites
+   (parse-manifest.js + session-start.js); adding the third makes
+   the list complete and tells future editors of any one site to
+   update all three.
+
+Option A alone leaves the inventory list at hooks/README.md
+incomplete (a future editor reading the list won't know to update
+templates/README.md). Option B alone doesn't help readers of
+templates/README.md who reach for the catalog entry first. Both
+together close the loop in either reading order.
+
+Dispatch as part of the pre-Unit-7 round 3 PR bundle along with
+todos 027, 028, 029, 031. ~3-5 LOC across 2 files.
 
 ## Technical Details
 

@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "031"
 tags: [code-review, post-pr-9, qa-advisory, security, scripts, yaml]
@@ -89,7 +89,33 @@ parse-manifest.js" and stand alone on its own merits.
 
 ## Recommended Action
 
-_(Filled during triage.)_
+**Option C — approved 2026-04-28 by coord.** Pin both
+`parse-manifest.js` `yaml.load` sites to `DEFAULT_SCHEMA` AND update
+the symmetry comment in `spawn-session.js`:
+
+1. **`parse-manifest.js:161` (`loadManifest`)** — change
+   `yaml.load(raw)` to
+   `yaml.load(raw, { schema: yaml.DEFAULT_SCHEMA })`.
+2. **`parse-manifest.js:722` (`runUpdate`)** — same.
+3. **`spawn-session.js:268-269` symmetry comment** — update to
+   reflect the now-true claim that all three sites are explicitly
+   pinned. Something like: "Pinned to DEFAULT_SCHEMA for parity with
+   the calls in parse-manifest.js — preserves merge keys; defends
+   against a future js-yaml downgrade silently re-enabling
+   !!js/function execution."
+
+Defense-in-depth (the launcher load justifies the same defense for
+the manifest/manifest-status loads — both consume operator-trusted
+YAML but neither needs `!!js/function`); makes the symmetry comment
+literally true; closes QA Advisory A1 from PR #9.
+
+Option A alone (pin without comment update) leaves the comment
+slightly inaccurate. Option B alone (drop the symmetry claim) loses
+defense-in-depth at the parse-manifest sites that the launcher load
+already enforces. Option C closes both sides of the symmetry.
+
+Dispatch as part of the pre-Unit-7 round 3 PR bundle along with
+todos 027, 028, 029, 030. ~3-4 LOC across 2 files.
 
 ## Technical Details
 

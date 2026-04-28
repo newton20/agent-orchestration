@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "028"
 tags: [code-review, post-pr-9, ce-review, security, spawn-session, docs]
@@ -101,7 +101,32 @@ the Unit 11 dispatch.
 
 ## Recommended Action
 
-_(Filled during triage.)_
+**Option A — approved 2026-04-28 by coord.** Extend the existing
+trust-boundary paragraph at `spawn-session.js:42-45` (or wherever the
+current header doc lives) to name all three gaps:
+
+1. **windowTarget** is trusted pass-through (no format guard in V1;
+   F2 from todo 004 deferred to Unit 11).
+2. **Per-call args** (`name`, `model`, `pluginDir`, `title`,
+   `workdir`) are *quoted-not-validated* — defended at the quoting
+   layer by `q()` / `qPath()`, NOT by upstream validation. Phase IDs
+   used as session names are independently validated by
+   `parse-manifest.js`'s `VALID_ID_RE`; other per-call args trust the
+   caller to pass sane values.
+3. **Manifest path passed via `--launcher`** is itself trusted: the
+   operator picks the YAML path; spawn-session does no traversal
+   validation. When higher-layer callers (web UI, API) pass launcher
+   paths from less-trusted input, the higher layer must validate the
+   path before calling spawn-session.
+
+Option B (move to scripts/README.md dedicated section) splits doc
+location for a 5-line addition; readers who already trust the inline
+header would still see only the original paragraph. Option C (defer
+to Unit 11) leaves the foot-gun in place; the gaps surface during
+security review, not Unit 11 design.
+
+Dispatch as part of the pre-Unit-7 round 3 PR bundle along with
+todos 027, 029, 030, 031. Pure documentation (~5-8 LOC).
 
 ## Technical Details
 
