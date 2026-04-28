@@ -110,20 +110,24 @@ the symmetry comment in `spawn-session.js`:
 2. **`parse-manifest.js:722` (`runUpdate`)** — same.
 3. **`spawn-session.js:268-269` symmetry comment** — update to
    reflect the now-true claim that all three sites are explicitly
-   pinned. Something like: "Pinned to DEFAULT_SCHEMA for parity with
-   the calls in parse-manifest.js — preserves merge keys; defends
-   against a future js-yaml downgrade silently re-enabling
-   !!js/function execution."
+   pinned. Use parity / intent / merge-keys framing only — do NOT
+   add downgrade-defense language to the comment (see the Caveat in
+   the Problem Statement; `DEFAULT_SCHEMA` is not a downgrade defense
+   and the source comment must not claim it is). Something like:
+   "Pinned to DEFAULT_SCHEMA for parity with the calls in
+   parse-manifest.js — preserves merge keys (`<<`) and timestamps;
+   making the choice explicit at every site documents intent."
 
-Defense-in-depth (the launcher load justifies the same defense for
-the manifest/manifest-status loads — both consume operator-trusted
-YAML but neither needs `!!js/function`); makes the symmetry comment
-literally true; closes QA Advisory A1 from PR #9.
+Closes QA Advisory A1 from PR #9 by making all three call sites
+match. The pin's value is symmetry + intent, not downgrade defense
+(library-version pinning in `package.json` is what defends against a
+v3 downgrade, not the schema name).
 
-Option A alone (pin without comment update) leaves the comment
-slightly inaccurate. Option B alone (drop the symmetry claim) loses
-defense-in-depth at the parse-manifest sites that the launcher load
-already enforces. Option C closes both sides of the symmetry.
+Option A alone (pin without comment update) leaves the symmetry
+comment in spawn-session.js still claiming a parallel that doesn't
+exist on the other side. Option B alone (drop the symmetry claim)
+walks back the explicit-pin breadcrumb at the launcher site for no
+gain. Option C closes both sides.
 
 Dispatch as part of the pre-Unit-7 round 3 PR bundle along with
 todos 027, 028, 029, 030. ~3-4 LOC across 2 files.
