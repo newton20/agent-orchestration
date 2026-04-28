@@ -313,14 +313,20 @@ plus the seventh decision the dispatch handoff added.
    same bytes. Tested by `output is LF only on disk (no CRLF)
    regardless of input templates`.
 
-3. **Catalog sync — README-only.** Unit 7 parses the variable-catalog
-   tables in this README directly (one regex per table); no
-   `templates/variables.json` mirror exists. The mirror would pay
-   for itself once a second consumer beyond Unit 7 exists or once
-   the catalog grows past ~15 variables. Today it is 31 entries with
-   one consumer; the duplication cost outweighs the maintenance
-   cost. Revisit if Unit 11's dashboard or an automated triager
-   begins reading the catalog.
+3. **Catalog sync — README-only, frontmatter-authoritative.** No
+   `templates/variables.json` mirror exists, AND Unit 7 does not
+   regex-parse the README's variable-catalog tables either. The
+   renderer's authoritative variable surface for any given template
+   is that template's own YAML frontmatter (`required ∪ optional`);
+   the catalog above is the human-facing pairwise reference for
+   contributors. Drift between the catalog prose and a template's
+   frontmatter is a human-review concern, not a CI gate today. See
+   "Unit 7 integration notes" item 1 for the implementation detail.
+   Revisit (a JSON mirror or a regex parser over the tables) if a
+   second consumer beyond Unit 7 appears or if the catalog grows
+   past a maintenance threshold (~15 variables, today's count is
+   already higher but with one consumer the duplication cost is
+   acceptable).
 
 4. **Empty-state placeholder owner — Unit 7 injects.** When the
    caller passes `""` / `null` / `undefined` for `decisions_block`,
