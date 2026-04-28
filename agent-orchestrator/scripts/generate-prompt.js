@@ -750,7 +750,13 @@ function generatePrompt(opts) {
 
   return {
     promptPath,
-    charCount: finalText.length,
+    // UTF-8 byte count, byte-equal to `fs.readFileSync(promptPath).length`
+    // — see Unit 7 design decision #7. `finalText.length` would count
+    // UTF-16 code units and underreport the actual on-disk size, since
+    // the real templates contain non-ASCII characters (em dashes,
+    // smart quotes, ellipses). Codex round 4 caught this drift between
+    // the documented metric and the implementation.
+    charCount: Buffer.byteLength(finalText, 'utf8'),
     varsUsed,
     warnings,
   };
@@ -942,13 +948,22 @@ function main() {
   for (const [k, v] of Object.entries(context)) {
     if (CONTEXT_ALLOWLIST.has(k)) safeContext[k] = v;
   }
+  // Resolve workdir to absolute. The protocol-header.md contract
+  // documents workdir as an absolute path the spawned agent uses to
+  // anchor every protocol-file path; rendering `.` or any relative
+  // value verbatim would generate a prompt that violates the
+  // "do not interpret relative paths against your shell's cwd"
+  // invariant. --output and --templates are already resolved
+  // earlier; this normalizes --workdir to match. Codex round 4
+  // caught the asymmetry.
+  const workdir = path.resolve(args.workdir || process.cwd());
   const opts = {
     ...safeContext,
     role: args.role,
     recoveryRole: args.recoveryRole,
     phaseId: args.phase,
     templatesDir,
-    workdir: args.workdir || process.cwd(),
+    workdir,
     projectName: args.project || '',
     phaseDir: path.resolve(args.output),
     outputDir: path.resolve(args.output),

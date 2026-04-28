@@ -914,6 +914,32 @@ test('generatePrompt: same inputs produce byte-identical output (modulo .tmp- fi
 // O — return value shape
 // =========================================================================
 
+test('generatePrompt: charCount equals UTF-8 byte length of the file on disk', () => {
+  // Codex round 4 — `finalText.length` counts UTF-16 code units,
+  // which under-reports prompt size for non-ASCII content (em
+  // dashes, smart quotes — the real protocol-header has both).
+  // Unit 7 design decision #7 documents the metric as
+  // byte-equal-to-disk; this test is the lockstep guard.
+  const phaseDir = mkTmp('gp-bytes');
+  const result = generatePrompt(
+    makeBaseOpts({
+      role: 'impl',
+      phaseDir,
+      outputDir: phaseDir,
+      completionSignalPath: path.join(phaseDir, 'impl-complete.md'),
+      // Force non-ASCII into the substituted content so the test
+      // proves the bug it guards against.
+      planUnits: 'Plan with em dash — and ellipsis … and smart quote “x”.',
+    }),
+  );
+  const onDisk = fs.readFileSync(result.promptPath).length;
+  assert.strictEqual(
+    result.charCount,
+    onDisk,
+    'charCount must equal UTF-8 byte length of the rendered file on disk',
+  );
+});
+
 test('generatePrompt: return value carries promptPath, charCount, varsUsed, warnings', () => {
   const phaseDir = mkTmp('gp-ret');
   const result = generatePrompt(
@@ -1064,6 +1090,57 @@ test('CLI: --context JSON cannot override --role / --output dispatch keys', () =
 function escapeRegExpForTest(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
+
+test('CLI: --workdir is resolved to absolute before rendering', () => {
+  // Codex round 4 — `--output` and `--templates` are resolved via
+  // path.resolve(); `--workdir` must be too, otherwise a caller
+  // passing `--workdir .` (or any relative path) would render a
+  // protocol-violating relative workdir into the prompt. The
+  // protocol-header.md contract documents workdir as absolute.
+  const phaseDir = mkTmp('gp-cli-workdir');
+  const out = require('node:child_process').spawnSync(
+    process.execPath,
+    [
+      path.join(__dirname, 'generate-prompt.js'),
+      '--role',
+      'impl',
+      '--phase',
+      'phase-7',
+      '--output',
+      phaseDir,
+      '--templates',
+      TEMPLATES_DIR,
+      '--workdir',
+      '.',
+      '--project',
+      'cli-project',
+      '--context',
+      (() => {
+        const ctxPath = path.join(mkTmp('gp-ctx-wd'), 'ctx.json');
+        fs.writeFileSync(
+          ctxPath,
+          JSON.stringify({
+            planUnits: 'Test workdir resolution.',
+            outputPaths: '- foo.js',
+          }),
+        );
+        return ctxPath;
+      })(),
+    ],
+    { encoding: 'utf8', cwd: __dirname },
+  );
+  assert.strictEqual(out.status, 0, `cli stderr: ${out.stderr}`);
+  const text = fs.readFileSync(path.join(phaseDir, 'impl-prompt.md'), 'utf8');
+  // The rendered workdir should be an absolute path (the resolved
+  // form of `.` against the CLI's cwd, which we set to __dirname).
+  assert.match(text, /Your working directory is\s+\*\*[A-Z]:[\\\/]/);
+  // And it must NOT be the literal `.` (which would render as a
+  // relative path the agent must not interpret against its shell).
+  assert.ok(
+    !/Your working directory is\s+\*\*\.\*\*/.test(text),
+    '--workdir . must be resolved before rendering',
+  );
+});
 
 test('every real template parses + has valid required/optional shape', () => {
   const files = ['protocol-header.md', 'impl-prompt.md', 'qa-prompt.md', 'qa-playbook-prompt.md', 'coordinator-briefing.md', 'recovery-prompt.md'];
