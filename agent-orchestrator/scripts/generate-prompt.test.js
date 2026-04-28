@@ -982,21 +982,29 @@ test('EMPTY_STATE_PLACEHOLDERS matches templates/README.md "Empty-state renderin
 });
 
 test('CLI: --context JSON cannot override --role / --output dispatch keys', () => {
-  // Codex P2 round 1 — a `--context` file with `role: "qa"` would
-  // otherwise spread over the CLI's `--role impl` and silently flip
-  // the dispatch. Filtering CLI_DISPATCH_KEYS out of the context
-  // BEFORE the spread, plus assigning the CLI flags AFTER it,
-  // closes both the obvious and the belt-and-suspenders path.
+  // Codex P2 round 1 + round 2 — a `--context` file should never be
+  // able to redirect the dispatch (round 1: role/outputDir) or the
+  // protocol-path agreement (round 2: completionSignalPath,
+  // heartbeatPath). The CONTEXT_ALLOWLIST in generate-prompt.js
+  // accepts only content-block keys; infrastructure / control keys
+  // are dropped on load so even a hostile JSON cannot move the
+  // write target or the polled completion signal location.
   const phaseDir = mkTmp('gp-cli-ctx');
   const ctxPath = path.join(mkTmp('gp-ctx-json'), 'ctx.json');
+  const blockedSignal = path.join(mkTmp('gp-blocked'), 'qa-complete.md');
+  const blockedHeartbeat = path.join(mkTmp('gp-blocked-hb'), 'heartbeat.jsonl');
   fs.writeFileSync(
     ctxPath,
     JSON.stringify({
-      // Dispatch-control keys that should be stripped:
+      // Dispatch-control keys (round 1) — must be dropped:
       role: 'qa',
       outputDir: '/tmp/elsewhere',
       phaseId: '../escape',
       projectName: 'should-not-override',
+      // Protocol-path keys (round 2) — must also be dropped:
+      completionSignalPath: blockedSignal,
+      heartbeatPath: blockedHeartbeat,
+      phaseDir: '/tmp/blocked-phasedir',
       // Content blocks the renderer needs (these should flow through):
       planUnits: 'Override-attempt content block.',
       outputPaths: '- foo.js',
@@ -1024,18 +1032,38 @@ test('CLI: --context JSON cannot override --role / --output dispatch keys', () =
     { encoding: 'utf8' },
   );
   assert.strictEqual(out.status, 0, `cli stderr: ${out.stderr}`);
-  // CLI args won: file written under phaseDir as impl-prompt.md.
+  // Output landed at the CLI-controlled location.
   const promptPath = path.join(phaseDir, 'impl-prompt.md');
   assert.ok(fs.existsSync(promptPath), 'CLI --output must control the write location');
   const text = fs.readFileSync(promptPath, 'utf8');
-  // CLI --role impl rendered (not qa from the context override).
+  // Role / project came from CLI flags, not the context.
   assert.match(text, /You are a \*\*impl\*\* agent/);
-  // CLI --project won (not the context's "should-not-override").
   assert.match(text, /"cli-project"/);
   assert.ok(!/should-not-override/.test(text));
-  // The content-block override DID flow through (planUnits survived).
+  // The content-block override DID flow through.
   assert.match(text, /Override-attempt content block\./);
+  // Critical: completionSignalPath in the rendered prompt must point
+  // at the CLI-derived default (${phaseDir}/impl-complete.md), NOT
+  // the blocked override the context attempted to inject. This is
+  // what guarantees the orchestrator and the spawned agent agree
+  // on where the completion signal will be written.
+  assert.match(text, new RegExp(escapeRegExpForTest(path.join(phaseDir, 'impl-complete.md'))));
+  assert.ok(
+    !text.includes(blockedSignal),
+    'context.completionSignalPath must NOT have been honored',
+  );
+  // Same for heartbeatPath — the protocol-header substitutes
+  // {{heartbeat_path}} verbatim, and a hostile context shouldn't
+  // be able to relocate where the agent emits heartbeats.
+  assert.ok(
+    !text.includes(blockedHeartbeat),
+    'context.heartbeatPath must NOT have been honored',
+  );
 });
+
+function escapeRegExpForTest(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
 
 test('every real template parses + has valid required/optional shape', () => {
   const files = ['protocol-header.md', 'impl-prompt.md', 'qa-prompt.md', 'qa-playbook-prompt.md', 'coordinator-briefing.md', 'recovery-prompt.md'];

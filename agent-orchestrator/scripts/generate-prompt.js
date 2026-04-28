@@ -864,24 +864,57 @@ function fail(msg) {
   process.exit(1);
 }
 
-// Keys that come from explicit CLI flags. The --context JSON file is
-// for content blocks only; if it contains any of these keys, we strip
-// them to prevent a content-block file from silently redirecting the
-// dispatch (codex P2 round 1: a context file with `role: "qa"` and
-// `outputDir: "/tmp/anywhere"` would otherwise override the operator's
-// --role and --output flags).
-const CLI_DISPATCH_KEYS = Object.freeze([
-  'role',
-  'recoveryRole',
-  'phaseId',
-  'templatesDir',
-  'workdir',
-  'projectName',
-  'phaseDir',
-  'outputDir',
-  'planPath',
-  'planUnitMarker',
-]);
+// Keys the CLI's `--context` JSON file is allowed to set. An
+// allowlist (rather than a blacklist of dispatch-control keys) is the
+// structurally safer approach: any new infrastructure key added to
+// generatePrompt later automatically falls outside the allowlist
+// and cannot be silently redirected by a content-block JSON.
+//
+// Codex P2 round 1 (dispatch keys: role, outputDir, phaseId,
+// projectName) and P2 round 2 (protocol paths: completionSignalPath,
+// heartbeatPath) caught two classes of override bug. The allowlist
+// closes both — only content-block keys that the role templates
+// substitute as prose are accepted; everything else is dropped on
+// load so a content-block file cannot redirect the dispatch or
+// the orchestrator's protocol-path agreements.
+const CONTEXT_ALLOWLIST = Object.freeze(
+  new Set([
+    // Impl-specific
+    'planUnits',
+    'outputPaths',
+    'previousPhaseBriefing',
+    // QA-specific
+    'prOrBranchUnderTest',
+    'qaScopeRows',
+    'testCommandsBlock',
+    'qaPlaybookBlock',
+    // Coord-specific
+    'statusSummaryBlock',
+    'decisionsBlock',
+    'openQuestionsBlock',
+    'planReferenceBlock',
+    'projectContextBlock',
+    'gitDetailsBlock',
+    'warningsBlock',
+    'artifactPointer',
+    'coordNextActions',
+    // Recovery-specific (recoveryCheckpointPath etc. appear as text
+    // in the rendered prompt; they are read references the agent
+    // looks up, not protocol paths the orchestrator polls)
+    'recoveryCheckpointPath',
+    'crashTimestamp',
+    'lastHeartbeatTimestamp',
+    'priorSessionPid',
+    'completedCheckpointsBlock',
+    'remainingWorkBlock',
+    // Header content (operator may pass priorPhaseSignals as a
+    // dogfood convenience; the orchestrator passes them through
+    // its own JS API path in production)
+    'priorPhaseSignals',
+    'priorPhaseDirsBlock',
+    'suggestedCommitMessage',
+  ]),
+);
 
 function main() {
   const args = parseCliArgs(process.argv);
@@ -896,14 +929,18 @@ function main() {
       fail(`failed to read --context ${args.contextJson}: ${err.message}`);
     }
   }
-  // Strip dispatch-control keys from --context so a content-block
-  // file cannot override the explicit CLI flags. Belt-and-suspenders:
-  // even after stripping, the spread runs BEFORE the CLI-derived
-  // assignments below so the CLI always wins on any collision the
-  // strip missed.
+  // Allowlist content-block keys only. Infrastructure keys
+  // (completionSignalPath, heartbeatPath, phaseDir, outputDir, role,
+  // recoveryRole, etc.) are NOT accepted from --context; the CLI
+  // derives them from explicit flags or sensible defaults so a
+  // content-block JSON cannot redirect the dispatch (codex P2 round
+  // 1) or the orchestrator's protocol-path agreements (codex P2
+  // round 2). Belt-and-suspenders: the spread of safeContext runs
+  // BEFORE the CLI-derived assignments below, so the CLI always
+  // wins on any collision the allowlist missed.
   const safeContext = {};
   for (const [k, v] of Object.entries(context)) {
-    if (!CLI_DISPATCH_KEYS.includes(k)) safeContext[k] = v;
+    if (CONTEXT_ALLOWLIST.has(k)) safeContext[k] = v;
   }
   const opts = {
     ...safeContext,
