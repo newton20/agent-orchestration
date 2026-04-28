@@ -315,6 +315,24 @@ test('extractPlanUnit: nested {{var}} literals inside code fences survive', () =
   assert.match(excerpt, /\{\{phase_id\}\}/);
 });
 
+test('extractPlanUnit: marker "4" does NOT prefix-match "Unit 4.5"', () => {
+  // Codex P2 round 1 — the previous lookahead `[:.\s]` allowed `.`,
+  // which let marker "4" silently match `Unit 4.5: Spike` when the
+  // plan had no `Unit 4: ...`. Anchoring the suffix to `:` (the
+  // project's plan format) eliminates the prefix-match.
+  const tmp = mkTmp('gp-plan-prefix');
+  const planPath = path.join(tmp, 'plan.md');
+  fs.writeFileSync(
+    planPath,
+    '- [ ] **Unit 4.5: Spike**\n  body\n\n- [ ] **Unit 5: Hook**\n  body\n',
+  );
+  assert.throws(
+    () => extractPlanUnit(planPath, '4'),
+    /no unit matching "4" found/,
+    'marker "4" must not match "Unit 4.5"',
+  );
+});
+
 test('extractPlanUnit: tolerates Unit numbers with dots (Unit 4.5)', () => {
   const tmp = mkTmp('gp-plan');
   const planPath = path.join(tmp, 'plan.md');
@@ -961,6 +979,62 @@ test('EMPTY_STATE_PLACEHOLDERS matches templates/README.md "Empty-state renderin
     open_questions_block: '(no open questions)',
     warnings_block: '(no warnings)',
   });
+});
+
+test('CLI: --context JSON cannot override --role / --output dispatch keys', () => {
+  // Codex P2 round 1 — a `--context` file with `role: "qa"` would
+  // otherwise spread over the CLI's `--role impl` and silently flip
+  // the dispatch. Filtering CLI_DISPATCH_KEYS out of the context
+  // BEFORE the spread, plus assigning the CLI flags AFTER it,
+  // closes both the obvious and the belt-and-suspenders path.
+  const phaseDir = mkTmp('gp-cli-ctx');
+  const ctxPath = path.join(mkTmp('gp-ctx-json'), 'ctx.json');
+  fs.writeFileSync(
+    ctxPath,
+    JSON.stringify({
+      // Dispatch-control keys that should be stripped:
+      role: 'qa',
+      outputDir: '/tmp/elsewhere',
+      phaseId: '../escape',
+      projectName: 'should-not-override',
+      // Content blocks the renderer needs (these should flow through):
+      planUnits: 'Override-attempt content block.',
+      outputPaths: '- foo.js',
+    }),
+  );
+  const out = require('node:child_process').spawnSync(
+    process.execPath,
+    [
+      path.join(__dirname, 'generate-prompt.js'),
+      '--role',
+      'impl',
+      '--phase',
+      'phase-7',
+      '--output',
+      phaseDir,
+      '--templates',
+      TEMPLATES_DIR,
+      '--workdir',
+      '/tmp/wd',
+      '--project',
+      'cli-project',
+      '--context',
+      ctxPath,
+    ],
+    { encoding: 'utf8' },
+  );
+  assert.strictEqual(out.status, 0, `cli stderr: ${out.stderr}`);
+  // CLI args won: file written under phaseDir as impl-prompt.md.
+  const promptPath = path.join(phaseDir, 'impl-prompt.md');
+  assert.ok(fs.existsSync(promptPath), 'CLI --output must control the write location');
+  const text = fs.readFileSync(promptPath, 'utf8');
+  // CLI --role impl rendered (not qa from the context override).
+  assert.match(text, /You are a \*\*impl\*\* agent/);
+  // CLI --project won (not the context's "should-not-override").
+  assert.match(text, /"cli-project"/);
+  assert.ok(!/should-not-override/.test(text));
+  // The content-block override DID flow through (planUnits survived).
+  assert.match(text, /Override-attempt content block\./);
 });
 
 test('every real template parses + has valid required/optional shape', () => {

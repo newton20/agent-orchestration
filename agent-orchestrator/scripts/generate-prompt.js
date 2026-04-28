@@ -346,18 +346,24 @@ function extractPlanUnit(planPath, unitMarker) {
   }
   const text = fs.readFileSync(planPath, 'utf8');
   const escaped = escapeRegExp(unitMarker);
-  // Match a heading bullet whose marker is followed by `:` or `.` or
-  // a space (so `Unit 7` does not greedily match `Unit 7.5`). Body
-  // continues until the next sibling unit heading or EOF.
+  // Match a heading bullet whose marker is immediately followed by
+  // `:` (the project's plan format always uses `**Unit N: Title**`).
+  // Anchoring to `:` rather than the laxer `[:.\s]` lookahead is
+  // important because `.` would let marker `4` prefix-match
+  // `Unit 4.5` — codex P2 round 1 flagged this drift between intent
+  // ("find Unit 4 exactly") and behavior ("find anything starting
+  // with Unit 4"). The only valid suffix in our plan format is the
+  // colon that introduces the title. Body extends until the next
+  // sibling unit heading or EOF.
   const headingRe = new RegExp(
-    `^- \\[[ x]\\] \\*\\*Unit ${escaped}(?=[:.\\s])`,
+    `^- \\[[ x]\\] \\*\\*Unit ${escaped}:`,
     'm',
   );
   const startMatch = text.match(headingRe);
   if (!startMatch) {
     throw new Error(
       `extractPlanUnit: no unit matching "${unitMarker}" found in ${planPath} ` +
-        `(searched for "- [ ] **Unit ${unitMarker}**" with separator [:.\\s])`,
+        `(searched for line starting with "- [ ] **Unit ${unitMarker}:")`,
     );
   }
   const startIdx = startMatch.index;
@@ -858,6 +864,25 @@ function fail(msg) {
   process.exit(1);
 }
 
+// Keys that come from explicit CLI flags. The --context JSON file is
+// for content blocks only; if it contains any of these keys, we strip
+// them to prevent a content-block file from silently redirecting the
+// dispatch (codex P2 round 1: a context file with `role: "qa"` and
+// `outputDir: "/tmp/anywhere"` would otherwise override the operator's
+// --role and --output flags).
+const CLI_DISPATCH_KEYS = Object.freeze([
+  'role',
+  'recoveryRole',
+  'phaseId',
+  'templatesDir',
+  'workdir',
+  'projectName',
+  'phaseDir',
+  'outputDir',
+  'planPath',
+  'planUnitMarker',
+]);
+
 function main() {
   const args = parseCliArgs(process.argv);
   const templatesDir = args.templates
@@ -871,7 +896,17 @@ function main() {
       fail(`failed to read --context ${args.contextJson}: ${err.message}`);
     }
   }
+  // Strip dispatch-control keys from --context so a content-block
+  // file cannot override the explicit CLI flags. Belt-and-suspenders:
+  // even after stripping, the spread runs BEFORE the CLI-derived
+  // assignments below so the CLI always wins on any collision the
+  // strip missed.
+  const safeContext = {};
+  for (const [k, v] of Object.entries(context)) {
+    if (!CLI_DISPATCH_KEYS.includes(k)) safeContext[k] = v;
+  }
   const opts = {
+    ...safeContext,
     role: args.role,
     recoveryRole: args.recoveryRole,
     phaseId: args.phase,
@@ -882,7 +917,6 @@ function main() {
     outputDir: path.resolve(args.output),
     planPath: args.plan,
     planUnitMarker: args.unitMarker,
-    ...context,
   };
   if (args.dryRun) {
     // For --dry-run, we still validate but do NOT write. The
