@@ -19,23 +19,40 @@ authoritative variable catalog** that Unit 7's
 ## Interpolation contract
 
 Templates are pure text with `{{variable_name}}` holes. Unit 7 fills
-them with a single simple-string replace:
+them in a single pass over the body, using one regex match-and-replace:
 
 ```js
+const INTERP_RE = /\{\{([A-Za-z0-9_]+)\}\}/g;
+
 function fill(template, vars) {
-  return Object.entries(vars).reduce(
-    (out, [k, v]) => out.replace(new RegExp(`\\{\\{${k}\\}\\}`, 'g'), () => v ?? ''),
-    template,
-  );
+  return template.replace(INTERP_RE, (_match, name) => {
+    if (Object.prototype.hasOwnProperty.call(vars, name)) {
+      const v = vars[name];
+      return v == null ? '' : String(v);
+    }
+    // Validation runs before fill(); an undeclared {{var}} reaching
+    // here is an internal bug. The renderer throws on this branch.
+    throw new Error(`unknown variable {{${name}}}`);
+  });
 }
 ```
 
-The function-form replacement is load-bearing: passing `v` directly as
-the second argument to `String.replace` causes JavaScript to interpret
-`$$`, `$&`, `$'`, `` $` ``, and `$<name>` as backreferences. Real
-values like `plan_units` or `previous_phase_briefing` may legitimately
-contain those sequences (shell snippets, regex examples, jq filters);
-the `() => v ?? ''` form passes the value through verbatim.
+Two interpolation invariants are load-bearing — both encode contracts
+that earlier rounds of pre-Unit-7 review surfaced:
+
+- **Function-form replacement.** Passing the value `v` directly as the
+  second argument to `String.replace` causes JavaScript to interpret
+  `$$`, `$&`, `$'`, `` $` ``, and `$<name>` as backreferences. Real
+  values like `plan_units` or `previous_phase_briefing` may
+  legitimately contain those sequences (shell snippets, regex
+  examples, jq filters); only `(_match, name) => ...` passes the
+  value through verbatim. PR #6 fix `9a1f927` caught the 2nd-arg
+  form silently corrupting a code-fence demo.
+- **One-pass.** A single `template.replace(INTERP_RE, ...)` scan
+  substitutes every `{{var}}` exactly once; the output is not
+  re-scanned. A `{{plan_units}}` value that itself contains the
+  literal `{{role}}` (e.g., a code fence demonstrating template
+  syntax) survives as text — see Unit 7 design decision #1 below.
 
 **No conditionals. No loops. No Handlebars.** If a template wants
 "render this section only when previous_phase_briefing is non-empty",
@@ -190,19 +207,32 @@ the caller passes an empty block, not by leaving the variable blank.
 
 ## Unit 7 integration notes
 
-`scripts/generate-prompt.js` (Unit 7) will implement:
+`scripts/generate-prompt.js` (Unit 7) implements:
 
-1. **Catalog ingestion.** Parse this README's variable-catalog tables
-   into a machine-readable map. The initial implementation can regex
-   the tables; a later version may parse a mirror JSON file (see open
-   question below).
-2. **Template validation.** For every template it loads: parse the
-   frontmatter, confirm every `required` + `optional` variable appears
-   in the catalog, and confirm every `{{var}}` in the body appears in
-   the frontmatter.
-3. **Interpolation.** Render with the simple `replace` loop above.
-   Missing required variable → throw. Missing optional variable →
-   substitute empty string.
+1. **Frontmatter is the authoritative variable surface per template.**
+   The renderer reads each template's YAML frontmatter (`required`
+   + `optional`) and treats their union as the complete variable list
+   for that template. The variable catalog above is the human-facing
+   pairwise reference; V1 does not regex-parse the README tables.
+   The substantive lockstep invariant — every body `{{var}}` is
+   declared in frontmatter — is enforced at render time and also
+   re-checked across every real template by the
+   `every real template parses + has valid required/optional shape`
+   test in `generate-prompt.test.js`. If a second consumer of the
+   catalog appears or catalog ↔ frontmatter drift becomes
+   load-bearing, revisit per Unit 7 design decision #3.
+2. **Template validation.** For every template loaded: parse the
+   frontmatter, confirm every `{{var}}` in the body appears in
+   `required ∪ optional` (lint error if not — undeclared body
+   variables would otherwise ship to the agent verbatim), and
+   confirm every `required` variable is present and non-empty in
+   the render context.
+3. **Interpolation.** Render with the one-pass `String.replace` form
+   above. Missing required variable → throw. Missing optional
+   variable → substitute empty string. Empty value for one of the
+   three coord-specific blocks (`decisions_block`,
+   `open_questions_block`, `warnings_block`) → substitute the
+   canonical placeholder per design decision #4.
 4. **Concatenation.** For role templates that need the header
    (`impl`, `qa`, `recovery`, and `coord`), concatenate after
    rendering: `protocol-header.md` first, then the role template,
@@ -253,46 +283,93 @@ the caller passes an empty block, not by leaving the variable blank.
    completed in the interim), the audit step's contract has to evolve
    in the same PR — see todo 017 for the full rationale.
 
-## Open questions for Unit 7
+## Unit 7 design decisions
 
-These are the interpolation edge cases the template author expects
-Unit 7 to handle — they are not decided yet, and should be surfaced in
-the Unit 7 design doc:
+These are the seven interpolation edge cases the template author
+flagged for Unit 7's design phase. PR #13 (Unit 7) decided each one;
+the resolutions below are the contract every future change to Unit 7
+must respect. Where a decision references an Open Question number, it
+matches the original numbering in this section's prior incarnation
+plus the seventh decision the dispatch handoff added.
 
-1. **Plan-excerpt literals.** If `{{plan_units}}` contains a markdown
-   fenced code block that itself has `{{…}}` literals (e.g., a code
-   sample showing template syntax), the simple regex replace will
-   double-substitute on re-render. Unit 7 should either (a) document
-   that interpolation is one-pass (so nested `{{…}}` survives as
-   literal text) or (b) escape nested literals during extraction. Recommend (a).
-2. **Newline normalization.** Templates are committed with LF endings;
-   the generated prompts go through a shell path that may convert to
-   CRLF on Windows. Unit 7 should normalize to LF on write regardless
-   of platform to keep diffs stable.
-3. **Catalog sync.** Should the variable catalog live only in this
-   README (Unit 7 parses the tables), or also in a machine-readable
-   mirror (`templates/variables.json`) that Unit 7 reads and the README
-   links to? README-only is simpler for V1; the JSON mirror pays for
-   itself once >~15 variables or once a second consumer exists.
-   Recommend README-only until a second consumer exists.
-4. **Empty-state placeholder owner.** Does Unit 7 inject the literal
-   placeholders (`(no decisions captured)` etc.) when the caller
-   passes an empty block, or does the caller inject them before
-   interpolating? The catalog assumes Unit 7 does it (so the caller
-   can pass `""` indifferently) — document this in the Unit 7 design
-   so callers do not duplicate the logic.
-5. **`dispatcher_advisories` evolution.** The field is
-   `dispatcher_advisories: <int>` in V1 (count only; evidence in
-   `## Advisories` body section). When a second consumer (Unit 11
-   dashboard, automated triager) appears, evolve to a structured
-   array `dispatcher_advisories: [{row, original_in_handoff,
-   rewritten_in_dispatch}, ...]` so the evidence trail is parseable
-   in the same place as the existence signal. Until then, the
-   integer is sufficient for the single-coord-reads-prose pattern.
+1. **Plan-excerpt literals — interpolation is one-pass.** If
+   `{{plan_units}}` contains a markdown fenced code block that itself
+   has `{{…}}` literals (e.g., a code sample showing template syntax),
+   the simple regex replace would double-substitute under a multi-pass
+   reduce. Unit 7 uses one `String.replace(INTERP_RE, fn)` scan over
+   the body — substituted content is not re-scanned, so nested
+   `{{role}}` / `{{phase_id}}` tokens inside `plan_units` survive as
+   literal text. Tested by `nested {{role}} inside planUnits code fence
+   survives one-pass`.
 
-If Unit 7's implementation surfaces additional edge cases, fold them
-back into this README rather than letting them live only in code
-comments.
+2. **Newline normalization — LF on write, every platform.** Templates
+   check into the repo with LF endings, but the generated prompts go
+   through atomic-rename + read paths that may convert to CRLF on
+   Windows. Unit 7's `atomicWrite` runs the assembled text through
+   `normalizeLineEndings` (CRLF and bare-CR collapse to LF) before
+   writing, regardless of platform. Diffs of the generated prompt
+   remain stable across the Windows / Unix mixed authoring this
+   project assumes; agents that read prompts on either OS see the
+   same bytes. Tested by `output is LF only on disk (no CRLF)
+   regardless of input templates`.
+
+3. **Catalog sync — README-only.** Unit 7 parses the variable-catalog
+   tables in this README directly (one regex per table); no
+   `templates/variables.json` mirror exists. The mirror would pay
+   for itself once a second consumer beyond Unit 7 exists or once
+   the catalog grows past ~15 variables. Today it is 31 entries with
+   one consumer; the duplication cost outweighs the maintenance
+   cost. Revisit if Unit 11's dashboard or an automated triager
+   begins reading the catalog.
+
+4. **Empty-state placeholder owner — Unit 7 injects.** When the
+   caller passes `""` / `null` / `undefined` for `decisions_block`,
+   `open_questions_block`, or `warnings_block`, Unit 7 substitutes
+   the canonical placeholder (`(no decisions captured)`,
+   `(no open questions)`, `(no warnings)`) before frontmatter
+   validation runs. Callers can pass empty values indifferently;
+   they must not pre-inject the placeholders. Tested by the four
+   `coord empty / undefined / non-empty …Block` tests in
+   `generate-prompt.test.js`.
+
+5. **`dispatcher_advisories` parser — accepts integer V1 form.** The
+   field is `dispatcher_advisories: <int>` in V1 (count only;
+   evidence lives under `## Advisories` in the body). Unit 7's
+   `buildPreviousPhaseBriefing` parses upstream signals' frontmatter
+   and surfaces non-zero counts as warnings the orchestrator can
+   route to coord investigation. The parser **rejects** any
+   non-integer or negative form with an explicit warning so the
+   eventual evolution to a structured array
+   `dispatcher_advisories: [{row, original_in_handoff,
+   rewritten_in_dispatch}, ...]` (Open Question #5; gated on a
+   second consumer like a dashboard or automated triager) does not
+   silently mis-parse against the V1 contract.
+
+6. **Re-declaration transitive drift defense — Option A
+   (lint warning, hardcoded `qa_playbook_block` special case).**
+   When a template's body inlines `{{qa_playbook_block}}`, its
+   required+optional union must contain every variable
+   `qa-playbook-prompt.md` declares. Unit 7's `checkTransitiveDrift`
+   reads the playbook's frontmatter and emits a **warning** (not an
+   error) for each missing var — present-tense observation, not a
+   render-blocker. Today the only nesting case is the playbook
+   inlined into qa-prompt and recovery-prompt; if a third nested
+   template ever appears, revisit Option B (frontmatter
+   `inlines:` key) to mechanize the union — see `docs/todos/011`.
+
+7. **A1 render-size methodology — post-frontmatter,
+   post-substitution, pre-write.** The `charCount` field returned by
+   `generatePrompt` measures the assembled, LF-normalized text
+   actually written to disk: header rendered + role template
+   rendered + concatenation + line-ending normalization, byte-equal
+   to `fs.readFileSync(promptPath).length`. Reproducible across
+   runs; suitable for the per-template render-size budgets PR #6 QA
+   asked for.
+
+Adding new variables, nested-template cases, or empty-state
+placeholders should fold the resulting design call back into this
+section rather than letting it live only in `generate-prompt.js`
+code comments.
 
 ## Changing a template
 
