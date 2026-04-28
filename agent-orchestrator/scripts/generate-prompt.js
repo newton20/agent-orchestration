@@ -927,17 +927,26 @@ const CONTEXT_ALLOWLIST = Object.freeze(
     'coordNextActions',
     // Recovery-specific (recoveryCheckpointPath etc. appear as text
     // in the rendered prompt; they are read references the agent
-    // looks up, not protocol paths the orchestrator polls)
+    // looks up, not files Unit 7 itself reads — so they stay
+    // content-only at the CLI surface)
     'recoveryCheckpointPath',
     'crashTimestamp',
     'lastHeartbeatTimestamp',
     'priorSessionPid',
     'completedCheckpointsBlock',
     'remainingWorkBlock',
-    // Header content (operator may pass priorPhaseSignals as a
-    // dogfood convenience; the orchestrator passes them through
-    // its own JS API path in production)
-    'priorPhaseSignals',
+    // Header content. Note: `priorPhaseSignals` is deliberately NOT
+    // in this allowlist. It is an array of paths Unit 7 would
+    // fs.readFileSync into the rendered prompt — letting --context
+    // name arbitrary local paths would disclose file contents (e.g.
+    // /etc/passwd, ~/.aws/credentials) into a prompt the agent then
+    // sees, which a sufficiently broad CLI dispatch can also write
+    // into completion-signal artifacts. CLI callers wanting to
+    // include upstream completion-signal content should pre-render
+    // it as `previousPhaseBriefing` (a string content block, no
+    // file reads). The JS API path used by Unit 11 still accepts
+    // priorPhaseSignals directly because the orchestrator controls
+    // those paths. Codex round 9 caught this.
     'priorPhaseDirsBlock',
     'suggestedCommitMessage',
   ]),

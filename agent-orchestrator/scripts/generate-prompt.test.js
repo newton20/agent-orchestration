@@ -1186,6 +1186,67 @@ test('CLI: --workdir is resolved to absolute before rendering', () => {
   assert.notStrictEqual(renderedWorkdir, '.');
 });
 
+test('CLI: --context cannot trigger arbitrary file reads via priorPhaseSignals', () => {
+  // Codex round 9 — `priorPhaseSignals` is a file-reading input
+  // (buildPreviousPhaseBriefing → fs.readFileSync). Allowlisting it
+  // for --context would let a hostile JSON name arbitrary local
+  // paths and have their contents inlined into the prompt (and from
+  // there, into completion artifacts). Removing it from the
+  // allowlist means a context-supplied path is silently ignored;
+  // callers should pre-render the briefing as a
+  // `previousPhaseBriefing` string instead.
+  const phaseDir = mkTmp('gp-cli-fileread');
+  const secretDir = mkTmp('gp-secret');
+  const secretPath = path.join(secretDir, 'secret-impl-complete.md');
+  // Make the file look like a valid completion signal so it would
+  // pass parseFrontmatter if it ever got read.
+  fs.writeFileSync(
+    secretPath,
+    '---\nschema_version: 1\n---\n## Summary\nSECRET-CONTENT-MUST-NOT-LEAK\n',
+  );
+  const ctxPath = path.join(mkTmp('gp-ctx-fileread'), 'ctx.json');
+  fs.writeFileSync(
+    ctxPath,
+    JSON.stringify({
+      // The hostile attempt:
+      priorPhaseSignals: [secretPath],
+      // Plus a valid content block so the render still succeeds:
+      planUnits: 'Test file-read defense.',
+      outputPaths: '- foo.js',
+    }),
+  );
+  const out = require('node:child_process').spawnSync(
+    process.execPath,
+    [
+      path.join(__dirname, 'generate-prompt.js'),
+      '--role',
+      'impl',
+      '--phase',
+      'phase-7',
+      '--output',
+      phaseDir,
+      '--templates',
+      TEMPLATES_DIR,
+      '--workdir',
+      '/tmp/wd',
+      '--project',
+      'cli-project',
+      '--context',
+      ctxPath,
+    ],
+    { encoding: 'utf8' },
+  );
+  assert.strictEqual(out.status, 0, `cli stderr: ${out.stderr}`);
+  const text = fs.readFileSync(path.join(phaseDir, 'impl-prompt.md'), 'utf8');
+  // Context's planUnits was honored (legit content block).
+  assert.match(text, /Test file-read defense\./);
+  // But the secret file's content must NOT have been read and inlined.
+  assert.ok(
+    !text.includes('SECRET-CONTENT-MUST-NOT-LEAK'),
+    'CLI --context must not be able to trigger arbitrary file reads via priorPhaseSignals',
+  );
+});
+
 test('CLI: --dry-run render errors print through fail() not as uncaught stack trace', () => {
   // Codex round 7 — the dry-run path used to escape the non-dry
   // path's try/catch, so a render-time validation error (e.g.,
