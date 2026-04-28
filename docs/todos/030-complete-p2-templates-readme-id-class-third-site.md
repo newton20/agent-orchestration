@@ -1,5 +1,5 @@
 ---
-status: ready
+status: complete
 priority: p2
 issue_id: "030"
 tags: [code-review, post-pr-9, ce-review, templates, docs, cross-module-coupling]
@@ -141,6 +141,17 @@ todos 027, 028, 029, 031. ~3-5 LOC across 2 files.
 
 - **2026-04-28 — todo created** — Surfaced by PR #9 ce:review
   (architecture-strategist P2-1).
+- **2026-04-28 — merged via PR #11** (`feat(templates): pre-Unit-7
+  fixes round 3`). Option C (both back-pointer AND inventory bullet)
+  implemented: `templates/README.md:122` `phase_id` row gained the
+  three-sites cross-reference; `hooks/README.md` "Contract
+  invariants" ID-class bullet now enumerates all three sites
+  (`parse-manifest.js`'s `VALID_ID_RE`, `session-start.js`'s
+  `FLAG_NAME_RE`, `templates/README.md:122`). PR #11 ce:review
+  surfaced two P3 follow-ups — `docs/todos/038` (the
+  templates/README.md row is prose-enforced; could gain a fixture
+  grep test) and `docs/todos/040` (the "currently prose-enforced"
+  hedge in `hooks/README.md` is stale-on-arrival). Both deferred.
 
 ## Resources
 

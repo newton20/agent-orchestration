@@ -1,5 +1,5 @@
 ---
-status: ready
+status: complete
 priority: p2
 issue_id: "028"
 tags: [code-review, post-pr-9, ce-review, security, spawn-session, docs]
@@ -146,6 +146,15 @@ todos 027, 029, 030, 031. Pure documentation (~5-8 LOC).
 
 - **2026-04-28 — todo created** — Surfaced by PR #9 ce:review
   (architecture + security agents converged).
+- **2026-04-28 — merged via PR #11** (`feat(templates): pre-Unit-7
+  fixes round 3`). Option A implemented: extended the trust-boundary
+  paragraph at `spawn-session.js:42-65` to name all three gaps —
+  `windowTarget` (trusted pass-through, F2 deferred to Unit 11),
+  per-call args (`name`, `model`, `pluginDir`, `title`, `workdir`)
+  defended at quoting layer not validation, manifest path passed via
+  `--launcher` operator-trusted. PR #11 ce:review's agent-native
+  reviewer confirmed the expansion gives Unit 11 reviewers the trust
+  contract they need; no follow-up.
 
 ## Resources
 
