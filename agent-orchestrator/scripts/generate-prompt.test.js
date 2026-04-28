@@ -985,6 +985,35 @@ test('generatePrompt: dispatcher_advisories>0 in upstream signal surfaces in war
   assert.strictEqual(advisoryWarnings.length, 1);
 });
 
+test('generatePrompt: empty-string previousPhaseBriefing + priorPhaseSignals derives briefing from signals', () => {
+  // Codex round 10 — an empty string for previousPhaseBriefing must
+  // NOT count as "explicit pre-rendered briefing." Test helpers
+  // (and real callers using shared defaults) often initialize the
+  // field as "". When priorPhaseSignals is supplied, the
+  // rendered briefing should come from the signals — anything
+  // else silently drops the inlined upstream context for phases
+  // with depends_on entries.
+  const sigDir = mkTmp('gp-empty-rerender-sig');
+  const sigPath = path.join(sigDir, 'impl-complete.md');
+  fs.writeFileSync(
+    sigPath,
+    '---\nschema_version: 1\n---\n## Summary\nUPSTREAM-CONTENT-FROM-SIGNAL\n',
+  );
+  const phaseDir = mkTmp('gp-empty-rerender');
+  const opts = makeBaseOpts({
+    role: 'impl',
+    phaseDir,
+    outputDir: phaseDir,
+    completionSignalPath: path.join(phaseDir, 'impl-complete.md'),
+    // Empty-string default (the makeBaseOpts default), plus signals.
+    previousPhaseBriefing: '',
+    priorPhaseSignals: [sigPath],
+  });
+  const result = generatePrompt(opts);
+  const text = fs.readFileSync(result.promptPath, 'utf8');
+  assert.match(text, /UPSTREAM-CONTENT-FROM-SIGNAL/, 'briefing must be derived from signals when previousPhaseBriefing is empty');
+});
+
 test('generatePrompt: pre-rendered briefing + priorPhaseSignals still surfaces advisory warnings', () => {
   // Codex round 6 — a caller passing BOTH a pre-rendered
   // previousPhaseBriefing and the priorPhaseSignals array would

@@ -562,20 +562,30 @@ function buildContext(opts, effectiveRole, derivedWarnings) {
   // previous_phase_briefing: caller may pre-render, or generator
   // builds from priorPhaseSignals. Either way, parse upstream
   // signals for dispatcher_advisories warnings if they're available.
+  //
   // Codex round 6 caught a case where a caller passing BOTH the
-  // pre-rendered briefing AND priorPhaseSignals would silently
-  // drop the warnings — the briefing text takes precedence, but
-  // the warning channel is independent and must not be skipped.
-  if (typeof opts.previousPhaseBriefing === 'string') {
+  // pre-rendered briefing AND priorPhaseSignals would silently drop
+  // the warnings; codex round 10 caught the inverse case where a
+  // caller passing an empty-string previousPhaseBriefing (often the
+  // default in test helpers) plus non-empty priorPhaseSignals would
+  // silently drop the inlined briefing CONTENT. An empty string is
+  // not an explicit pre-rendered briefing — it's "I don't have one,
+  // build it from signals if available." Only a non-empty string
+  // is an explicit override.
+  const hasPrerendered =
+    typeof opts.previousPhaseBriefing === 'string' && opts.previousPhaseBriefing !== '';
+  const hasSignals =
+    Array.isArray(opts.priorPhaseSignals) && opts.priorPhaseSignals.length > 0;
+  if (hasPrerendered) {
     ctx.previous_phase_briefing = opts.previousPhaseBriefing;
-    if (Array.isArray(opts.priorPhaseSignals) && opts.priorPhaseSignals.length > 0) {
+    if (hasSignals) {
+      // Keep the caller's pre-rendered text but still parse signals
+      // for advisory warnings (independent channel — see codex
+      // round 6 above).
       const built = buildPreviousPhaseBriefing(opts.priorPhaseSignals);
-      // Discard built.briefing (caller pre-rendered) but keep the
-      // warnings — these are the load-bearing routing signal for
-      // coord investigation per Unit 7 design decision #5.
       for (const w of built.warnings) derivedWarnings.push(w);
     }
-  } else if (Array.isArray(opts.priorPhaseSignals)) {
+  } else if (hasSignals) {
     const built = buildPreviousPhaseBriefing(opts.priorPhaseSignals);
     ctx.previous_phase_briefing = built.briefing;
     for (const w of built.warnings) derivedWarnings.push(w);
