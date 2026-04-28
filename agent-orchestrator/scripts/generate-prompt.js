@@ -18,7 +18,6 @@
  *     phaseId,              // matches VALID_ID_RE
  *     templatesDir,         // absolute path to templates/ dir
  *     projectName, workdir, phaseDir,
- *     outputDir,            // optional override; defaults to phaseDir
  *     completionSignalPath, // optional override; default derived
  *     priorPhaseSignals,    // array of completion-signal paths
  *     heartbeatPath,
@@ -711,7 +710,16 @@ function generatePrompt(opts) {
   if (typeof o.phaseDir !== 'string' || o.phaseDir === '') {
     throw new Error('generatePrompt: phaseDir is required');
   }
-  const outputDir = o.outputDir || o.phaseDir;
+  // phaseDir is the single source of truth for both the rendered
+  // {{phase_dir}} variable AND the on-disk write location. Codex
+  // round 12 caught a divergence bug from a separate `outputDir`
+  // opt: when they differed, the rendered prompt told the agent its
+  // protocol files lived under one phase_dir while the file
+  // itself was written under another — the agent would look in
+  // the wrong place for sibling artifacts (impl-complete.md, etc.).
+  // Tests and dry-run redirect the write target by overriding
+  // phaseDir, not by introducing a separate outputDir.
+  const outputDir = o.phaseDir;
   // Derive the completion-signal path if the caller did not supply
   // one — `${phaseDir}/${effectiveRole}-complete.md` is the
   // protocol-header default.
@@ -1020,7 +1028,6 @@ function main() {
     workdir,
     projectName: args.project || '',
     phaseDir: path.resolve(args.output),
-    outputDir: path.resolve(args.output),
     planPath: args.plan,
     planUnitMarker: args.unitMarker,
   };
@@ -1035,7 +1042,13 @@ function main() {
     // inconsistency between the two paths.
     const tmpDir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'generate-prompt-dry-'));
     try {
-      opts.outputDir = tmpDir;
+      // Override phaseDir to the tmp location so the prompt is
+      // written there (and discarded after) without touching the
+      // operator's --output target. The rendered {{phase_dir}}
+      // variable points at the tmp dir for the duration of the
+      // dry-run; no agent reads this output, so the substitution
+      // is informational only.
+      opts.phaseDir = tmpDir;
       const result = generatePrompt(opts);
       process.stdout.write(
         JSON.stringify(

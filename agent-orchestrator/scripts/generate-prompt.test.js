@@ -804,6 +804,27 @@ test('generatePrompt: recovery (coord) does not run two-pass; qa_playbook_block 
   assert.ok(!/P1 — Test suite, every workspace/.test(text), 'playbook content must be absent');
 });
 
+test('generatePrompt: recovery accepts empty completedCheckpointsBlock (early-crash case)', () => {
+  // Codex round 12 — recovery-prompt.md's prose explicitly handles
+  // an empty completedCheckpointsBlock ("If this block is empty,
+  // the prior session has no observable output — start from the
+  // beginning of Remaining work"). Frontmatter must reflect that
+  // by listing it as optional, not required, otherwise this valid
+  // early-crash recovery path fails validation.
+  const phaseDir = mkTmp('gp-rec-no-checkpoints');
+  const opts = makeBaseOpts({
+    role: 'recovery',
+    recoveryRole: 'impl',
+    phaseDir,
+    completionSignalPath: path.join(phaseDir, 'impl-complete.md'),
+    completedCheckpointsBlock: '', // crash before any checkpoint
+  });
+  const result = generatePrompt(opts);
+  const text = fs.readFileSync(result.promptPath, 'utf8');
+  // The recovery prose around the empty block survives substitution.
+  assert.match(text, /If this block is empty, the prior session has no observable output/);
+});
+
 test('generatePrompt: recovery preserves the prior live prompt to .original.md (idempotent)', () => {
   const phaseDir = mkTmp('gp-rec-preserve');
 
