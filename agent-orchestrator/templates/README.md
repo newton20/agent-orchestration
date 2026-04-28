@@ -119,7 +119,7 @@ variable that is not in the list below, the render must fail.
 | Name | Type | Purpose |
 |---|---|---|
 | `role` | string enum | `impl` \| `qa` \| `coord` \| `recovery`. Value is the agent's dispatched role. `recovery` is reserved for the V1.5 recovery-analyst agent; V1 `recovery-prompt.md` renders with the original role (`impl`, `qa`, or `coord`) because a respawned session takes on the same role. |
-| `phase_id` | string | Phase identifier matching `VALID_ID_RE` (`[A-Za-z0-9._-]+`). |
+| `phase_id` | string | Phase identifier matching `VALID_ID_RE` (`[A-Za-z0-9._-]+`). The character class is shared with `parse-manifest.js`'s `VALID_ID_RE` and `session-start.js`'s `FLAG_NAME_RE` — change all three sites or none. See `hooks/README.md` "Contract invariants" and `docs/todos/006` / `030` for context. |
 | `project_name` | string | Repo slug or user-facing project name. Displayed in the role preamble. |
 | `workdir` | absolute path | The spawned session's `cwd`. Every protocol file path is anchored here. |
 | `phase_dir` | absolute path | `${workdir}/docs/orchestration/phases/${phase_id}`. All inputs/outputs for this phase live under it. |

@@ -1081,11 +1081,16 @@ test suite includes an explicit regression test
 ### Exported symbols for Unit 11
 
 `session-start.js` exports `{ runHook, FLAG_TTL_MS,
-MAX_FLAG_BYTES, FLAG_NAME_RE }`. Unit 11 should `require()` the
-regex and TTL constants rather than re-literal them, so the two
-modules stay in lockstep automatically. The character class inside
-`FLAG_NAME_RE` duplicates `VALID_ID_RE` in
-`scripts/parse-manifest.js`; see
+STALE_HARD_TTL_MS, MAX_FLAG_BYTES, FLAG_NAME_RE }`. Unit 11
+should `require()` the regex and TTL constants rather than
+re-literal them, so the two modules stay in lockstep
+automatically. `STALE_HARD_TTL_MS` (added by PR #9 as part of
+the two-tier-TTL GC) is the hard ceiling beyond which the hook
+unlinks a stale flag file best-effort; Unit 11 writers don't
+need to read it directly, but they must understand that any
+flag file older than `STALE_HARD_TTL_MS` will be GC'd by the
+next hook tick. The character class inside `FLAG_NAME_RE`
+duplicates `VALID_ID_RE` in `scripts/parse-manifest.js`; see
 `docs/todos/006-pending-p3-unit-5-id-regex-duplication.md` for
 the enforcement-pattern decision.
 

@@ -49,13 +49,27 @@ misbehaving hook that blocks session start is worse than no hook at all.
 
 ## Contract invariants
 
-- `FLAG_NAME_RE` (`session-start.js`) and `VALID_ID_RE`
-  (`../scripts/parse-manifest.js`) share an ID character class. Change
-  both or neither — see `docs/todos/006`.
+- The `[A-Za-z0-9._-]+` ID character class is encoded at three sites:
+  `FLAG_NAME_RE` in `session-start.js`, `VALID_ID_RE` in
+  `../scripts/parse-manifest.js`, and the `phase_id` row in
+  `../templates/README.md` (variable catalog). Change all three or
+  none — see `docs/todos/006` and `docs/todos/030`. The cross-module
+  consistency between the two regexes is enforced by a node:test
+  assertion in `../scripts/parse-manifest.test.js` (added by
+  `docs/todos/027`); the templates/README.md row is currently
+  prose-enforced.
 - Stale `.pending-*` files are unlinked best-effort once their age
   exceeds `STALE_HARD_TTL_MS` (10 × `FLAG_TTL_MS` = 10 minutes). Files
   in `[FLAG_TTL_MS, STALE_HARD_TTL_MS)` stay on disk as a debug window
   for failed spawns.
+- Writers (Unit 11 orchestrator, manual debugging tools) MUST place
+  `.pending-<id>` files via atomic write-then-rename
+  (`writeFileSync(tmpPath, content); renameSync(tmpPath, flagPath)`),
+  never via direct `writeFileSync(flagPath, content)`. Without atomic
+  write, the hook's `statSync` could see a 0-byte mid-write file with
+  `mtime=now`, pass the freshness gate, and then fail the size guard or
+  read mid-stream. The hook deletes via atomic rename on consume;
+  writers must be symmetric on creation.
 
 ## Manual end-to-end test (Windows)
 

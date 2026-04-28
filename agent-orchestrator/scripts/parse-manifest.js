@@ -158,7 +158,11 @@ function loadManifest(manifestPath) {
   }
   let parsed;
   try {
-    parsed = yaml.load(raw);
+    // Pin schema explicitly for parity with spawn-session.js's
+    // launcher-manifest load and the runUpdate() status-file load below
+    // — preserves merge keys (`<<`) and timestamps; making the choice
+    // explicit at every site documents intent.
+    parsed = yaml.load(raw, { schema: yaml.DEFAULT_SCHEMA });
   } catch (e) {
     // js-yaml errors include a .mark with line / column when available.
     const where = e.mark
@@ -719,7 +723,11 @@ function runUpdate(manifestPath, phaseId, updates) {
     const raw = fs.readFileSync(statusPath, 'utf8');
     let parsed;
     try {
-      parsed = yaml.load(raw);
+      // Pin schema explicitly for parity with the loadManifest() call
+      // above and spawn-session.js's launcher load — preserves merge
+      // keys (`<<`) and timestamps; making the choice explicit at every
+      // site documents intent.
+      parsed = yaml.load(raw, { schema: yaml.DEFAULT_SCHEMA });
     } catch (e) {
       return {
         ok: false,
@@ -790,4 +798,5 @@ module.exports = {
   statusPathFor,
   runUpdate,
   KNOWN_SHELLS,
+  VALID_ID_RE,
 };

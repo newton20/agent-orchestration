@@ -43,6 +43,24 @@
  * `passthrough_flags`) reach the inner shell verbatim. Treat the launcher
  * block as a trusted config surface. Phase IDs and session names are
  * independently validated upstream (`parse-manifest.js`'s `VALID_ID_RE`).
+ *
+ * Three more inputs are also trusted, in subtly different ways — name
+ * each so a future reader doesn't conclude "everything outside the four
+ * launcher fields is validated":
+ *   - `windowTarget` is trusted pass-through. Defaults to `'0'` and is
+ *     interpolated into `wt -w <windowTarget>` and the rendered command
+ *     string with no format guard in V1 (F2 from docs/todos/004 is
+ *     deferred to Unit 11).
+ *   - Per-call args (`name`, `model`, `pluginDir`, `title`, `workdir`)
+ *     are *quoted-not-validated* — defended at the quoting layer by
+ *     `q()` / `qPath()` (see `quoteCmd*` / `quotePs*`), NOT by upstream
+ *     validation. Phase IDs used as session names are independently
+ *     validated by `parse-manifest.js`'s `VALID_ID_RE`; other per-call
+ *     args trust the caller to pass sane values.
+ *   - The manifest path passed via `--launcher` is itself trusted: the
+ *     operator picks the YAML path; spawn-session does no traversal
+ *     validation. Higher-layer callers (web UI, API) MUST validate the
+ *     path before invoking spawn-session.
  */
 
 'use strict';
@@ -263,12 +281,10 @@ function loadLauncherFromManifest(manifestPath) {
   if (!fs.existsSync(abs))
     throw new Error(`launcher manifest not found: ${abs}`);
   const raw = fs.readFileSync(abs, 'utf8');
-  // Pin the schema explicitly so a future js-yaml downgrade can't
-  // silently reintroduce custom-tag execution via a permissive default.
-  // DEFAULT_SCHEMA is js-yaml v4's safe default — like the call in
-  // parse-manifest.js it preserves merge keys (`<<`) and timestamps;
-  // unlike CORE_SCHEMA which would drop merge support and diverge from
-  // the manifest loader for no defensive gain.
+  // Pinned to DEFAULT_SCHEMA for parity with the calls in
+  // parse-manifest.js (loadManifest + runUpdate) — preserves merge keys
+  // (`<<`) and timestamps; making the choice explicit at every site
+  // documents intent.
   const parsed = yaml.load(raw, { schema: yaml.DEFAULT_SCHEMA });
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
     throw new Error(`launcher manifest must be a YAML object: ${abs}`);
