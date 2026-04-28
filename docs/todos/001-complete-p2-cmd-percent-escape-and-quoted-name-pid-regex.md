@@ -1,5 +1,5 @@
 ---
-status: ready
+status: complete
 priority: p2
 issue_id: "001"
 tags: [code-review, unit-4, spawn-session, windows, cmd, wmi]
