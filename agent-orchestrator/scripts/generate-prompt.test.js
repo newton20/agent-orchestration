@@ -1097,6 +1097,9 @@ test('CLI: --workdir is resolved to absolute before rendering', () => {
   // passing `--workdir .` (or any relative path) would render a
   // protocol-violating relative workdir into the prompt. The
   // protocol-header.md contract documents workdir as absolute.
+  // Codex round 5 — extract the rendered workdir and verify
+  // path.isAbsolute() rather than hard-coding a Windows drive
+  // prefix; the assertion must hold cross-platform.
   const phaseDir = mkTmp('gp-cli-workdir');
   const out = require('node:child_process').spawnSync(
     process.execPath,
@@ -1131,15 +1134,43 @@ test('CLI: --workdir is resolved to absolute before rendering', () => {
   );
   assert.strictEqual(out.status, 0, `cli stderr: ${out.stderr}`);
   const text = fs.readFileSync(path.join(phaseDir, 'impl-prompt.md'), 'utf8');
-  // The rendered workdir should be an absolute path (the resolved
-  // form of `.` against the CLI's cwd, which we set to __dirname).
-  assert.match(text, /Your working directory is\s+\*\*[A-Z]:[\\\/]/);
-  // And it must NOT be the literal `.` (which would render as a
-  // relative path the agent must not interpret against its shell).
+  // Extract the workdir from the rendered protocol header.
+  const m = text.match(/Your working directory is\s+\*\*([^*]+)\*\*/);
+  assert.ok(m, 'protocol header must render the workdir line');
+  const renderedWorkdir = m[1];
+  // Cross-platform absolute-path check (Linux/macOS render `/...`;
+  // Windows renders `C:\...`).
   assert.ok(
-    !/Your working directory is\s+\*\*\.\*\*/.test(text),
-    '--workdir . must be resolved before rendering',
+    path.isAbsolute(renderedWorkdir),
+    `rendered workdir must be absolute, got ${JSON.stringify(renderedWorkdir)}`,
   );
+  // And specifically must not be the literal `.` we passed.
+  assert.notStrictEqual(renderedWorkdir, '.');
+});
+
+test('CLI: --project is required (matches the protocol-header contract)', () => {
+  // Codex round 5 — protocol-header.md declares project_name
+  // required, and renderTemplate rejects empty required strings.
+  // The CLI must surface this as a clear up-front error rather
+  // than letting the operator hit a deep template-render error.
+  const phaseDir = mkTmp('gp-cli-noproj');
+  const out = require('node:child_process').spawnSync(
+    process.execPath,
+    [
+      path.join(__dirname, 'generate-prompt.js'),
+      '--role',
+      'impl',
+      '--phase',
+      'phase-7',
+      '--output',
+      phaseDir,
+      '--templates',
+      TEMPLATES_DIR,
+    ],
+    { encoding: 'utf8' },
+  );
+  assert.strictEqual(out.status, 1);
+  assert.match(out.stderr, /--project is required/);
 });
 
 test('every real template parses + has valid required/optional shape', () => {

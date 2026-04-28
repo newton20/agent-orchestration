@@ -777,21 +777,24 @@ function printHelp() {
   console.log(
     [
       'Usage:',
-      '  generate-prompt.js --role <role> --phase <id> --output <dir> [opts]',
+      '  generate-prompt.js --role <role> --phase <id> --output <dir>',
+      '                     --project <name> [opts]',
       '',
       'Required:',
       '  --role <impl|qa|coord|recovery>',
       '  --phase <id>           phase id (matches VALID_ID_RE)',
       '  --output <dir>         output directory (writes <effectiveRole>-prompt.md)',
+      '  --project <name>       project name (substitutes {{project_name}} in the',
+      '                         protocol header; non-empty per the template contract)',
       '',
       'Common:',
       '  --templates <dir>      templates dir (default: ../templates)',
-      '  --workdir <dir>        spawned session cwd (default: cwd)',
-      '  --project <name>       project name (default: empty)',
+      '  --workdir <dir>        spawned session cwd (default: cwd; resolved to absolute)',
       '  --plan <path>          plan markdown file',
       '  --unit-marker <s>      Unit marker to extract (e.g. "7" or "4.5")',
       '  --recovery-role <r>    underlying role when --role recovery',
-      '  --context <json-path>  JSON file with content blocks',
+      '  --context <json-path>  JSON file with content blocks (allowlisted keys only;',
+      '                         dispatch-control keys like role/outputDir are dropped)',
       '  --dry-run              do not write; print stats',
       '',
       'Exit codes: 0 = success, 1 = validation/IO error.',
@@ -862,6 +865,13 @@ function parseCliArgs(argv) {
   if (!out.role) fail('--role is required');
   if (!out.phase) fail('--phase is required');
   if (!out.output) fail('--output is required');
+  // protocol-header.md declares project_name required and renderTemplate
+  // rejects empty required strings — fail at the CLI surface with a
+  // clear message rather than letting the operator hit a confusing
+  // template-render error deep in the call stack. Codex round 5
+  // surfaced the inconsistency between the help text (which listed
+  // --project as "Common", i.e. optional) and the template contract.
+  if (!out.project) fail('--project is required (substitutes {{project_name}} in the protocol header)');
   return out;
 }
 
