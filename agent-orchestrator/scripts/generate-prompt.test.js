@@ -349,6 +349,39 @@ test('extractPlanUnit: nested {{var}} literals inside code fences survive', () =
   assert.match(excerpt, /\{\{phase_id\}\}/);
 });
 
+test('generatePrompt: empty-string planUnits + planPath/marker derives from plan file', () => {
+  // Codex round 13 — same class of bug as round 10's empty-briefing
+  // case, but on the other variable. A caller passing the
+  // makeBaseOpts default `planUnits: ""` plus planPath +
+  // planUnitMarker would have its empty string honored and
+  // extraction skipped, producing an impl prompt that fails
+  // required-variable validation with empty plan_units. Empty
+  // string is "I don't have one, build it from planPath if
+  // available," not "explicit pre-rendered plan."
+  const planFile = path.join(mkTmp('gp-empty-plan'), 'plan.md');
+  fs.writeFileSync(
+    planFile,
+    [
+      '- [ ] **Unit 7: Prompt generator**',
+      '  body of unit 7 from the plan file',
+      '',
+      '- [ ] **Unit 8: Other**',
+    ].join('\n'),
+  );
+  const phaseDir = mkTmp('gp-empty-plan-out');
+  const opts = makeBaseOpts({
+    role: 'impl',
+    phaseDir,
+    completionSignalPath: path.join(phaseDir, 'impl-complete.md'),
+    planUnits: '',                  // empty default — must NOT block extraction
+    planPath: planFile,
+    planUnitMarker: '7',
+  });
+  const result = generatePrompt(opts);
+  const text = fs.readFileSync(result.promptPath, 'utf8');
+  assert.match(text, /body of unit 7 from the plan file/);
+});
+
 test('extractPlanUnit: marker "4" does NOT prefix-match "Unit 4.5"', () => {
   // Codex P2 round 1 — the previous lookahead `[:.\s]` allowed `.`,
   // which let marker "4" silently match `Unit 4.5: Spike` when the

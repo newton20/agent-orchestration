@@ -563,8 +563,11 @@ function buildContext(opts, effectiveRole, derivedWarnings) {
   }
 
   // plan_units: caller may pre-render or pass planPath +
-  // planUnitMarker for in-generator extraction.
-  if (typeof opts.planUnits === 'string') {
+  // planUnitMarker for in-generator extraction. Empty string is
+  // NOT an explicit pre-rendered plan — like previousPhaseBriefing
+  // (codex round 10), only a non-empty string is an explicit
+  // override. Codex round 13 caught the same class of bug here.
+  if (typeof opts.planUnits === 'string' && opts.planUnits !== '') {
     ctx.plan_units = opts.planUnits;
   } else if (typeof opts.planPath === 'string' && typeof opts.planUnitMarker === 'string') {
     ctx.plan_units = extractPlanUnit(opts.planPath, opts.planUnitMarker);
