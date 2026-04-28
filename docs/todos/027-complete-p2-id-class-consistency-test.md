@@ -1,5 +1,5 @@
 ---
-status: ready
+status: complete
 priority: p2
 issue_id: "027"
 tags: [code-review, post-pr-9, ce-review, hooks, scripts, cross-module-coupling, test-coverage]
@@ -153,6 +153,16 @@ todos 028, 029, 030, 031.
 
 - **2026-04-28 — todo created** — Surfaced by PR #9 ce:review (architecture
   + pattern + agent-native agents converged).
+- **2026-04-28 — merged via PR #11** (`feat(templates): pre-Unit-7 fixes
+  round 3`). Option B implemented: `VALID_ID_RE` exported from
+  `parse-manifest.js`; cross-module lockstep test added at
+  `parse-manifest.test.js:642-653` asserting
+  `FLAG_NAME_RE.source === '^\\.pending-' + VALID_ID_RE.source.slice(1)`.
+  Suite 157 → 158 green. PR #11 ce:review surfaced one P3 follow-up
+  (`docs/todos/041` — `.slice(1)` clever-not-obvious; deferred per
+  V1-freeze) and one related P3 (`docs/todos/038` — third
+  prose-enforced site `templates/README.md:122` could gain a fixture
+  grep test; deferred).
 
 ## Resources
 

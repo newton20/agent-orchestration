@@ -1,5 +1,5 @@
 ---
-status: ready
+status: complete
 priority: p2
 issue_id: "029"
 tags: [code-review, post-pr-9, ce-review, hooks, unit-11, docs, plan-update]
@@ -166,6 +166,19 @@ todos 027, 028, 030, 031. ~10-15 LOC across 3 files.
 
 - **2026-04-28 — todo created** — Surfaced by PR #9 ce:review
   (architecture + pattern + learnings agents converged).
+- **2026-04-28 — merged via PR #11** (`feat(templates): pre-Unit-7
+  fixes round 3`). Option A (three-part doc update) implemented:
+  (1) `STALE_HARD_TTL_MS` rationale comment expanded at
+  `session-start.js:23-32` with the 10× vs 5×/30× framing;
+  (2) plan `§1083` updated 4 → 5 elements
+  (`{ runHook, FLAG_TTL_MS, STALE_HARD_TTL_MS, MAX_FLAG_BYTES, FLAG_NAME_RE }`)
+  + a paragraph explaining why Unit 11 writers must understand
+  `STALE_HARD_TTL_MS`'s GC effect; (3) writer atomic-rename invariant
+  added to `hooks/README.md` "Contract invariants". PR #11
+  ce:review's architecture-strategist surfaced one P3 follow-up
+  (`docs/todos/037` — atomic-rename invariant is prose-only; a
+  contract test belongs in Unit 11's PR alongside the writer
+  itself).
 
 ## Resources
 

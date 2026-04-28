@@ -1,5 +1,5 @@
 ---
-status: ready
+status: complete
 priority: p2
 issue_id: "031"
 tags: [code-review, post-pr-9, qa-advisory, security, scripts, yaml]
@@ -151,6 +151,20 @@ todos 027, 028, 029, 030. ~3-4 LOC across 2 files.
 ## Work Log
 
 - **2026-04-28 — todo created** — From QA Advisory A1 on PR #9.
+- **2026-04-28 — merged via PR #11** (`feat(templates): pre-Unit-7
+  fixes round 3`). Option C implemented: pinned both
+  `parse-manifest.js` `yaml.load` sites (`loadManifest:165`,
+  `runUpdate:730`) to `{ schema: yaml.DEFAULT_SCHEMA }`; rewrote
+  `spawn-session.js:284-287` symmetry comment to parity / intent /
+  merge-keys framing only. **Caveat compliance verified:** the
+  source comment does NOT contain downgrade-defense language —
+  PR #11's pattern + simplicity reviewers explicitly checked, and
+  the prior "future js-yaml downgrade can't silently reintroduce
+  custom-tag execution via a permissive default" framing has been
+  fully removed. PR #11 ce:review surfaced one P3 follow-up
+  (`docs/todos/036` — minor "Pin"/"Pinned" voice mismatch + the
+  three near-duplicate comments are acceptable for context-locality
+  but cosmetic-only; deferred per V1-freeze).
 
 ## Resources
 
