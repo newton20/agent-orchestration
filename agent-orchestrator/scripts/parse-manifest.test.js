@@ -19,7 +19,9 @@ const {
   normalizePhases,
   statusPathFor,
   runUpdate,
+  VALID_ID_RE,
 } = require('./parse-manifest');
+const { FLAG_NAME_RE } = require('../hooks/session-start');
 
 function write(manifestObj) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'parse-manifest-'));
@@ -629,5 +631,23 @@ test('the prototype\'s manifest-example.yaml validates', () => {
     result.valid,
     true,
     'expected prototype example to validate: ' + JSON.stringify(result.errors)
+  );
+});
+
+// -------------------- Cross-module ID-class lockstep --------------------
+
+// VALID_ID_RE (parse-manifest.js) and FLAG_NAME_RE (hooks/session-start.js)
+// share the same ID character class. The prose pointers above each constant
+// carry the contract; this test makes drift between them a CI failure
+// rather than a comment-review oversight. See docs/todos/006 + 027.
+test('VALID_ID_RE and FLAG_NAME_RE share the same ID character class', () => {
+  assert.ok(VALID_ID_RE instanceof RegExp, 'VALID_ID_RE must be exported as a RegExp');
+  assert.ok(FLAG_NAME_RE instanceof RegExp, 'FLAG_NAME_RE must be exported as a RegExp');
+  assert.strictEqual(
+    FLAG_NAME_RE.source,
+    '^\\.pending-' + VALID_ID_RE.source.slice(1),
+    'FLAG_NAME_RE.source must be "^\\.pending-" prepended to VALID_ID_RE.source ' +
+      '(minus its leading ^). Update both regexes together — see ' +
+      'docs/todos/006 / 027 and hooks/README.md Contract invariants.'
   );
 });

@@ -23,9 +23,12 @@ const FLAG_TTL_MS = 60_000;           // 60 seconds — plan default
 // Two-tier TTL: soft TTL (FLAG_TTL_MS) skips the candidate but preserves
 // the file for debug. After STALE_HARD_TTL_MS the file is unlinked best-
 // effort to bound steady-state statSync cost on every SessionStart.
-// 10 × FLAG_TTL_MS ⇒ 600_000 ms / 10 minutes — long enough for a user
-// to inspect a failed spawn, short enough to keep the candidate scan
-// bounded by recent activity rather than all-time.
+// 10 × FLAG_TTL_MS ⇒ 600_000 ms / 10 minutes. The 10× multiplier (vs 5×
+// or 30×) is chosen so the GC window is long enough to inspect a failed
+// spawn (typical post-incident investigation arrives within minutes) and
+// short enough to keep the per-tick `statSync` count bounded by realistic
+// crash recency. See docs/todos/005:108-125 for the soft-vs-hard-TTL
+// framing.
 const STALE_HARD_TTL_MS = 10 * FLAG_TTL_MS;
 const MAX_FLAG_BYTES = 256 * 1024;    // 256 KB prompt cap
 // .pending-* flag-file name shape. The ID character class must stay
