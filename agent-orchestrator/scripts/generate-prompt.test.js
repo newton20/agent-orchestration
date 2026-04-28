@@ -182,7 +182,7 @@ test('renderTemplate: throws when required var missing from context', () => {
   const tmpl = '---\nrequired: [a, b]\noptional: []\n---\n{{a}} {{b}}';
   assert.throws(
     () => renderTemplate(tmpl, { a: 'x' }, { templateName: 't.md' }),
-    /required variable "b" is missing or empty/,
+    /required variable "b" is missing in context/,
   );
 });
 
@@ -190,7 +190,41 @@ test('renderTemplate: required empty string is rejected', () => {
   const tmpl = '---\nrequired: [a]\noptional: []\n---\n{{a}}';
   assert.throws(
     () => renderTemplate(tmpl, { a: '' }, { templateName: 't.md' }),
-    /required variable "a" is missing or empty/,
+    /required variable "a" coerces to the empty string/,
+  );
+});
+
+test('renderTemplate: required empty array is rejected (coerces to "")', () => {
+  // Codex round 11 — an empty array passes the bare `=== ''` check
+  // because it is neither undefined/null nor a string, yet
+  // interpolate() renders String([]) as "". Validate
+  // POST-coercion so [] / 0 / boolean false coerce-empty cases are
+  // caught at validation time, not silently rendered.
+  const tmpl = '---\nrequired: [a]\noptional: []\n---\n{{a}}';
+  assert.throws(
+    () => renderTemplate(tmpl, { a: [] }, { templateName: 't.md' }),
+    /required variable "a" coerces to the empty string/,
+  );
+});
+
+test('generatePrompt: empty-array outputPaths is rejected at render time', () => {
+  // End-to-end version of the renderTemplate test above: a caller
+  // passing `outputPaths: []` (e.g. via the JS API or a hostile
+  // --context with the array form) must fail validation rather
+  // than render an impl prompt with an empty Output contract block.
+  const phaseDir = mkTmp('gp-empty-array');
+  assert.throws(
+    () =>
+      generatePrompt(
+        makeBaseOpts({
+          role: 'impl',
+          phaseDir,
+          outputDir: phaseDir,
+          completionSignalPath: path.join(phaseDir, 'impl-complete.md'),
+          outputPaths: [],
+        }),
+      ),
+    /required variable "output_paths" coerces to the empty string/,
   );
 });
 

@@ -246,14 +246,28 @@ function renderTemplate(template, context, opts) {
     );
   }
 
-  // Validate required vars are present (non-empty string, non-null,
-  // non-undefined). Empty-state placeholder injection has already
-  // run at the call site for the three coord blocks, so an empty
-  // `decisions_block` here is genuinely a caller bug.
+  // Validate required vars are present and produce non-empty
+  // substituted text. Coerce to string FIRST and then check for
+  // emptiness — a bare `''` check passes `[]` (codex round 11)
+  // because an empty array is neither undefined/null nor a string,
+  // yet interpolate() renders it as `String([])` = `''`, leaving a
+  // load-bearing required block empty in the prompt. Catching
+  // post-coercion emptiness covers `[]`, `''`, `null`, `undefined`,
+  // and any future malformed shape that string-coerces to empty.
+  // Empty-state placeholder injection has already run at the call
+  // site for the three coord blocks (decisions / open_questions /
+  // warnings), so a coerce-empty value here is genuinely a caller
+  // bug rather than the legit empty-state form.
   for (const name of required) {
     const v = context[name];
-    if (v === undefined || v === null || (typeof v === 'string' && v === '')) {
-      throw new Error(`template ${tn}: required variable "${name}" is missing or empty in context`);
+    if (v === undefined || v === null) {
+      throw new Error(`template ${tn}: required variable "${name}" is missing in context`);
+    }
+    if (String(v) === '') {
+      throw new Error(
+        `template ${tn}: required variable "${name}" coerces to the empty string ` +
+          `(got ${JSON.stringify(v)}) — would leave the substitution position empty in the rendered prompt`,
+      );
     }
   }
 
