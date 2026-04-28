@@ -772,12 +772,20 @@ function generatePrompt(opts) {
   const finalText = normalizeLineEndings(assembled);
 
   // Recovery: preserve original BEFORE writing the new prompt.
-  if (recovery) {
+  // Skip the preservation step on dry-run — preservation is a
+  // disk-side effect that would persist past the dry-run.
+  if (recovery && !o.dryRun) {
     preserveOriginalPrompt(outputDir, effectiveRole);
   }
 
   const promptPath = path.join(outputDir, `${effectiveRole}-prompt.md`);
-  atomicWrite(promptPath, finalText);
+  // dry-run: render, validate, and compute charCount against the
+  // EXACT same context a real run would use (no tmp-dir override —
+  // codex round 14 caught the divergence). Skip only the actual
+  // disk write so the dry-run is purely informational.
+  if (!o.dryRun) {
+    atomicWrite(promptPath, finalText);
+  }
 
   // Aggregate varsUsed (deduplicated, sorted for determinism).
   const varsUsed = [
@@ -1035,29 +1043,24 @@ function main() {
     planUnitMarker: args.unitMarker,
   };
   if (args.dryRun) {
-    // For --dry-run, we still validate but do NOT write. The
-    // simplest implementation: render to a tmp dir, then unlink.
-    // Wrap render+print in the same try/catch the non-dry path
-    // uses so render-time errors (e.g., missing required content
-    // block, missing --recovery-role on a recovery dry-run) print
-    // as `generate-prompt.js: <message>` rather than as an
-    // uncaught stack trace. Codex round 7 caught this UX
-    // inconsistency between the two paths.
-    const tmpDir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'generate-prompt-dry-'));
+    // --dry-run: validate + render against the EXACT same context
+    // a real run would use, but skip the disk write. Earlier
+    // versions redirected phaseDir to a tmp dir to avoid touching
+    // --output, but codex round 14 caught that the tmp-dir
+    // substitution made the rendered {{phase_dir}}, default
+    // completionSignalPath, and reported char_count describe a
+    // different prompt than the real run. Now generatePrompt
+    // accepts a `dryRun: true` flag that skips the atomic write
+    // (and the recovery-side preservation), so dry-run stats
+    // describe the actual would-be-written prompt byte-for-byte.
     try {
-      // Override phaseDir to the tmp location so the prompt is
-      // written there (and discarded after) without touching the
-      // operator's --output target. The rendered {{phase_dir}}
-      // variable points at the tmp dir for the duration of the
-      // dry-run; no agent reads this output, so the substitution
-      // is informational only.
-      opts.phaseDir = tmpDir;
-      const result = generatePrompt(opts);
+      const result = generatePrompt({ ...opts, dryRun: true });
       process.stdout.write(
         JSON.stringify(
           {
             ok: true,
             dry_run: true,
+            prompt_path: result.promptPath,
             char_count: result.charCount,
             vars_used: result.varsUsed,
             warnings: result.warnings,
@@ -1068,12 +1071,6 @@ function main() {
       );
     } catch (err) {
       fail(err.message);
-    } finally {
-      try {
-        fs.rmSync(tmpDir, { recursive: true, force: true });
-      } catch (_err) {
-        // best-effort cleanup
-      }
     }
     return;
   }

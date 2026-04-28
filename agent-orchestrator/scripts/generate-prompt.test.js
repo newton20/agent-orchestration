@@ -1364,6 +1364,67 @@ test('CLI: --context cannot trigger arbitrary file reads via priorPhaseSignals',
   );
 });
 
+test('CLI: --dry-run renders against the requested phaseDir, not a tmp dir', () => {
+  // Codex round 14 — earlier versions redirected phaseDir to a
+  // tmp directory so the dry-run wouldn't write to the operator's
+  // --output. That made the rendered {{phase_dir}}, the default
+  // completionSignalPath, and the reported char_count describe
+  // a different prompt than the real run would produce. Now the
+  // dry-run flows through generatePrompt({ dryRun: true }) which
+  // skips the disk write but keeps every render input identical
+  // to a real dispatch. The reported promptPath in the JSON
+  // result must reference the operator's --output directory, and
+  // the rendered prompt (had it been written) would substitute
+  // {{phase_dir}} with that exact path.
+  const phaseDir = mkTmp('gp-cli-dry-real-phase');
+  const ctxPath = path.join(mkTmp('gp-ctx-dry'), 'ctx.json');
+  fs.writeFileSync(
+    ctxPath,
+    JSON.stringify({
+      planUnits: 'dry-run plan units',
+      outputPaths: '- foo.js',
+    }),
+  );
+  const out = require('node:child_process').spawnSync(
+    process.execPath,
+    [
+      path.join(__dirname, 'generate-prompt.js'),
+      '--role',
+      'impl',
+      '--phase',
+      'phase-7',
+      '--output',
+      phaseDir,
+      '--templates',
+      TEMPLATES_DIR,
+      '--workdir',
+      '/tmp/wd',
+      '--project',
+      'cli-project',
+      '--context',
+      ctxPath,
+      '--dry-run',
+    ],
+    { encoding: 'utf8' },
+  );
+  assert.strictEqual(out.status, 0, `cli stderr: ${out.stderr}`);
+  const result = JSON.parse(out.stdout);
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(result.dry_run, true);
+  // promptPath in the result must reference the operator's
+  // --output, NOT a tmp directory under os.tmpdir().
+  assert.strictEqual(
+    result.prompt_path,
+    path.join(phaseDir, 'impl-prompt.md'),
+    'dry-run promptPath must describe the real --output target',
+  );
+  // No file was actually written (this is a dry-run).
+  assert.ok(
+    !fs.existsSync(result.prompt_path),
+    'dry-run must not write the prompt file to disk',
+  );
+});
+
 test('CLI: --dry-run render errors print through fail() not as uncaught stack trace', () => {
   // Codex round 7 — the dry-run path used to escape the non-dry
   // path's try/catch, so a render-time validation error (e.g.,
