@@ -25,17 +25,27 @@ default rather than an explicit schema pin:
 
 `js-yaml@^4.1.0` (the pinned version) defaults to `DEFAULT_SCHEMA` for
 `load()`, so behavior today is identical to the explicitly-pinned
-launcher load. Two reasons to align:
+launcher load. Reasons to align:
 
-1. **Defense against library downgrade.** A future `js-yaml@3.x`
-   downgrade or a custom-schema injection would silently change
-   behavior. Explicit pinning is what makes the launcher load future-
-   proof per its own comment.
-2. **Comment symmetry.** `spawn-session.js:268-269` says "like the call
-   in parse-manifest.js it preserves merge keys" — strictly,
-   parse-manifest.js relies on the library default rather than an
-   explicit pin. A 1-character `{ schema: yaml.DEFAULT_SCHEMA }`
+1. **Comment symmetry / honesty.** `spawn-session.js:268-269` says
+   "like the call in parse-manifest.js it preserves merge keys" —
+   strictly, parse-manifest.js relies on the library default rather
+   than an explicit pin. A 1-line `{ schema: yaml.DEFAULT_SCHEMA }`
    addition at both sites would make the comment literally true.
+2. **Document intent.** Explicit pin tells the next reader "we chose
+   the default deliberately" rather than "we never thought about
+   schema choice."
+
+**Caveat — the pin is NOT a downgrade defense.** A previous draft of
+this todo claimed pinning to `DEFAULT_SCHEMA` defends against a
+hypothetical `js-yaml@3.x` downgrade. That claim is wrong: in v3,
+`DEFAULT_SCHEMA` is the FULL/unsafe schema (including `!!js/function`);
+the safe v3 alias was `DEFAULT_SAFE_SCHEMA`. v4 dropped `!!js/function`
+entirely so v4's `DEFAULT_SCHEMA` is safe by construction. The actual
+downgrade defense is the `^4.1.0` pin in `package.json` — code-level
+schema names alone do not survive a downgrade. Anyone implementing
+this todo should NOT add downgrade-defense language to the source
+comments; the pin's value is symmetry + intent, not safety.
 
 ## Findings
 
@@ -63,9 +73,10 @@ const parsed = yaml.load(raw, { schema: yaml.DEFAULT_SCHEMA });
 
 at both `parse-manifest.js:161` and `:722`.
 
-- **Pros:** Symmetric with `spawn-session.js:272`. Defense-in-depth
-  against library downgrade. Makes the existing comment literally true.
-- **Cons:** None — identical behavior at the pinned version.
+- **Pros:** Symmetric with `spawn-session.js:272`. Makes the existing
+  comment literally true. Documents intent at the call site.
+- **Cons:** None — identical behavior at the pinned version. (Not a
+  downgrade defense; see Caveat above.)
 - **Effort:** Trivial (2 LOC).
 - **Risk:** None.
 

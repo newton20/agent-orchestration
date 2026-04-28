@@ -106,13 +106,24 @@ budget) so adding a cross-module require there violates that boundary.
 A new repo-root `tests/` workspace (Option C) is overengineering for a
 single 2-line invariant.
 
+**Prerequisite — export `VALID_ID_RE`.** Today's `parse-manifest.js`
+exports surface is `{ loadManifest, validate, validateLauncher,
+findDanglingDeps, analyzeDeps, normalizePhases, statusPathFor,
+runUpdate, KNOWN_SHELLS }` — `VALID_ID_RE` is NOT on that list.
+A `require('./parse-manifest').VALID_ID_RE` call resolves to
+`undefined` today and the test would fail for the wrong reason.
+Implementer must add `VALID_ID_RE` to the `module.exports` block as
+step 1 of this todo. (Trivial; no behavior change. The constant has
+been internal-only by accident, not by intent.)
+
 The test should:
-1. `require('./parse-manifest').VALID_ID_RE` and
-   `require('../hooks/session-start').FLAG_NAME_RE` (or
-   `__test.FLAG_NAME_RE` if it's under that namespace).
-2. Extract the inner character class from each and assert equivalence
+1. Add `VALID_ID_RE` to `parse-manifest.js`'s `module.exports` block.
+2. `require('./parse-manifest').VALID_ID_RE` and
+   `require('../hooks/session-start').FLAG_NAME_RE` (the latter is
+   already exported alongside `FLAG_TTL_MS` / `MAX_FLAG_BYTES`).
+3. Extract the inner character class from each and assert equivalence
    (e.g. via the `.source` field, comparing the bracketed class).
-3. Fail loudly if either regex's character class drifts.
+4. Fail loudly if either regex's character class drifts.
 
 Converts the prose-only Option B contract from todo 006 into a CI
 tripwire without violating either the cold-start zero-dep boundary

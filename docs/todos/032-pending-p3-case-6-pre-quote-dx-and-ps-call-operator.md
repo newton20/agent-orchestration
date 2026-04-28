@@ -69,15 +69,41 @@ quoteBinary header comment. No code change.
 
 ### Option B — Pre-emptive guard in validateLauncher
 
-When `binary` contains a path separator + whitespace + an executable
-extension boundary, throw with a clear message naming both the cmd
-and PowerShell pre-quote forms.
+When `binary` is the case-6 raw shape — a path WITH whitespace inside
+the path part, followed by a subcommand — throw with a clear message
+naming both the cmd and PowerShell pre-quote forms.
+
+**The guard must NOT reuse the same `/\.(exe|cmd|bat|com)["']?\s/i`
+boundary regex as `quoteBinary`.** That boundary also matches case 5
+(`C:\tools\x.exe sub`) which PR #9 intentionally preserves verbatim.
+Instead, detect "whitespace inside the executable path itself" — e.g.,
+parse the binary by tokenizing on `.exe`/`.cmd`/`.bat`/`.com` extension
+boundary, check if the part BEFORE the extension contains whitespace
+that isn't already enclosed in matched quotes, and only reject if it
+does. Pseudocode:
+
+```
+const m = binary.match(/^(.+?\.(?:exe|cmd|bat|com))(\s+.+)?$/i);
+if (m) {
+  const exePart = m[1];
+  const tail = m[2];
+  const exePartUnquoted = exePart.replace(/^["']|["']$/g, '');
+  if (tail && /\s/.test(exePartUnquoted) && !/^["'].*["']$/.test(exePart)) {
+    throw new Error(
+      `launcher.binary path contains whitespace; pre-quote the exe ` +
+      `portion (cmd: '"<path>" sub'; PowerShell: '& "<path>" sub'): ${binary}`
+    );
+  }
+}
+```
 
 - **Pros:** Immediate, actionable error at config-load time.
 - **Cons:** Validator surface area grows; must understand exec
-  context (cmd vs PowerShell call-operator).
+  context (cmd vs PowerShell call-operator). Easy to write the guard
+  too aggressively (see warning above).
 - **Effort:** Small-medium (10-15 LOC + tests).
-- **Risk:** Low. Could over-reject valid edge cases.
+- **Risk:** Medium — get the guard wrong and it rejects case 5 or
+  passes case 6 unchanged.
 
 ### Option C — Auto-add `&` for PowerShell pre-quoted shape
 
