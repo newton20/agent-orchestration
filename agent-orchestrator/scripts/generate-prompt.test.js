@@ -985,6 +985,44 @@ test('generatePrompt: dispatcher_advisories>0 in upstream signal surfaces in war
   assert.strictEqual(advisoryWarnings.length, 1);
 });
 
+test('generatePrompt: pre-rendered briefing + priorPhaseSignals still surfaces advisory warnings', () => {
+  // Codex round 6 — a caller passing BOTH a pre-rendered
+  // previousPhaseBriefing and the priorPhaseSignals array would
+  // previously silently drop dispatcher_advisories warnings (the
+  // briefing-text branch short-circuited the parse). The warning
+  // channel is independent of the briefing-text channel; the
+  // orchestrator must not lose the routing signal just because
+  // the caller chose to pre-render the briefing prose.
+  const sigDir = mkTmp('gp-adv-prerendered');
+  const sigPath = path.join(sigDir, 'impl-complete.md');
+  fs.writeFileSync(
+    sigPath,
+    '---\nschema_version: 1\ndispatcher_advisories: 5\n---\n## Summary\nUpstream had 5 advisories.\n',
+  );
+  const phaseDir = mkTmp('gp-adv-pre');
+  const opts = makeBaseOpts({
+    role: 'impl',
+    phaseDir,
+    outputDir: phaseDir,
+    completionSignalPath: path.join(phaseDir, 'impl-complete.md'),
+    priorPhaseSignals: [sigPath],
+    // Caller pre-rendered the briefing prose; this used to suppress
+    // the parse of priorPhaseSignals for advisory warnings.
+    previousPhaseBriefing: 'CALLER PRE-RENDERED BRIEFING TEXT',
+  });
+  const result = generatePrompt(opts);
+  // The pre-rendered briefing wins for the body content.
+  const text = fs.readFileSync(result.promptPath, 'utf8');
+  assert.match(text, /CALLER PRE-RENDERED BRIEFING TEXT/);
+  // But the advisory warnings still surface — that's the contract.
+  const advisoryWarnings = result.warnings.filter((w) => /dispatcher_advisories=5/.test(w));
+  assert.strictEqual(
+    advisoryWarnings.length,
+    1,
+    'pre-rendered briefing must NOT suppress dispatcher_advisories warnings',
+  );
+});
+
 // =========================================================================
 // P — Real-template lockstep (regression guard)
 // =========================================================================

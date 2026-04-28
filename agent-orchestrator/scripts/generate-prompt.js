@@ -560,10 +560,21 @@ function buildContext(opts, effectiveRole, derivedWarnings) {
   }
 
   // previous_phase_briefing: caller may pre-render, or generator
-  // builds from priorPhaseSignals. Either way, dispatcher_advisories
-  // warnings flow into derivedWarnings.
+  // builds from priorPhaseSignals. Either way, parse upstream
+  // signals for dispatcher_advisories warnings if they're available.
+  // Codex round 6 caught a case where a caller passing BOTH the
+  // pre-rendered briefing AND priorPhaseSignals would silently
+  // drop the warnings — the briefing text takes precedence, but
+  // the warning channel is independent and must not be skipped.
   if (typeof opts.previousPhaseBriefing === 'string') {
     ctx.previous_phase_briefing = opts.previousPhaseBriefing;
+    if (Array.isArray(opts.priorPhaseSignals) && opts.priorPhaseSignals.length > 0) {
+      const built = buildPreviousPhaseBriefing(opts.priorPhaseSignals);
+      // Discard built.briefing (caller pre-rendered) but keep the
+      // warnings — these are the load-bearing routing signal for
+      // coord investigation per Unit 7 design decision #5.
+      for (const w of built.warnings) derivedWarnings.push(w);
+    }
   } else if (Array.isArray(opts.priorPhaseSignals)) {
     const built = buildPreviousPhaseBriefing(opts.priorPhaseSignals);
     ctx.previous_phase_briefing = built.briefing;
