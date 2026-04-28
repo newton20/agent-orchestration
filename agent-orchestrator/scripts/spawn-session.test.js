@@ -527,6 +527,41 @@ test('parsePidLookupOutput: matches when --name is followed by closing single-qu
   assert.strictEqual(parsePidLookupOutput(stdout, 'orch-a'), 4567);
 });
 
+// Todo 001 Gap 2: WMI reports `--name "<value with spaces>"` with the
+// opening quote intact. The leading boundary must accept an optional
+// opening quote so direct-CLI invocations with quoted names are found.
+test('parsePidLookupOutput: matches when --name value is double-quoted (todo 001 Gap 2)', () => {
+  const stdout = JSON.stringify([
+    {
+      ProcessId: 9101,
+      CommandLine: 'claude --name "orch phase 0" --model sonnet',
+    },
+  ]);
+  assert.strictEqual(parsePidLookupOutput(stdout, 'orch phase 0'), 9101);
+});
+
+test('parsePidLookupOutput: matches when --name value is single-quoted (todo 001 Gap 2)', () => {
+  const stdout = JSON.stringify([
+    {
+      ProcessId: 9102,
+      CommandLine: "agency claude --name 'orch phase 0' --model sonnet",
+    },
+  ]);
+  assert.strictEqual(parsePidLookupOutput(stdout, 'orch phase 0'), 9102);
+});
+
+test('parsePidLookupOutput: suffix-collision rejected for quoted names (todo 001 Gap 2)', () => {
+  // The optional opening-quote boundary must not weaken the trailing
+  // boundary: `--name "orch-a"` must NOT match the longer
+  // `--name "orch-a-review"` row.
+  const stdout = JSON.stringify([
+    { ProcessId: 9201, CommandLine: 'claude --name "orch-a-review" --model sonnet' },
+    { ProcessId: 9202, CommandLine: 'claude --name "orch-a" --model sonnet' },
+  ]);
+  assert.strictEqual(parsePidLookupOutput(stdout, 'orch-a'), 9202);
+  assert.strictEqual(parsePidLookupOutput(stdout, 'orch-a-review'), 9201);
+});
+
 test('parsePidLookupOutput: null parsed (CIM returned no rows) → null', () => {
   // PowerShell ConvertTo-Json emits "null" when the input array is
   // empty AND the @(...) wrapper is missing. Defensive.
@@ -654,22 +689,25 @@ test('quoteBinary: path without spaces unquoted', () => {
   assert.strictEqual(quoteBinary(p, 'powershell'), p);
 });
 
-// Codex P2 round 10: `binary: "C:\Program Files\Agency\agency.exe claude"`
-// — path with spaces PLUS a subcommand. Quote only the exe portion.
-test('quoteBinary: path-with-spaces + subcommand splits at .exe (cmd)', () => {
-  const b = 'C:\\Program Files\\Agency\\agency.exe claude';
-  assert.strictEqual(
-    quoteBinary(b, 'cmd'),
-    '"C:\\Program Files\\Agency\\agency.exe" claude'
-  );
+// Todo 002 finding #1 dropped the `.exe + subcommand` split branch.
+// What remains is a simple "path with internal whitespace gets quoted"
+// rule, qualified by the executable-boundary guard so an `.exe ` /
+// `.cmd ` / `.bat ` / `.com ` boundary still passes through as a
+// subcommand split rather than being wrapped as one filename.
+test('quoteBinary: no-space-path + subcommand passes through verbatim', () => {
+  // `C:\tools\agency.exe claude` — exe boundary detected, leave the
+  // shell to tokenize. Wrapping as one was the codex-caught regression.
+  const b = 'C:\\tools\\agency.exe claude';
+  assert.strictEqual(quoteBinary(b, 'cmd'), b);
+  assert.strictEqual(quoteBinary(b, 'powershell'), b);
 });
 
-test('quoteBinary: path-with-spaces + subcommand splits at .exe (powershell)', () => {
-  const b = 'C:\\Program Files\\Agency\\agency.exe claude';
-  assert.strictEqual(
-    quoteBinary(b, 'powershell'),
-    "& 'C:\\Program Files\\Agency\\agency.exe' claude"
-  );
+test('quoteBinary: path-with-spaces + subcommand passes through if pre-quoted', () => {
+  // Manifest author pre-quotes the exe portion. The boundary guard
+  // matches `.exe" ` so the literal string is forwarded verbatim.
+  const b = '"C:\\Program Files\\Agency\\agency.exe" claude';
+  assert.strictEqual(quoteBinary(b, 'cmd'), b);
+  assert.strictEqual(quoteBinary(b, 'powershell'), b);
 });
 
 test('quoteBinary: exe subcommand form without path-spaces stays verbatim', () => {

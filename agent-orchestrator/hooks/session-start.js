@@ -20,7 +20,17 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const FLAG_TTL_MS = 60_000;           // 60 seconds — plan default
+// Two-tier TTL: soft TTL (FLAG_TTL_MS) skips the candidate but preserves
+// the file for debug. After STALE_HARD_TTL_MS the file is unlinked best-
+// effort to bound steady-state statSync cost on every SessionStart.
+// 10 × FLAG_TTL_MS ⇒ 600_000 ms / 10 minutes — long enough for a user
+// to inspect a failed spawn, short enough to keep the candidate scan
+// bounded by recent activity rather than all-time.
+const STALE_HARD_TTL_MS = 10 * FLAG_TTL_MS;
 const MAX_FLAG_BYTES = 256 * 1024;    // 256 KB prompt cap
+// .pending-* flag-file name shape. The ID character class must stay
+// in sync with VALID_ID_RE in agent-orchestrator/scripts/parse-manifest.js.
+// See docs/todos/006 for context; change both or neither.
 const FLAG_NAME_RE = /^\.pending-[A-Za-z0-9._-]+$/;
 
 function logErr(msg) {
@@ -63,7 +73,15 @@ function runHook(opts) {
     let st;
     try { st = fsLib.statSync(full); }
     catch (err) { logErr(`stat ${full}: ${err.message}`); continue; }
-    if (now - st.mtimeMs > FLAG_TTL_MS) continue;  // stale — preserve on disk
+    const age = now - st.mtimeMs;
+    if (age > FLAG_TTL_MS) {
+      // Stale: skip either way. Beyond the hard TTL, GC the file so the
+      // per-tick statSync count stays bounded by recent activity rather
+      // than every flag ever written. Files in [soft, hard) stay on disk
+      // as the debug window for a failed spawn.
+      if (age >= STALE_HARD_TTL_MS) tryUnlink(fsLib, full);
+      continue;
+    }
     candidates.push({ path: full, mtimeMs: st.mtimeMs, name: ent.name });
   }
 
@@ -139,6 +157,7 @@ if (require.main === module) {
 module.exports = {
   runHook,
   FLAG_TTL_MS,
+  STALE_HARD_TTL_MS,
   MAX_FLAG_BYTES,
   FLAG_NAME_RE,
 };

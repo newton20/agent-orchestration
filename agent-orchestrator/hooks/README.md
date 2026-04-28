@@ -47,6 +47,16 @@ claude` from PowerShell). Name-based detection is dead.
 output `{}`.** The hook never throws and never exits nonzero. A
 misbehaving hook that blocks session start is worse than no hook at all.
 
+## Contract invariants
+
+- `FLAG_NAME_RE` (`session-start.js`) and `VALID_ID_RE`
+  (`../scripts/parse-manifest.js`) share an ID character class. Change
+  both or neither — see `docs/todos/006`.
+- Stale `.pending-*` files are unlinked best-effort once their age
+  exceeds `STALE_HARD_TTL_MS` (10 × `FLAG_TTL_MS` = 10 minutes). Files
+  in `[FLAG_TTL_MS, STALE_HARD_TTL_MS)` stay on disk as a debug window
+  for failed spawns.
+
 ## Manual end-to-end test (Windows)
 
 1. Scaffold an orchestration tree (Unit 3):

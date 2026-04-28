@@ -38,6 +38,11 @@
  *
  * PID lookup uses WMI CommandLine matching (not tasklist title matching)
  * so background wt tabs stay discoverable. See getSessionPid for details.
+ *
+ * Trust boundary. Launcher fields (`binary`, `shell_args`, `auto_mode_flag`,
+ * `passthrough_flags`) reach the inner shell verbatim. Treat the launcher
+ * block as a trusted config surface. Phase IDs and session names are
+ * independently validated upstream (`parse-manifest.js`'s `VALID_ID_RE`).
  */
 
 'use strict';
@@ -137,35 +142,25 @@ function quotePsAlways(value) {
 //   2. program + subcommand          "agency claude"
 //   3. exe path, no spaces           "C:\tools\claude.exe"
 //   4. exe path with spaces          "C:\Program Files\Claude\claude.exe"
-//   5. exe path with spaces + sub    "C:\Program Files\Agency\agency.exe claude"
-//                                    (codex P2 round 10 — quote exe only)
 //
-// Strategy: if the string matches /^(.+\.exe)\s+(.+)$/i (case 5), split
-// at the .exe boundary — quote the exe part (which may have spaces) and
-// pass the subcommand through verbatim. Otherwise apply the simpler
-// heuristic: quote only when the whole string is BOTH path-like AND has
-// whitespace (case 4). Bare / "prog + sub" / no-space-path stay verbatim.
-// PowerShell uses the call operator (`& 'path'`) so a quoted path
-// actually executes instead of being emitted as a string literal.
+// Quote only when the whole string is BOTH path-like AND has whitespace
+// (case 4). Everything else stays verbatim. PowerShell uses the call
+// operator (`& 'path'`) so a quoted path actually executes instead of
+// being emitted as a string literal.
+//
+// Whitespace immediately after an executable extension (`.exe`/`.cmd`/
+// `.bat`/`.com`, possibly with a trailing quote) signals an "exe +
+// arguments" boundary rather than a "path with spaces" — leave it
+// verbatim so the shell tokenizes the subcommand normally. Manifest
+// authors with a path-with-spaces wrapper plus a subcommand should
+// pre-quote the exe portion in their `binary` value (the cmd shape
+// `"C:\Program Files\X\x.exe" sub`).
 function quoteBinary(binary, shell) {
   if (typeof binary !== 'string' || binary === '') return binary;
-  const exeSplit = binary.match(/^(.+\.exe)\s+(.+)$/i);
-  if (exeSplit) {
-    const exePart = exeSplit[1];
-    const subPart = exeSplit[2];
-    // Still only quote the exe if it's path-like-with-space (case 5).
-    // If the exe is bare (`claude.exe command`, no path separator), skip
-    // the quote to keep output clean.
-    const exeNeedsQuote = /[\\/]/.test(exePart) && /\s/.test(exePart);
-    if (!exeNeedsQuote) return binary;
-    if (shell === 'powershell') {
-      return `& '${exePart.replace(/'/g, "''")}' ${subPart}`;
-    }
-    return `"${exePart.replace(/"/g, '""')}" ${subPart}`;
-  }
   const hasPathSep = /[\\/]/.test(binary);
   const hasSpace = /\s/.test(binary);
   if (!(hasPathSep && hasSpace)) return binary;
+  if (/\.(exe|cmd|bat|com)["']?\s/i.test(binary)) return binary;
   if (shell === 'powershell') {
     return `& '${binary.replace(/'/g, "''")}'`;
   }
@@ -176,8 +171,7 @@ function quoteBinary(binary, shell) {
 // quoted segments (including embedded whitespace). Handles BOTH
 // double-quote and single-quote grouping — PowerShell treats `'...'`
 // as a literal string, and users write wrapper paths like
-// `-File 'C:\Program Files\wrapper.ps1'` as a matter of style
-// (codex P2 round 12).
+// `-File 'C:\Program Files\wrapper.ps1'` as a matter of style.
 //
 // Used for the argv-form passed to execFileSync; the display-form
 // `command` string leaves shell_args inline and relies on the user's
@@ -223,8 +217,9 @@ function tokenizeShellArgs(s) {
  * shell matches the user's `shell` field — so a partial PowerShell
  * launcher picks up AGENCY_LAUNCHER's `-NoExit -Command` and
  * `--enable-auto-mode` rather than cmd's `/k` + `--permission-mode auto`.
- * Addresses codex P2: cross-shell default bleed would produce invalid
- * command lines like `powershell /k claude --permission-mode auto`.
+ * Without the per-shell baseline, a partial PowerShell launcher would
+ * silently inherit cmd defaults and produce invalid command lines like
+ * `powershell /k claude --permission-mode auto`.
  *
  * If `launcher` is `null`/`undefined`, returns DEFAULT_LAUNCHER.
  * If `launcher` is a preset alias string ('default' | 'agency'),
@@ -260,22 +255,28 @@ function resolveLauncher(launcher) {
  * key is absent — any present-but-malformed value (e.g. `launcher: false`
  * or `launcher: ""`) is returned verbatim so resolveLauncher's validator
  * can surface the real error rather than silently falling back to the
- * default. Addresses codex P2: a typo like `launcher: false` must not
- * masquerade as "no launcher configured".
+ * default. A typo like `launcher: false` must not masquerade as "no
+ * launcher configured".
  */
 function loadLauncherFromManifest(manifestPath) {
   const abs = path.resolve(manifestPath);
   if (!fs.existsSync(abs))
     throw new Error(`launcher manifest not found: ${abs}`);
   const raw = fs.readFileSync(abs, 'utf8');
-  const parsed = yaml.load(raw);
+  // Pin the schema explicitly so a future js-yaml downgrade can't
+  // silently reintroduce custom-tag execution via a permissive default.
+  // DEFAULT_SCHEMA is js-yaml v4's safe default — like the call in
+  // parse-manifest.js it preserves merge keys (`<<`) and timestamps;
+  // unlike CORE_SCHEMA which would drop merge support and diverge from
+  // the manifest loader for no defensive gain.
+  const parsed = yaml.load(raw, { schema: yaml.DEFAULT_SCHEMA });
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
     throw new Error(`launcher manifest must be a YAML object: ${abs}`);
   if (!Object.prototype.hasOwnProperty.call(parsed, 'launcher')) return null;
   // `launcher:` with nothing after it parses to null in YAML. That's
   // ambiguous with "no launcher", so treat a present-but-null value as
-  // the error it almost certainly is (codex P2: explicit null must not
-  // silently fall back to defaults).
+  // the error it almost certainly is — explicit null must not silently
+  // fall back to defaults.
   if (parsed.launcher === null)
     throw new Error(
       `launcher manifest has an explicit null launcher at ${abs} — ` +
@@ -331,8 +332,8 @@ function buildSpawnCommand({
   // The prototype follows the same convention (`${name} — ${title}`). If
   // the caller supplied a custom title that doesn't already start with
   // name, prepend it with an em-dash separator so the PID lookup stays
-  // discoverable. Codex P2: custom titles without the name prefix were
-  // previously undiscoverable.
+  // discoverable — a custom title without the name prefix would otherwise
+  // be undiscoverable.
   const sessionName = name;
   let effectiveTitle;
   if (!title) effectiveTitle = sessionName;
@@ -353,7 +354,7 @@ function buildSpawnCommand({
   //      shell tokenizes it at runtime.
   //   2. "C:\\Program Files\\Claude\\claude.exe" — a single path with
   //      a space. Must be quoted or the shell runs "C:\\Program" as
-  //      the program. Codex P2.
+  //      the program.
   // Heuristic: if the binary contains a path separator AND whitespace,
   // it's case 2 and needs quoting. Otherwise it's case 1 (or a bare
   // word) and stays verbatim.
@@ -375,7 +376,9 @@ function buildSpawnCommand({
   //   `command` — a human-readable shell-string rendering for logging,
   //            --dry-run output, and test assertions. Same content, but
   //            NOT the string we execute (going through execSync → cmd.exe
-  //            would eat `%` and mangle nested quotes, codex P1 round 8/9).
+  //            would eat `%` and mangle nested quotes — that path corrupts
+  //            both the WMI %--name % filter and any --plugin-dir with
+  //            embedded spaces).
   //
   // For the shell part, wt expects the subcommand's argv as separate
   // tokens after `new-tab`. We hand each of {shell-binary, shell-args,
@@ -435,8 +438,8 @@ function buildSpawnCommand({
 
 // Finding the PID of a specific tab in `wt -w 0` is hard: tasklist /V
 // only surfaces the active tab's window title, so background tabs are
-// invisible by title alone (codex P1). Instead we match on the spawned
-// process's COMMAND LINE — every session's inner command contains the
+// invisible by title alone. Instead we match on the spawned process's
+// COMMAND LINE — every session's inner command contains the
 // distinctive `--name orch-<phase>-<role>` flag, and WMI exposes
 // CommandLine for every running process regardless of which wt tab is
 // foreground.
@@ -460,8 +463,8 @@ function buildSpawnCommand({
  * via `execFileSync('powershell', argv)` — which bypasses cmd.exe.
  * cmd.exe eagerly expands `%...%` as environment variables, which
  * would mangle our `%--name %` LIKE filter into an empty string
- * (codex P1: through execSync, `%--name %` becomes `` because the
- * phantom env var `--name ` doesn't exist).
+ * (through execSync, `%--name %` becomes `` because the phantom env
+ * var `--name ` doesn't exist).
  *
  * @{...} wraps the CIM result so ConvertTo-Json always emits an array,
  * even for zero or one result. -Depth 1 keeps the output shallow.
@@ -490,10 +493,10 @@ function escapeRegex(s) {
 // Heuristic: is the process a shell-wrapper that should NOT be treated
 // as the session's primary PID? The bundled launchers intentionally keep
 // cmd /k and powershell open after Claude exits so the user can inspect
-// output post-mortem. If Unit 8's health check watches the wrapper's
-// PID, it'll report the agent alive forever. Codex P1 round 10.
-// We detect by looking at the first token of the CommandLine (with or
-// without a .exe suffix, case-insensitive).
+// output post-mortem. If Unit 8's health check watched the wrapper's
+// PID, it'd report the agent alive forever after Claude exits. We detect
+// by looking at the first token of the CommandLine (with or without a
+// .exe suffix, case-insensitive).
 const SHELL_WRAPPERS = new Set(['cmd', 'cmd.exe', 'powershell', 'powershell.exe']);
 
 function isShellWrapperCmdline(cmdline) {
@@ -501,9 +504,9 @@ function isShellWrapperCmdline(cmdline) {
   const trimmed = cmdline.trim();
   // First token may be a quoted path like `"C:\...\powershell.exe"` —
   // extract through the closing quote if the first char is a quote,
-  // else up to the first whitespace. Codex P2 round 13: without
-  // trailing-quote handling, the basename included the `"` and the
-  // wrapper check missed quoted exe paths.
+  // else up to the first whitespace. Without the trailing-quote
+  // handling, the extracted basename would include the `"` and the
+  // wrapper check would miss quoted exe paths.
   let first;
   if (trimmed.startsWith('"')) {
     const end = trimmed.indexOf('"', 1);
@@ -526,13 +529,15 @@ function parsePidLookupOutput(stdout, name) {
   }
   if (parsed === null || parsed === undefined) return null;
   const rows = Array.isArray(parsed) ? parsed : [parsed];
-  // Trailing boundary allows whitespace, end-of-line, OR a closing
-  // quote (single or double). When --name is the last flag on a
-  // wrapper command line like `cmd /k "claude --name orch-a"`, WMI
-  // includes the trailing `"`; codex P2 round 12 would otherwise miss
-  // that row entirely.
+  // Boundary check on both sides: the leading group accepts an
+  // optional opening single- or double-quote so quoted forms in WMI
+  // CommandLine output (`--name "orch phase 0"`, `--name 'orch phase 0'`)
+  // match cleanly. The trailing group matches whitespace, end-of-line,
+  // or a closing quote — required for the `cmd /k "claude --name orch-a"`
+  // shape WMI reports verbatim. Without these boundaries, suffix-
+  // collisions like `orch-a` vs `orch-a-review` would false-match.
   const re = new RegExp(
-    `(?:^|\\s)--name\\s+${escapeRegex(name)}(?=\\s|$|['"])`
+    `(?:^|\\s)--name\\s+(?:['"])?${escapeRegex(name)}(?=\\s|$|['"])`
   );
 
   // Two-pass: prefer non-wrapper matches (the claude / agency binary)
@@ -617,9 +622,9 @@ function spawnSession({
   // Injectable runner receives (program, argv) so it matches getSessionPid
   // and so tests can assert on each arg individually. Default uses
   // execFileSync which does NOT go through cmd.exe — critical for
-  // preserving nested double quotes through the wt → subshell handoff
-  // (codex P1 round 9: execSync'd through cmd.exe corrupted our
-  // --plugin-dir "C:\Program Files\..." before wt ever saw it).
+  // preserving nested double quotes through the wt → subshell handoff.
+  // Routing through execSync → cmd.exe corrupts `--plugin-dir
+  // "C:\Program Files\..."` before wt ever sees it.
   const runner =
     _runner || ((program, args) => execFileSync(program, args, { stdio: 'ignore' }));
   runner('wt', argv);

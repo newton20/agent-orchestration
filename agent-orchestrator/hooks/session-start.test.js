@@ -23,6 +23,7 @@ const { spawnSync } = require('node:child_process');
 const {
   runHook,
   FLAG_TTL_MS,
+  STALE_HARD_TTL_MS,
   MAX_FLAG_BYTES,
   FLAG_NAME_RE,
 } = require('./session-start');
@@ -141,7 +142,7 @@ test('single fresh .pending-<id> → additionalContext + file deleted', () => {
 
 // -------------------- 7. single stale flag → {} + preserved --------------------
 
-test('single stale .pending-<id> (older than TTL) → {} and file preserved', () => {
+test('single stale .pending-<id> (older than TTL, within hard TTL) → {} and file preserved', () => {
   const root = mkProjectDir();
   const orch = mkOrchDir(root);
   const stalePath = writeFlag(orch, 'stale', 'old content', {
@@ -152,6 +153,52 @@ test('single stale .pending-<id> (older than TTL) → {} and file preserved', ()
   assert.strictEqual(out, '{}');
   assert.strictEqual(fs.existsSync(stalePath), true);
   assert.strictEqual(fs.readFileSync(stalePath, 'utf8'), 'old content');
+});
+
+// -------------------- 7a. two-tier TTL — todo 005 --------------------
+
+test('STALE_HARD_TTL_MS is exported and is 10 × FLAG_TTL_MS', () => {
+  assert.strictEqual(STALE_HARD_TTL_MS, 10 * FLAG_TTL_MS);
+});
+
+test('flag older than hard TTL → unlinked best-effort (todo 005 Option B)', () => {
+  const root = mkProjectDir();
+  const orch = mkOrchDir(root);
+  const now = Date.now();
+  // Hard-stale flag (≥ 10 min) — must be GC'd.
+  const hardStale = writeFlag(orch, 'ancient', 'forgotten', {
+    mtimeMs: now - STALE_HARD_TTL_MS - 30_000,
+  });
+  // Soft-stale flag (between soft and hard) — must be preserved.
+  const softStale = writeFlag(orch, 'recent-stale', 'still useful', {
+    mtimeMs: now - FLAG_TTL_MS - 10_000,
+  });
+
+  const out = runHook({ projectDir: root, now });
+  assert.strictEqual(out, '{}');
+  assert.strictEqual(fs.existsSync(hardStale), false, 'hard-stale flag should be unlinked');
+  assert.strictEqual(fs.existsSync(softStale), true, 'soft-stale flag should be preserved');
+});
+
+test('hard-TTL unlink ignores ENOENT race (todo 005)', () => {
+  const root = mkProjectDir();
+  const orch = mkOrchDir(root);
+  const now = Date.now();
+  writeFlag(orch, 'racing-gc', 'gone', {
+    mtimeMs: now - STALE_HARD_TTL_MS - 1_000,
+  });
+
+  // Simulate a concurrent unlink: our unlinkSync sees ENOENT. Hook must
+  // not throw and must still return {}.
+  const fsLib = Object.create(fs);
+  fsLib.unlinkSync = () => {
+    const err = new Error('ENOENT');
+    err.code = 'ENOENT';
+    throw err;
+  };
+
+  const out = runHook({ projectDir: root, now, fsLib });
+  assert.strictEqual(out, '{}');
 });
 
 // -------------------- 8. multiple fresh → oldest wins, others preserved --------------------
