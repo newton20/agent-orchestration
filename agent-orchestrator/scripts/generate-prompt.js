@@ -994,6 +994,12 @@ function main() {
   if (args.dryRun) {
     // For --dry-run, we still validate but do NOT write. The
     // simplest implementation: render to a tmp dir, then unlink.
+    // Wrap render+print in the same try/catch the non-dry path
+    // uses so render-time errors (e.g., missing required content
+    // block, missing --recovery-role on a recovery dry-run) print
+    // as `generate-prompt.js: <message>` rather than as an
+    // uncaught stack trace. Codex round 7 caught this UX
+    // inconsistency between the two paths.
     const tmpDir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'generate-prompt-dry-'));
     try {
       opts.outputDir = tmpDir;
@@ -1011,6 +1017,8 @@ function main() {
           2,
         ) + '\n',
       );
+    } catch (err) {
+      fail(err.message);
     } finally {
       try {
         fs.rmSync(tmpDir, { recursive: true, force: true });

@@ -1186,6 +1186,41 @@ test('CLI: --workdir is resolved to absolute before rendering', () => {
   assert.notStrictEqual(renderedWorkdir, '.');
 });
 
+test('CLI: --dry-run render errors print through fail() not as uncaught stack trace', () => {
+  // Codex round 7 — the dry-run path used to escape the non-dry
+  // path's try/catch, so a render-time validation error (e.g.,
+  // recovery dry-run without --recovery-role) printed as an
+  // uncaught stack trace instead of the documented
+  // `generate-prompt.js: <message>` envelope. Wrapping the
+  // dry-run render in the same try/catch unifies the UX.
+  const phaseDir = mkTmp('gp-cli-dry');
+  const out = require('node:child_process').spawnSync(
+    process.execPath,
+    [
+      path.join(__dirname, 'generate-prompt.js'),
+      '--role',
+      'recovery',         // requires --recovery-role; we omit it
+      '--phase',
+      'phase-7',
+      '--output',
+      phaseDir,
+      '--templates',
+      TEMPLATES_DIR,
+      '--workdir',
+      '/tmp/wd',
+      '--project',
+      'cli-project',
+      '--dry-run',
+    ],
+    { encoding: 'utf8' },
+  );
+  assert.strictEqual(out.status, 1);
+  assert.match(out.stderr, /^generate-prompt\.js: /m);
+  assert.match(out.stderr, /recoveryRole must be one of/);
+  // Must NOT contain a Node.js stack-trace envelope.
+  assert.ok(!/^\s+at\s/m.test(out.stderr), 'dry-run errors must not surface a stack trace');
+});
+
 test('CLI: --project is required (matches the protocol-header contract)', () => {
   // Codex round 5 — protocol-header.md declares project_name
   // required, and renderTemplate rejects empty required strings.
