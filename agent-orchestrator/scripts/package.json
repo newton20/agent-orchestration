@@ -6,10 +6,11 @@
   "bin": {
     "parse-manifest": "./parse-manifest.js",
     "scaffold-protocol": "./scaffold-protocol.js",
-    "spawn-session": "./spawn-session.js"
+    "spawn-session": "./spawn-session.js",
+    "generate-prompt": "./generate-prompt.js"
   },
   "scripts": {
-    "test": "node --test parse-manifest.test.js scaffold-protocol.test.js spawn-session.test.js"
+    "test": "node --test parse-manifest.test.js scaffold-protocol.test.js spawn-session.test.js generate-prompt.test.js"
   },
   "dependencies": {
     "js-yaml": "^4.1.0"
