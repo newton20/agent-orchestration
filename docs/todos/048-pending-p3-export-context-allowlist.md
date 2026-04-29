@@ -99,28 +99,42 @@ status is implicit until needed.
 
 ## Recommended Action
 
-Coord triage pending. Recommend Option A if/when this lands in the
-post-Unit-7 doc cleanup PR — it is a one-line export plus a JSDoc
-clarification, and the security-defense framing is already implied
-by the in-source comments at lines 940-995.
+Coord triage pending. Recommend Option A — exporting an
+**`isAllowedContextKey(key)` predicate** (NOT the raw Set, since
+`Object.freeze(new Set(...))` does not prevent `.add()` /
+`.delete()` mutation). Predicate plus JSDoc clarification.
 
 ## Technical Details
 
 - Affected file: `agent-orchestrator/scripts/generate-prompt.js`
 - Lines: 950-996 (declaration), 1099-1115 (exports).
-- Behavior: no change. Public surface adds one frozen `Set`.
-- Test impact: optionally add a node:test assertion that
-  `require('./generate-prompt').CONTEXT_ALLOWLIST` is a frozen
-  `Set` containing at least the impl/qa/coord/recovery keys
-  documented at lines 952-994.
+- Behavior: no change to the existing CLI gate. Public surface
+  adds **one immutable accessor** — choose ONE of:
+  - `isAllowedContextKey(key) -> boolean` predicate function
+    closing over the private Set (recommended; can't be widened).
+  - `CONTEXT_ALLOWLIST: ReadonlyArray<string>` exported as a
+    `Object.freeze`d Array (frozen Arrays DO refuse push/pop).
+  Do NOT export the raw `Set` — `Object.freeze` on a Set wrapper
+  leaves `.add()` / `.delete()` callable on the internal storage.
+- Test impact: add a node:test assertion that the chosen surface
+  cannot be mutated by an external caller (call `.add()` /
+  `.delete()` / `.push()` and verify the next access still
+  reflects the original allowlist).
 
 ## Acceptance Criteria
 
 - [ ] Triage captures chosen Option.
-- [ ] If A: `CONTEXT_ALLOWLIST` appears in `module.exports`.
-- [ ] If A: JSDoc above the declaration calls out the constant as
-  the canonical allowlist for content-block ingestion from
-  untrusted callers.
+- [ ] If A: a public predicate (`isAllowedContextKey`) OR a frozen
+  Array (NOT a frozen Set) is added to `module.exports`. Raw-Set
+  export is explicitly disallowed in the criteria.
+- [ ] If A: JSDoc above the declaration calls out the constant /
+  predicate as the canonical allowlist for content-block
+  ingestion from untrusted callers, AND warns against future
+  refactors that would expose the internal Set directly.
+- [ ] If A: a node:test assertion verifies the public surface is
+  immune to external mutation (e.g. `require('./generate-prompt')
+  .CONTEXT_ALLOWLIST.push('x')` throws or no-ops, and the
+  predicate does not start returning `true` for `'x'`).
 - [ ] If A: existing CLI behavior unchanged (allowlist values
   identical).
 - [ ] Tests still green.
@@ -140,6 +154,16 @@ by the in-source comments at lines 940-995.
   the private Set) or a frozen Array (for which `Object.freeze`
   does prevent mutation). Explicitly flagged the raw-Set-export
   footgun.
+- **2026-04-29 — corrected via codex round 2 on triage PR** —
+  Technical Details and Acceptance Criteria still said "add a
+  frozen Set to module.exports / test CONTEXT_ALLOWLIST directly"
+  even after Option A was rewritten. Codex correctly noted this
+  would reintroduce the same security footgun the todo just
+  identified. Rewrote Technical Details to require the
+  predicate-or-frozen-Array shape and explicitly disallow raw-Set
+  export; updated Acceptance Criteria to require an immutable
+  public surface and a node:test assertion that external mutation
+  attempts no-op.
 
 ## Resources
 

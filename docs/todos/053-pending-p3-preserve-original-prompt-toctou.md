@@ -183,32 +183,57 @@ No real concurrent-recovery scenario exists in V1.
 
 ## Recommended Action
 
-Coord triage pending. Recommend Option A if/when this lands in the
-post-Unit-7 doc cleanup PR — the `wx` open is a small, idiomatic
-fix that eliminates the window. If Option A is rejected for
-atomic-write-pattern reasons, Option B's JSDoc note is the cheap
-fallback.
+Coord triage pending. Recommend Option A — but **only** with the
+atomic tmp-write + `linkSync` pattern documented in Option A's Cons
+section. The bare `fs.openSync(origPath, 'wx')` form shown earlier
+in the snippet would preserve the exact failure mode this todo is
+guarding against (crash between create and write leaves an empty
+.original.md, breaking the invariant permanently). If the
+atomic-link form is rejected as too platform-specific (Windows
+NTFS-vs-FAT32 caveat), Option B's JSDoc note is the cheap fallback.
 
 ## Technical Details
 
 - Affected file: `agent-orchestrator/scripts/generate-prompt.js`
 - Lines: 486-494 (function body).
-- `atomicWrite` (currently used) writes to `${path}.tmp` then
-  renames; Option A replaces this with `fs.openSync(origPath,
-  'wx')` + `fs.writeFileSync(fd, ...)`.
+- The fix MUST use a complete-file exclusive-create primitive — not
+  bare `wx`. The recommended pattern: write `live` content to a
+  tmp path via `fs.writeFileSync(tmpPath, live)` so the tmp file is
+  complete on disk; then `fs.linkSync(tmpPath, origPath)` —
+  succeeds (creates origPath as a hard link, fully populated) or
+  fails atomically with EEXIST (re-recovery; another writer won).
+  Unlink tmp regardless. See Option A's "Atomic exclusive-create
+  pattern" code sketch for the full shape.
+- The current `atomicWrite` (write tmp + rename) does not provide
+  the exclusive-create property — `renameSync` overwrites an
+  existing target on POSIX and most Windows filesystems.
+- Windows caveat: `linkSync` works on NTFS (default) but not
+  FAT32. Document this constraint in code comments if Option A is
+  chosen.
 - Test impact: existing single-dispatch preservation tests
-  unchanged. New test could simulate two concurrent calls and
-  assert exactly one returns true.
+  unchanged. New tests:
+  - simulate two concurrent calls and assert exactly one returns
+    `true` (the link race resolves to a single winner)
+  - simulate a tmp-write that succeeds followed by a
+    pre-`linkSync` crash, then a re-recovery — assert the
+    re-recovery completes preservation correctly (since no
+    origPath was created, the second call's link succeeds)
 
 ## Acceptance Criteria
 
 - [ ] Triage captures chosen Option.
-- [ ] If A: `preserveOriginalPrompt` uses `fs.openSync(origPath,
-  'wx')` (or equivalent O_EXCL primitive) to gate the write.
-- [ ] If A: re-recovery dispatch (origPath already exists) still
-  returns false without overwriting.
-- [ ] If A: first-dispatch (origPath does not exist) writes the
-  live contents to origPath.
+- [ ] If A: `preserveOriginalPrompt` uses the tmp-write +
+  `fs.linkSync` exclusive-create pattern (NOT bare `fs.openSync(...,
+  'wx')` + `writeFileSync`, which is non-atomic and would preserve
+  the same failure mode).
+- [ ] If A: re-recovery dispatch (origPath already exists) returns
+  false without overwriting AND without leaving the live content
+  in a stray tmp file (tmp is unlinked in the `finally` block
+  regardless of which branch runs).
+- [ ] If A: first-dispatch (origPath does not exist) atomically
+  produces a complete-content origPath via the link; partial-write
+  failure modes between tmp-write and linkSync produce no origPath
+  at all (allowing the next recovery to retry).
 - [ ] Tests still green.
 
 ## Work Log
@@ -227,6 +252,15 @@ fallback.
   origPath)` which atomically fails with EEXIST or succeeds with
   a complete file on disk; unlink tmp regardless). Documented the
   Windows NTFS-vs-FAT32 caveat for `linkSync`.
+- **2026-04-29 — corrected via codex round 2 on triage PR** —
+  Technical Details and Acceptance Criteria still referenced the
+  bare `wx` + `writeFileSync` pattern even after Option A was
+  rewritten. Codex correctly noted this would preserve the exact
+  partial-write failure mode the todo is guarding against.
+  Rewrote Technical Details to require the tmp-write +
+  `fs.linkSync` exclusive-create pattern; updated Acceptance
+  Criteria to explicitly disallow bare `wx` + `writeFileSync`
+  and require complete-content origPath via the link primitive.
 
 ## Resources
 

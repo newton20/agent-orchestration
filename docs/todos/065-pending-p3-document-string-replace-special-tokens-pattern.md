@@ -114,7 +114,12 @@ cleanup PR.
 ## Technical Details
 
 - New file (Option A):
-  `agent-orchestrator/docs/solutions/logic-errors/javascript-string-replace-special-tokens.md`
+  `docs/solutions/logic-errors/javascript-string-replace-special-tokens.md`
+  (repo-root `docs/solutions/`, matching the existing
+  `docs/solutions/integration-issues/` directory; codex on triage
+  caught the original triage's path nesting under
+  `agent-orchestrator/docs/...` which would have created a parallel
+  wrong tree)
 - Cross-reference from
   `agent-orchestrator/templates/README.md` "Interpolation
   contract" section (link out to the new solutions doc).
@@ -137,6 +142,13 @@ cleanup PR.
 
 - **2026-04-29 — todo created** — Surfaced by PR #13 ce:review
   (learnings-researcher). Coord triage pending.
+- **2026-04-29 — corrected via codex round 2 on triage PR** —
+  original Technical Details path nested the new solutions doc
+  under `agent-orchestrator/docs/solutions/...`, but the
+  repository's actual solutions tree is at repo-root
+  `docs/solutions/` (sibling to `docs/todos/` where this todo
+  itself lives). Following the original path would create a
+  parallel wrong tree. Corrected to `docs/solutions/logic-errors/...`.
 
 ## Resources
 

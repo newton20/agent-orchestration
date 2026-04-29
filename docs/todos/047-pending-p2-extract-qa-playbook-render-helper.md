@@ -64,7 +64,12 @@ PR #13 ce:review pattern-recognition-specialist P2:
 
 ### Option A — Extract `renderQaPlaybookIfNeeded` helper
 
-Pull the inline block into a named function:
+Pull the inline block into a named function. Mirror the existing
+inline call shape — `renderTemplate` requires a full template
+(frontmatter + body) and returns `{ text, varsUsed, warnings }`,
+not a bare string (codex on triage caught the original sketch
+calling `renderTemplate(parseFrontmatter(playbookSrc).body, ...)`,
+which would throw "missing YAML frontmatter"):
 
 ```js
 function renderQaPlaybookIfNeeded(o, context, recovery, templatesDir) {
@@ -72,11 +77,10 @@ function renderQaPlaybookIfNeeded(o, context, recovery, templatesDir) {
   const isQa = o.role === 'qa' || (recovery && o.recoveryRole === 'qa');
   if (!isQa) return '';
   const playbookSrc = readTemplate(templatesDir, QA_PLAYBOOK_FILE);
-  const playbookOnce = renderTemplate(
-    parseFrontmatter(playbookSrc).body,
-    context
-  );
-  return renderTemplate(playbookOnce, context);
+  const rendered = renderTemplate(playbookSrc, context, {
+    templateName: QA_PLAYBOOK_FILE,
+  });
+  return rendered.text;
 }
 ```
 
@@ -153,6 +157,16 @@ edits cleaner).
 
 - **2026-04-29 — todo created** — Surfaced by PR #13 ce:review
   (pattern-recognition-specialist P2). Coord triage pending.
+- **2026-04-29 — corrected via codex round 2 on triage PR** —
+  original Option A helper sketch passed
+  `parseFrontmatter(playbookSrc).body` to `renderTemplate`, which
+  would throw "missing YAML frontmatter" since renderTemplate
+  expects the full template. Also called `renderTemplate` twice
+  (once on body, once on the rendered text) implying a two-pass
+  semantic that does not exist. Codex correctly noted the helper
+  must mirror the existing call shape: pass full `playbookSrc`,
+  read `rendered.text` from the return value. Rewrote the
+  snippet.
 
 ## Resources
 

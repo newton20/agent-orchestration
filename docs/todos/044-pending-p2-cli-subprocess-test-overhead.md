@@ -20,14 +20,35 @@ codes), but as the suite grows they'll continue to dominate.
 
 `agent-orchestrator/scripts/generate-prompt.test.js` lines 1194,
 1259, 1335, 1388, 1436, 1469: each is a `spawnSync(process.execPath,
-[GENERATE_PROMPT_SCRIPT, ...])` call. Tests cover:
+[GENERATE_PROMPT_SCRIPT, ...])` call. The actual CLI surface they
+exercise (codex on triage caught the original triage's stale
+descriptions):
 
-- Missing required args → exit 1, stderr contains usage.
-- Bad `--role` → exit 1, stderr names the bad role.
-- `--context k=v` allowlist enforcement → exit 1 on unknown key.
-- `--context` value parses as JSON when shape suggests JSON.
-- `--out` flag writes to disk and prints "wrote ..." to stdout.
-- Default behavior (no `--out`) prints rendered prompt to stdout.
+- `--context` JSON keys outside CONTEXT_ALLOWLIST are silently
+  dropped (CLI exits 0 with the prompt rendered using only the
+  allowlisted keys). Test asserts the dropped key did not surface
+  in the rendered prompt.
+- `--context` JSON path containing dispatch-control keys (`role`,
+  `outputDir`, `phaseDir`, etc.) — same silent-drop behavior;
+  test asserts the operator's `--role` / `--output` flags win.
+- `--workdir` resolution: the rendered prompt's `{{workdir}}`
+  matches the operator's `--workdir` flag (not the test's CWD).
+- `--dry-run` end-to-end: renders without touching disk, prints
+  the rendered prompt to stdout as JSON.
+- Missing `--phase` / `--role` exits 1 with the documented
+  `generate-prompt.js: <message>` envelope on stderr (no stack
+  trace).
+- Bare `--unit-marker N` matches `**Unit N:**` exactly (no
+  prefix-match leak through codex round 1's anchor fix).
+
+The CLI's successful output is JSON (not "wrote …") containing
+fields like `prompt_path`, `chars`, `vars_used`, etc. Tests parse
+the JSON and assert against the structured fields. The
+flag is `--output` (not `--out`).
+
+Performance-oracle measured each subprocess at ~140ms on Windows
+(Node startup ~60ms + module load ~50ms + js-yaml cold-load ~30ms +
+work). 6 × 140ms ≈ 848ms of pure overhead before any test logic.
 
 Performance-oracle measured each subprocess at ~140ms on Windows
 (Node startup ~60ms + module load ~50ms + js-yaml cold-load ~30ms +
@@ -146,6 +167,15 @@ is the load-bearing question.
 
 - **2026-04-29 — todo created** — Surfaced by PR #13 ce:review
   (performance-oracle P2). Coord triage pending.
+- **2026-04-29 — corrected via codex round 2 on triage PR** —
+  original CLI test inventory described stale behaviors (`--out`
+  flag, "wrote …" stdout shape, exit-1-on-unknown-context-key)
+  that don't match the actual CLI. Codex correctly noted the
+  flag is `--output`, JSON output, and unknown context keys are
+  silently dropped per CONTEXT_ALLOWLIST. Rewrote the inventory
+  to match real behaviors (allowlist drop + dispatch-key
+  drop + workdir resolution + dry-run + missing-arg envelope +
+  unit-marker anchor) so the refactor target list is accurate.
 
 ## Resources
 

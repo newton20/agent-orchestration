@@ -121,7 +121,7 @@ cleanup PR.
 ## Technical Details
 
 - New file (Option A):
-  `agent-orchestrator/docs/solutions/logic-errors/empty-string-explicit-override-bug-class.md`
+  `docs/solutions/logic-errors/empty-string-explicit-override-bug-class.md`
 - Cross-reference from `agent-orchestrator/scripts/generate-prompt.js`
   inline comments at the three fix sites (round 6, 10, 13) — link
   out rather than re-explain.
@@ -146,6 +146,13 @@ cleanup PR.
 
 - **2026-04-29 — todo created** — Surfaced by PR #13 ce:review
   (learnings-researcher). Coord triage pending.
+- **2026-04-29 — corrected via codex round 2 on triage PR** —
+  original Technical Details path nested the new solutions doc
+  under `agent-orchestrator/docs/solutions/...`, but the
+  repository's actual solutions tree is at repo-root
+  `docs/solutions/` (sibling to `docs/todos/`). Following the
+  original path would create a parallel wrong tree. Corrected to
+  `docs/solutions/logic-errors/...`.
 
 ## Resources
 
