@@ -97,21 +97,32 @@ test) as subprocess tests.
   but real surface change; need to confirm no caller depends
   on it (only `bin/generate-prompt` and tests today).
 
-### Option B — Replace some subprocess tests with JS API calls
+### Option B — Refactor `main()` to be testable AND keep CLI-path coverage
 
-The `--context k=v` allowlist tests are about input shape
-validation. The same shape can be probed via the JS API (call
-`generatePrompt({ context: { unknownKey: 'x' } })` and assert it
-throws). Keep subprocess tests only where the CLI parsing
-itself is what's under test (argv → opts).
+Option A's main() refactor is the load-bearing change. The
+**allowlist drop** is enforced in `main()` itself (it reads the
+JSON file from `--context`, filters via CONTEXT_ALLOWLIST, then
+spreads into the opts that flow to `generatePrompt`). The JS API
+of `generatePrompt` does not have a `context` opt — there is no
+JS-API path that exercises the allowlist drop, so a naive
+"replace subprocess tests with JS calls" rewrite would lose
+allowlist coverage entirely (codex round 4 caught this).
 
-- **Pros:** Smaller refactor than Option A. No `main()`
-  signature change. Just relocate tests.
-- **Cons:** Some assertions (e.g. stderr message format, exit
-  code 1 vs 0) genuinely require a subprocess to verify. Won't
-  remove all 6 — likely 2-3.
-- **Effort:** Small-medium.
-- **Risk:** Low — pure test refactor.
+Treat this as a sub-option of Option A: after refactoring
+`main()` to accept `{ argv, stdout, stderr, exit }`, the
+allowlist tests can call `main(...)` directly with an argv
+that includes `--context <path>` — same coverage of the
+filtering step, in-process. Subprocess tests can be retained
+only for end-to-end smoke (e.g., shebang/exit-code/stderr-
+envelope checks that genuinely need the OS process boundary).
+
+- **Pros:** Preserves allowlist + dispatch-key-drop test
+  coverage in-process; uses the same `main()` refactor as
+  Option A.
+- **Cons:** Strictly a layered version of Option A; doesn't
+  exist as a separate fix.
+- **Effort:** Same as Option A.
+- **Risk:** Low.
 
 ### Option C — Defer
 
@@ -176,6 +187,15 @@ is the load-bearing question.
   to match real behaviors (allowlist drop + dispatch-key
   drop + workdir resolution + dry-run + missing-arg envelope +
   unit-marker anchor) so the refactor target list is accurate.
+- **2026-04-29 — corrected via codex round 4 on triage PR** —
+  original Option B suggested calling `generatePrompt({ context:
+  ... })` directly to test the allowlist drop. Codex correctly
+  noted the JS API has no `context` opt; the allowlist drop lives
+  in `main()`. A naive replacement would lose allowlist coverage
+  entirely. Rewrote Option B as "sub-option of Option A": after
+  refactoring `main()` to be in-process testable, allowlist tests
+  call `main(...)` with `--context <path>` argv. Subprocess
+  smoke tests retained for OS-boundary assertions only.
 
 ## Resources
 

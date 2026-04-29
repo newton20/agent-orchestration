@@ -148,9 +148,17 @@ this with todo 042 (both center on playbook-load plumbing).
   - `generatePrompt` reads the playbook once, passes bytes
     into both call sites.
 - `readTemplate` per-call cost on Windows: ~394µs measured.
-- Non-QA renders unchanged (the existing
-  `body.includes('{{qa_playbook_block}}')` short-circuit
-  preserves zero-cost for non-QA paths).
+- Affected dispatch paths (per the corrected scope in the
+  Problem Statement above): QA + qa-recovery (currently
+  double-read; Option A makes them single-read);
+  impl-recovery + coord-recovery (currently single-read inside
+  `checkTransitiveDrift` because `recovery-prompt.md` body
+  contains `{{qa_playbook_block}}`; Option A's pre-load + bytes
+  pass-through removes this read too if the recovery path also
+  pre-loads). Pure impl/coord (non-recovery) renders are
+  zero-read and unchanged — the existing
+  `body.includes('{{qa_playbook_block}}')` short-circuit in
+  `checkTransitiveDrift` already preserves their zero cost.
 
 ## Acceptance Criteria
 
@@ -179,6 +187,11 @@ this with todo 042 (both center on playbook-load plumbing).
   double-read; qa-recovery double-read; impl/coord-recovery
   single-read; pure impl/coord zero-read) so Option A's
   optimization scope captures the full surface.
+- **2026-04-29 — corrected via codex round 4 on triage PR** —
+  Technical Details still said "Non-QA renders unchanged
+  (zero-cost)", contradicting the Problem Statement's corrected
+  scope. Rewrote the bullet to enumerate the four paths with
+  their before/after read counts.
 
 ## Resources
 

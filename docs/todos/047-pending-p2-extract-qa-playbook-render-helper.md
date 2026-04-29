@@ -25,10 +25,12 @@ hides it inside a larger function.
 const needsPlaybook =
   !context.qa_playbook_block &&
   (o.role === 'qa' || (recovery && o.recoveryRole === 'qa'));
+let playbookText = '';
 if (needsPlaybook) {
   const playbookSrc = readTemplate(o.templatesDir, QA_PLAYBOOK_FILE);
-  const playbookOnce = renderTemplate(parseFrontmatter(playbookSrc).body, context);
-  context.qa_playbook_block = renderTemplate(playbookOnce, context);
+  const rendered = renderTemplate(playbookSrc, context, { templateName: QA_PLAYBOOK_FILE });
+  playbookText = rendered.text;
+  context.qa_playbook_block = playbookText;
 }
 ```
 
@@ -167,6 +169,15 @@ edits cleaner).
   must mirror the existing call shape: pass full `playbookSrc`,
   read `rendered.text` from the return value. Rewrote the
   snippet.
+- **2026-04-29 — corrected via codex round 4 on triage PR** —
+  the Problem Statement's "current inline code" excerpt still
+  showed the same stale `parseFrontmatter(playbookSrc).body` +
+  double-renderTemplate pattern that Option A had been
+  rewritten away from. A reader scanning only the Problem
+  Statement would believe the codebase looks like the broken
+  sketch and might reproduce that shape. Updated the excerpt
+  to match the actual current code (full playbookSrc to
+  renderTemplate; read `rendered.text`).
 
 ## Resources
 
