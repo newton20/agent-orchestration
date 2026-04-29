@@ -113,11 +113,14 @@ calls out the trust assumption explicitly:
 > file-read disclosure bug codex round 9 closed for the CLI.
 > See generate-prompt.js:981-992.
 
-Plus a one-line entry in the Unit 11 checklist (in
-`docs/units/011-...md` or wherever Unit 11 design lives) that
-says: "If exposing `priorPhaseSignals` via any new operator
-surface, gate it behind a path-containment check against
-`phasesRoot`."
+Plus a one-line entry where Unit 11 design lives. Today that's
+the orchestration plan at `docs/plans/2026-04-15-001-feat-agent-
+orchestration-plugin-plan.md` (Unit 11 section near line 609).
+Add: "If exposing `priorPhaseSignals` via any new operator
+surface (CLI flag, HTTP, etc.), gate it behind a path-
+containment check against `phasesRoot`." NOTE: do NOT add this
+to `docs/todos/011-*.md` — that is an unrelated completed todo
+about template frontmatter, not a Unit 11 design surface.
 
 - **Pros:** Cheap. The trust assumption is now visible at the
   function declaration where it's actually used. Future
@@ -150,8 +153,12 @@ case.
 - Affected file: `agent-orchestrator/scripts/generate-prompt.js`
 - Lines: 413-461 (function body), 981-992 (CLI allowlist comment
   the JSDoc would cross-reference).
-- Unit 11 design doc: `docs/units/...` or
-  `docs/todos/011-...` — add a checklist note.
+- Unit 11 design doc:
+  `docs/plans/2026-04-15-001-feat-agent-orchestration-plugin-plan.md`
+  Unit 11 section (around line 609 at time of writing). NOT
+  `docs/todos/011-*.md` (that is an unrelated completed todo
+  about template re-declaration convention; codex on triage
+  caught the original cross-reference pointing there).
 
 ## Acceptance Criteria
 
@@ -171,6 +178,15 @@ case.
 - **2026-04-29 — todo created** — Surfaced by PR #13 ce:review
   (security-sentinel P3, operational note). Coord triage
   pending.
+- **2026-04-29 — corrected via codex round 5 on triage PR** —
+  original Option B + Technical Details said to add the Unit 11
+  checklist note to `docs/todos/011-*.md`. Codex correctly noted
+  that's an unrelated completed todo about template
+  re-declaration convention; Unit 11 design lives in the
+  orchestration plan at `docs/plans/2026-04-15-001-feat-agent-
+  orchestration-plugin-plan.md` (Unit 11 section ~line 609).
+  Updated both Option B and Technical Details to point at the
+  correct surface.
 
 ## Resources
 

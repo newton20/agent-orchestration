@@ -79,8 +79,8 @@ PR #13 ce:review performance-oracle P2:
 Change `main()` and `parseCliArgs()` signatures to accept
 `{ argv, stdout, stderr, exit }` (or throw `CliError` and wrap).
 4 of the 6 subprocess tests refactor to in-process calls. Keep
-1-2 (e.g. the actual binary smoke test, the `--out` disk-write
-test) as subprocess tests.
+1-2 (e.g. the actual binary smoke test, the `--output` disk-write
+end-to-end test) as subprocess tests.
 
 - **Pros:** ~600ms test speedup (~28% of total). Better isolation
   for stderr/exit assertions (can inspect a buffer instead of
@@ -196,6 +196,11 @@ is the load-bearing question.
   refactoring `main()` to be in-process testable, allowlist tests
   call `main(...)` with `--context <path>` argv. Subprocess
   smoke tests retained for OS-boundary assertions only.
+- **2026-04-29 — corrected via codex round 5 on triage PR** —
+  Option A's "keep 1-2 subprocess tests" example referenced a
+  `--out` disk-write test even though the same todo states the
+  actual flag is `--output`. Replaced with `--output` to keep
+  the implementation guidance internally consistent.
 
 ## Resources
 
