@@ -58,19 +58,27 @@ PR #13 ce:review agent-native-reviewer P3:
 
 ### Option A — Reflow the prose to be empty-safe
 
-Edit `agent-orchestrator/templates/protocol-header.md:38-39`:
+Replace the full paragraph at
+`agent-orchestrator/templates/protocol-header.md:38-40` (NOT just
+line 38; the absolute-path instruction at line 40 is load-bearing
+and must be preserved — codex round 7 caught the original
+triage's reflow dropping it):
 
 ```
 Read each path before starting work. If the bullet above is empty,
-this phase has no upstream dependencies — proceed directly.
+this phase has no upstream dependencies — proceed directly. Paths
+are absolute — do not interpret relative paths against your
+shell's cwd for protocol files.
 ```
 
 - **Pros:** Single template edit. Reads correctly in both empty
-  and non-empty cases. No conditional rendering needed.
+  and non-empty cases. No conditional rendering needed. Preserves
+  the absolute-path invariant the existing paragraph carries.
 - **Cons:** Slightly more words; agent has to read a conditional
   sentence even when the case is obvious.
 - **Effort:** Trivial.
-- **Risk:** None.
+- **Risk:** None — load-bearing absolute-path instruction is
+  retained.
 
 ### Option B — Defer
 
@@ -127,6 +135,16 @@ cleanup PR.
 
 - **2026-04-29 — todo created** — Surfaced by PR #13 ce:review
   (agent-native-reviewer P3). Coord triage pending.
+- **2026-04-29 — corrected via codex round 7 on triage PR** —
+  original Option A reflow replaced only the dangling sentence
+  and silently dropped the load-bearing absolute-path
+  instruction at line 40 of protocol-header.md ("Paths are
+  absolute — do not interpret relative paths against your
+  shell's cwd for protocol files"). Codex correctly noted this
+  would either leave that line orphaned or strand a protocol
+  invariant. Rewrote the proposed reflow to span the full
+  paragraph (lines 38-40) and include the absolute-path
+  instruction in the new wording.
 
 ## Resources
 
