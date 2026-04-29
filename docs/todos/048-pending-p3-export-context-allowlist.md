@@ -61,16 +61,27 @@ note the rationale (closes the codex P2 round 1/2 dispatch- and
 protocol-path tamper vectors).
 
 - **Pros:** Single source of truth. New consumers import the same
-  constant, get the same defense for free. Documentation makes the
+  predicate, get the same defense for free. Documentation makes the
   invariant grep-able.
 - **Cons:** Slightly enlarges the public API. Future churn on the
   allowlist becomes a "public API" change, requiring more care
   (but the allowlist is already a public security boundary; this
   just makes the boundary explicit).
-- **Effort:** Trivial (one line in `module.exports`, a JSDoc
-  paragraph).
-- **Risk:** Low. Already frozen with `Object.freeze`, so external
-  callers cannot mutate it.
+- **Effort:** Trivial (one helper function, a JSDoc paragraph).
+- **Risk:** Low — but **DO NOT** export the raw `Set` directly.
+  `Object.freeze(new Set(...))` does not prevent `.add()` /
+  `.delete()` on the Set's internal storage (codex on triage PR
+  caught this — the `Object.freeze` only freezes the wrapper
+  object, not the Set's items). Export shapes that resist mutation:
+  - **Recommended:** export an `isAllowedContextKey(key) -> boolean`
+    predicate function that closes over the private Set.
+  - **Alternative:** export a frozen Array — `Object.freeze` on an
+    array DOES prevent mutation (push/pop throw in strict mode).
+    Consumers iterate or convert to Set as needed.
+  Exporting the raw Set is a footgun: a single `require(...).CONTEXT_ALLOWLIST.add('phaseDir')`
+  inside any in-process consumer (a test fixture, a future module)
+  would silently widen the trusted-key set for every subsequent
+  invocation in that process.
 
 ### Option B — Defer until a second consumer exists
 
@@ -118,6 +129,17 @@ by the in-source comments at lines 940-995.
 
 - **2026-04-29 — todo created** — Surfaced by PR #13 ce:review
   (architecture-strategist P3). Coord triage pending.
+- **2026-04-29 — corrected via codex on triage PR** — original
+  Option A claimed `Object.freeze(new Set(...))` made the
+  allowlist immutable from external callers. Codex correctly
+  noted that `Object.freeze` only freezes the wrapper object —
+  the Set's internal storage stays mutable, so a consumer could
+  call `.add()` / `.delete()` to widen the allowlist for the
+  entire process. Rewrote Option A to recommend exporting an
+  `isAllowedContextKey(key) -> boolean` predicate (closes over
+  the private Set) or a frozen Array (for which `Object.freeze`
+  does prevent mutation). Explicitly flagged the raw-Set-export
+  footgun.
 
 ## Resources
 

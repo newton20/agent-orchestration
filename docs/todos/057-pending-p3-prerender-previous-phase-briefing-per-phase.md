@@ -58,11 +58,21 @@ call. Unit 11 logging may show the same advisory three times per
 phase.
 
 The empty-string-fallthrough fix from codex round 10 (which makes
-`previousPhaseBriefing: ''` route through the same derive path
-without re-reading signals) means a Unit 11 caller can pre-render
-the briefing once and pass the resulting string via
-`previousPhaseBriefing` opt — `buildPreviousPhaseBriefing` is
-never called when a non-empty value is supplied.
+`previousPhaseBriefing: ''` route through the derive path) means a
+Unit 11 caller can pre-render the briefing once and pass the
+resulting string via `previousPhaseBriefing` opt.
+
+**Important caveat (codex on triage caught):** Pre-rendering only
+avoids the file rereads if the caller ALSO **stops passing
+`priorPhaseSignals`** on the subsequent role dispatches. The
+codex-round-6 contract keeps the warning-channel parse running
+even when the caller pre-renders the briefing text — so a Unit 11
+caller that pre-renders the briefing AND keeps passing
+priorPhaseSignals will still re-read every signal three times
+(once per role) just to extract dispatcher_advisories warnings.
+Pre-rendering must be paired with omitting signals on the
+secondary calls; the warnings can be plumbed directly via the
+return value of the first call.
 
 ## Findings
 
@@ -85,21 +95,29 @@ PR #13 ce:review performance-oracle P3:
 Add a subsection (companion to todo 056's section, or unified
 under "Performance notes for Unit 11"):
 
-> **Pre-render `previousPhaseBriefing` once per phase.** Each
-> call to `generatePrompt` with `priorPhaseSignals` rebuilds the
-> upstream-briefing from disk. The briefing is identical
-> across the impl/qa/coord renders for a single phase. Unit 11
-> should build the briefing once per phase using
+> **Pre-render `previousPhaseBriefing` once per phase, AND omit
+> `priorPhaseSignals` from the role dispatches.** Each call to
+> `generatePrompt` with `priorPhaseSignals` rebuilds the
+> upstream-briefing from disk. The briefing is identical across
+> the impl/qa/coord renders for a single phase. Unit 11 should
+> build the briefing once per phase using
 > `buildPreviousPhaseBriefing` (exported from
-> `generate-prompt.js`) and pass the resulting string as
-> `previousPhaseBriefing` to all three role dispatches. The
-> empty-string-fallthrough behavior makes this safe — passing
-> `''` still routes through the auto-derive path.
+> `generate-prompt.js`), capture the warnings from that call,
+> and pass the resulting string as `previousPhaseBriefing` to
+> all three role dispatches.
 >
-> Bonus: pre-rendering centralizes the
-> `dispatcher_advisories` warnings into one spot, so they
-> appear exactly once per phase rather than once per role
-> render.
+> **Critical:** the role-dispatch calls must NOT pass
+> `priorPhaseSignals` alongside the pre-rendered briefing. The
+> codex-round-6 contract keeps the warning-channel parse running
+> even when the briefing text is pre-rendered — so passing both
+> would still re-read every signal three times just to surface
+> dispatcher_advisories warnings (which the orchestrator has
+> already captured from the pre-render). Pass
+> `previousPhaseBriefing` only on the dispatches; keep
+> `priorPhaseSignals` on the one-time pre-render call.
+>
+> Bonus: this also dedups the `dispatcher_advisories` warnings
+> to once per phase rather than once per role render.
 
 - **Pros:** Zero code change. Documents the discipline + the
   side-effect win on warnings dedup. Unit 7 stays simple.
@@ -169,6 +187,17 @@ favor of Option A over deferring.
 
 - **2026-04-29 — todo created** — Surfaced by PR #13 ce:review
   (performance-oracle P3). Coord triage pending.
+- **2026-04-29 — corrected via codex on triage PR** — original
+  Option A told Unit 11 to "pre-render `previousPhaseBriefing`
+  once per phase and pass the resulting string to all three role
+  dispatches" without warning that the codex-round-6 contract
+  keeps the warning-channel parse running even when the briefing
+  is pre-rendered. A naive caller that pre-renders the briefing
+  AND keeps passing `priorPhaseSignals` would still re-read every
+  signal three times (once per role). Rewrote Option A to add the
+  critical caveat: **omit `priorPhaseSignals` from the role
+  dispatches** after pre-rendering; capture the warnings from the
+  one-time pre-render call instead.
 
 ## Resources
 

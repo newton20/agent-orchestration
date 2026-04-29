@@ -100,24 +100,60 @@ function preserveOriginalPrompt(outputDir, effectiveRole) {
 }
 ```
 
-- **Pros:** Eliminates the TOCTOU window. First-writer-wins is
-  enforced by the kernel, not by JS-side check ordering. Behavior
-  identical for the single-dispatch case. Note: this trades the
-  current `atomicWrite` (write to `.tmp`, rename) for a direct
-  `wx` open — losing the partial-write atomicity. Could be
-  retained by writing to `${origPath}.tmp` with `wx` then
-  rename, but rename overwrites by default; would need
-  `fs.linkSync` + unlink dance for full atomicity. Acceptable
-  tradeoff because preservation is a one-time, small write
-  (the live prompt file) and a partial write of the
-  `.original.md` will be re-written on the next recovery, since
-  the first-writer-wins is now a property of the rename target.
-- **Cons:** Slight complexity increase (try/catch around the
-  open). Loses `atomicWrite`'s tmp+rename pattern unless
-  combined with `link`+`unlink`.
-- **Effort:** Small.
+- **Pros:** First-writer-wins is enforced by the kernel, not by
+  JS-side check ordering.
+- **Cons (CRITICAL — do not use the bare `wx` open shown above):**
+  A direct `openSync(origPath, 'wx')` followed by writes is **not
+  atomic**. If the process crashes (or the disk errors) between
+  creating the empty file and finishing the write, `.original.md`
+  exists on disk as a truncated / empty file. The next recovery
+  dispatch sees `EEXIST`, returns `false`, and SKIPS the
+  preservation — permanently breaking the documented "first
+  non-recovery prompt across the entire crash chain" invariant.
+  Codex on the triage PR caught this trap.
+
+  **Atomic exclusive-create pattern (use this instead):**
+  Write the live content to `${origPath}.preserve-tmp-${pid}-${ms}`
+  via the existing `atomicWrite`-style flow, then atomically link
+  the tmp into place using `fs.linkSync(tmpPath, origPath)` —
+  which fails with `EEXIST` if `origPath` already exists, or
+  succeeds if not. Either outcome leaves a complete file on disk
+  (or no file at all). Unlink the tmp regardless.
+
+  ```js
+  function preserveOriginalPrompt(outputDir, effectiveRole) {
+    const livePath = path.join(outputDir, `${effectiveRole}-prompt.md`);
+    const origPath = path.join(outputDir, `${effectiveRole}-prompt.original.md`);
+    if (!fs.existsSync(livePath)) return false;
+    const live = fs.readFileSync(livePath, 'utf8');
+    const tmpPath = path.join(
+      path.dirname(origPath),
+      `.${path.basename(origPath)}.preserve-tmp-${process.pid}-${Date.now()}`
+    );
+    fs.writeFileSync(tmpPath, live, { encoding: 'utf8' });
+    let preserved = false;
+    try {
+      fs.linkSync(tmpPath, origPath);  // atomic exclusive-create on POSIX + NTFS
+      preserved = true;
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err;
+      // origPath already exists — re-recovery; do nothing.
+    } finally {
+      try { fs.unlinkSync(tmpPath); } catch { /* best-effort */ }
+    }
+    return preserved;
+  }
+  ```
+
+  Caveats: `linkSync` on Windows requires the source and target
+  on the same filesystem; both paths share `outputDir` so this
+  holds. On Windows, hard-link creation is supported on NTFS
+  (default) but not on FAT32 — document this constraint.
+- **Effort:** Small (~10 LOC).
 - **Risk:** Low. Existing tests for single-dispatch preservation
-  unchanged.
+  unchanged. Add a test that simulates concurrent recovery
+  (same `outputDir`, two simultaneous calls) and asserts the
+  invariant holds.
 
 ### Option B — Accept (orchestrator design forbids concurrent dispatches)
 
@@ -179,6 +215,18 @@ fallback.
 
 - **2026-04-29 — todo created** — Surfaced by PR #13 ce:review
   (security-sentinel P3). Coord triage pending.
+- **2026-04-29 — corrected via codex on triage PR** — original
+  Option A recommended a bare `fs.openSync(origPath, 'wx')` open
+  followed by writes. Codex correctly noted that this is NOT
+  atomic — a crash or disk error between create and write leaves
+  `.original.md` empty/truncated; the next recovery sees `EEXIST`
+  and skips the preservation, **permanently** breaking the
+  documented "first non-recovery prompt across the entire crash
+  chain" invariant. Rewrote Option A to use an
+  atomic-exclusive-create pattern (write tmp → `fs.linkSync(tmp,
+  origPath)` which atomically fails with EEXIST or succeeds with
+  a complete file on disk; unlink tmp regardless). Documented the
+  Windows NTFS-vs-FAT32 caveat for `linkSync`.
 
 ## Resources
 
