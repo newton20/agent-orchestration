@@ -167,13 +167,27 @@ the contract (Option A) or implementation detail (Option C).
 - [ ] If A: `prior_phase_dirs` entries also normalized.
 - [ ] If A: snapshot of a rendered prompt on Windows matches
   the snapshot on Linux for path strings.
-- [ ] If B: `completionSignalPath` and `heartbeatPath` use
-  `path.posix.join`; combine with a `phaseDir` normalize.
+- [ ] If B: `completionSignalPath` derivation uses
+  `path.posix.join` (NOT `heartbeatPath` — it has no derivation
+  site, it's a passthrough). Combine with a `phaseDir` normalize
+  on the inputs that arrive backslash-shaped from operator-side.
+  Caller-supplied `heartbeatPath` containing backslashes is
+  Unit 11's responsibility unless Option A is also adopted for
+  cross-cutting normalization.
 
 ## Work Log
 
 - **2026-04-29 — todo created** — Surfaced by PR #13 ce:review
   (agent-native-reviewer P2). Coord triage pending.
+- **2026-04-29 — corrected via codex round 8 on triage PR** —
+  Acceptance Criteria still said "Option B: completionSignalPath
+  AND heartbeatPath use path.posix.join" even after Option B was
+  rewritten to scope heartbeat OUT (no derivation site). Codex
+  correctly noted following the criterion would re-introduce the
+  stale heartbeat-derivation guidance. Updated criterion to
+  scope Option B's `path.posix.join` switch to
+  `completionSignalPath` only and to clarify caller-supplied
+  heartbeat paths.
 - **2026-04-29 — corrected via codex round 6 on triage PR** —
   two real defects in the original triage:
   (i) Problem Statement excerpt used `${o.role}-complete.md` for

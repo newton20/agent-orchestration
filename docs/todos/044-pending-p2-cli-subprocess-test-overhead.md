@@ -169,9 +169,12 @@ is the load-bearing question.
 - [ ] If A: at least 1 subprocess test retained as a smoke
   check that the binary actually invokes.
 - [ ] If A: total suite runtime drops by ≥ 400ms (target ~600ms).
-- [ ] If B: 2-3 subprocess tests replaced with direct JS API
-  calls; remaining subprocess tests cover CLI-specific behavior
-  (argv parsing, stderr format, exit codes).
+- [ ] If B: allowlist + dispatch-key-drop tests are migrated to
+  in-process `main(['node','generate-prompt.js','--context',
+  ...])` calls (NOT direct `generatePrompt({})` calls — the
+  allowlist drop lives in `main()`, not in the JS API).
+  Subprocess tests retained for OS-boundary checks (shebang,
+  exit-code envelope, stderr-format-on-fatal-arg).
 - [ ] All 158+ tests still green.
 
 ## Work Log
@@ -201,6 +204,14 @@ is the load-bearing question.
   `--out` disk-write test even though the same todo states the
   actual flag is `--output`. Replaced with `--output` to keep
   the implementation guidance internally consistent.
+- **2026-04-29 — corrected via codex round 8 on triage PR** —
+  Option B's Acceptance Criteria still said "replace 2-3
+  subprocess tests with direct JS API calls" even after Option
+  B was rewritten to require in-process main() calls. Codex
+  correctly noted following the criterion would re-create the
+  allowlist coverage gap Option B was rewritten to avoid.
+  Updated criterion to require `main(...)` calls with `--context`
+  argv for allowlist tests.
 
 ## Resources
 
