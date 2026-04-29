@@ -15,8 +15,31 @@ via `readTemplate` for the two-pass render (line 750), and once
 inside `checkTransitiveDrift` (line 307/318) which loads the
 playbook to validate the role template's frontmatter against it.
 At ~394µs per read on Windows, this adds ~400µs to every QA
-render. Non-QA renders are unaffected — `checkTransitiveDrift`
-short-circuits via `body.includes('{{qa_playbook_block}}')`.
+render.
+
+The full read scope (codex round 3 caught the original triage
+understating it):
+- **`role: 'qa'`** — both reads fire (full ~790µs redundancy).
+- **`role: 'recovery'` with `recoveryRole: 'qa'`** — same: both
+  reads fire.
+- **`role: 'recovery'` with `recoveryRole: 'impl'` or `'coord'`**
+  — `recovery-prompt.md` itself contains `{{qa_playbook_block}}`
+  (declared optional in its frontmatter so empty values render as
+  the empty string). `checkTransitiveDrift(roleSrc=recovery-prompt.md, ...)`
+  therefore does NOT short-circuit and still reads the playbook
+  once (~394µs). The two-pass render is skipped (no need to
+  inline a playbook the recovery prose handles as empty), so this
+  path is single-read, not double-read.
+- **Pure `role: 'impl'` / `role: 'coord'`** — neither
+  template body contains `{{qa_playbook_block}}`, so
+  `checkTransitiveDrift` short-circuits via
+  `body.includes('{{qa_playbook_block}}')` and zero playbook
+  reads happen.
+
+So the affected paths are: QA + qa-recovery (double-read) AND
+impl-recovery + coord-recovery (single-read). Non-recovery non-QA
+dispatches are unaffected. The optimization in Option A should
+account for all three QA-touching paths, not "QA only."
 
 ## Problem Statement
 
@@ -145,6 +168,17 @@ this with todo 042 (both center on playbook-load plumbing).
 
 - **2026-04-29 — todo created** — Surfaced by PR #13 ce:review
   (performance-oracle P2). Coord triage pending.
+- **2026-04-29 — corrected via codex round 3 on triage PR** —
+  original Problem Statement claimed non-QA renders were
+  unaffected by the redundant playbook read. Codex correctly
+  noted that `recovery-prompt.md` contains `{{qa_playbook_block}}`
+  for ALL recoveryRoles (declared optional so empty renders as
+  empty), so impl-recovery and coord-recovery still trigger one
+  playbook read in `checkTransitiveDrift`. Rewrote the affected
+  paragraph to enumerate all four dispatch combinations (QA
+  double-read; qa-recovery double-read; impl/coord-recovery
+  single-read; pure impl/coord zero-read) so Option A's
+  optimization scope captures the full surface.
 
 ## Resources
 

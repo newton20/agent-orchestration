@@ -77,9 +77,16 @@ Create a new solution doc with sections:
   'string'` without checking for `''` treat empty-string defaults
   as explicit overrides, skipping derive-from-other-input
   fallbacks.
-- **Why it happens:** Default param values share mutation across
-  call sites; empty-string is a common zero-state sentinel; the
-  type check is a one-liner that looks complete.
+- **Why it happens:** Empty-string `''` is a common zero-state
+  sentinel for "I don't have an override" in shared-defaults
+  patterns (a `makeBaseOpts` helper that initializes content
+  blocks as `''`, a config object that defaults blocks to empty
+  strings, etc.). A `typeof x === 'string'` check looks complete
+  for "is this an override?" but misses that the empty string
+  passes the typeof gate while semantically meaning the opposite
+  (caller doesn't have an override; please derive). The
+  one-liner reads as defensive but is actually permissive of the
+  sentinel value.
 - **Three concrete examples from PR #13:**
   - `previousPhaseBriefing` (round 10) — the canonical case.
   - `qaPlaybookBlock` (round 6) — architecturally related; bonus
@@ -153,6 +160,16 @@ cleanup PR.
   `docs/solutions/` (sibling to `docs/todos/`). Following the
   original path would create a parallel wrong tree. Corrected to
   `docs/solutions/logic-errors/...`.
+- **2026-04-29 — corrected via codex round 3 on triage PR** —
+  "Why it happens" bullet originally invoked Python-style
+  shared-default-mutation as the root cause. Codex correctly
+  noted that JavaScript default-parameter expressions are
+  evaluated per-call, so they don't share state across call
+  sites. The actual root cause is `''` being a common
+  zero-state sentinel paired with an incomplete `typeof x ===
+  'string'` guard that admits the sentinel as a legitimate
+  override. Rewrote the bullet to document the actual JS
+  failure mode.
 
 ## Resources
 
