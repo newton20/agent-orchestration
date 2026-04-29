@@ -28,10 +28,16 @@ forward slash:
 ```
 
 `agent-orchestrator/scripts/generate-prompt.js:729-730` builds the
-completion-signal path with `path.join`:
+completion-signal path with `path.join`, using `effectiveRole`
+(which is `recoveryRole` for recovery dispatches and `o.role`
+otherwise — codex round 6 caught the original triage's incorrect
+use of `${o.role}` here, which would route recovery dispatches to
+`recovery-complete.md` instead of the underlying
+`impl-/qa-/coord-complete.md`):
 
 ```js
-const completionSignalPath = path.join(o.phaseDir, `${o.role}-complete.md`);
+const completionSignalPath =
+  o.completionSignalPath || path.join(o.phaseDir, `${effectiveRole}-complete.md`);
 ```
 
 `path.join` on Windows returns `\\`-separated paths. The rendered
@@ -89,18 +95,28 @@ see `/`-only paths regardless of OS.
 
 ### Option B — Use `path.posix.join` for derivation
 
-Switch `path.join` to `path.posix.join` for
-`completionSignalPath` and `heartbeatPath` derivation. Forces
-forward-slash output regardless of OS for those specific paths.
+Switch `path.join` to `path.posix.join` for the
+`completionSignalPath` derivation. Note that `heartbeatPath` is
+NOT derived in `generate-prompt.js` — it is a passthrough opt
+(empty string when heartbeats are disabled), so this option
+applies only to the one derivation site. Codex round 6 caught
+the original triage's heartbeat-derivation framing.
+
 `o.phaseDir` itself still arrives via the caller and may already
-contain backslashes — so Option B alone may not fully fix the mix.
+contain backslashes — so Option B alone may not fully fix the
+mix.
 
 - **Pros:** Localized change at the derivation site. Explicit
   signal that "these strings are agent-facing path strings, not
   fs-input."
 - **Cons:** Doesn't normalize `phaseDir` itself if the caller
-  passed it with backslashes. Need to combine with a normalize
-  on `o.phaseDir`. Two-step.
+  passed it with backslashes. Doesn't touch `heartbeatPath` (no
+  derivation site exists). If a caller-supplied
+  `heartbeatPath` contains backslashes, it will still render
+  with backslashes; either Unit 11 normalizes before passing,
+  or Option A's `buildContext`-level normalization is needed
+  for cross-cutting consistency. Two-step at minimum; doesn't
+  eliminate the mix as cleanly as Option A.
 - **Effort:** Small.
 - **Risk:** Low.
 
@@ -158,6 +174,26 @@ the contract (Option A) or implementation detail (Option C).
 
 - **2026-04-29 — todo created** — Surfaced by PR #13 ce:review
   (agent-native-reviewer P2). Coord triage pending.
+- **2026-04-29 — corrected via codex round 6 on triage PR** —
+  two real defects in the original triage:
+  (i) Problem Statement excerpt used `${o.role}-complete.md` for
+      the completion-signal derivation. Codex correctly noted the
+      production code uses `${effectiveRole}-complete.md` —
+      where `effectiveRole = recoveryRole` for recovery
+      dispatches. Following the original snippet would route
+      recovery dispatches to `recovery-complete.md` instead of
+      the underlying `impl-/qa-/coord-complete.md`, breaking the
+      V1 recovery protocol. Updated the example to match real
+      code.
+  (ii) Option B claimed both `completionSignalPath` AND
+      `heartbeatPath` are derived sites. Codex correctly noted
+      `heartbeatPath` is a passthrough opt (no derivation in
+      generate-prompt.js); rendering as empty when heartbeats
+      are disabled. Following the original would tempt
+      implementers to add a default heartbeat file, changing
+      current behavior. Scoped Option B to `completionSignalPath`
+      only and added a Cons note about callers that pass
+      backslash-containing heartbeat paths.
 
 ## Resources
 
