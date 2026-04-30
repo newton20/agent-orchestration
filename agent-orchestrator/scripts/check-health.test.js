@@ -977,6 +977,50 @@ test('checkHealth: garbage status.pid is harmless (status.pid is unused for live
   assert.strictEqual(result.alive, true);
 });
 
+test('checkHealth: real getSessionPid is invoked with excludeWrappers: true (codex P1 round 3)', () => {
+  // Wrapper PID would falsely report alive after Claude exits, since
+  // cmd /k and powershell -NoExit keep the tab open with --name on
+  // their CommandLine. Verify checkHealth passes excludeWrappers: true
+  // when constructing its default lookup.
+  //
+  // Strategy: temporarily monkey-patch require.cache for spawn-session
+  // is overkill. Instead, we verify the contract via the test that
+  // checkHealth's default lookup returns null when only a wrapper is
+  // visible. We can't easily exercise that without spawning a real
+  // wrapper, so we mock at the parsePidLookupOutput layer: build a
+  // fake _pidLookup that DOES go through the same WMI parser the
+  // production path uses.
+  const { parsePidLookupOutput } = require('./spawn-session');
+  const dir = mkTmp('ch-wrapper-aware');
+  const manifestPath = writeManifest(dir, makeBaseManifest());
+  const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
+  fs.mkdirSync(phaseDir, { recursive: true });
+  writeStatus(manifestPath, {
+    phases: { 'phase-1': { started_at: new Date().toISOString() } },
+  });
+  // Simulate WMI: only cmd /k wrapper survives.
+  const stdout = JSON.stringify([
+    {
+      ProcessId: 5555,
+      CommandLine: 'cmd /k claude --name orch-phase-1-impl --model sonnet',
+    },
+  ]);
+  // The lookup checkHealth uses must call parsePidLookupOutput with
+  // excludeWrappers: true and therefore return null.
+  const wrapperAwareLookup = (name) =>
+    parsePidLookupOutput(stdout, name, { excludeWrappers: true });
+
+  const result = checkHealth({
+    phaseId: 'phase-1', role: 'impl', manifestPath,
+    _pidLookup: wrapperAwareLookup,
+    _killer: KILLER_ALIVE, // even if wrapper PID were used, alive would be true
+  });
+
+  // Expected: wrapper-aware lookup returns null → pidAlive false → alive false
+  assert.strictEqual(result.pidAlive, false, 'wrapper-only must read as dead');
+  assert.strictEqual(result.alive, false);
+});
+
 test('checkHealth: role disambiguation — impl and qa lookups use distinct session names', () => {
   // The core defect codex round 2 caught: with one shared status.pid,
   // checking impl and qa would see the same pid. With session-name

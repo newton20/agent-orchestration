@@ -429,8 +429,16 @@ function checkHealth(opts = {}) {
   // name is `orch-<phase>-<role>`, so the lookup naturally scopes by
   // role. Per the dispatch: do NOT reimplement PID lookup — getSessionPid
   // owns the WMI contract.
+  //
+  // `excludeWrappers: true` is critical: cmd /k and powershell -NoExit
+  // intentionally keep the tab open after Claude exits (post-mortem
+  // visibility), and the wrapper's CommandLine still contains `--name`.
+  // Without this flag, getSessionPid's wrapper-fallback would mask a
+  // crashed agent as alive until the phase timeout fires (codex round 3
+  // [P1]).
   const expectedSessionName = sessionName || defaultSessionName(phaseId, role);
-  const lookup = _pidLookup || ((name) => getSessionPid(name));
+  const lookup =
+    _pidLookup || ((name) => getSessionPid(name, { excludeWrappers: true }));
   let pid = null;
   try {
     const found = lookup(expectedSessionName);
