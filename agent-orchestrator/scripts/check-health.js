@@ -40,8 +40,10 @@
  *     phaseId,            // required, matches VALID_ID_RE
  *     role,               // required, one of impl | qa | coord
  *     manifestPath,       // required, file must exist
- *     workdir,            // optional override; default derived from manifest
- *     phaseDir,           // optional override; default <workdir>/docs/orchestration/phases/<phaseId>
+ *     phaseDir,           // optional override; default <manifestDir>/docs/orchestration/phases/<phaseId>
+ *                         //   (matches scaffold-protocol.js — protocol artifacts always live
+ *                         //    under the manifest's directory, NOT manifest.workdir, per
+ *                         //    docs/manifest-reference.md §workdir)
  *     sessionName,        // optional override; default orch-<phaseId>-<role>
  *     heartbeatStaleMs,   // optional, default 5 * 60_000
  *     // injection seams for tests:
@@ -304,7 +306,6 @@ function checkHealth(opts = {}) {
     phaseId,
     role,
     manifestPath,
-    workdir,
     phaseDir,
     sessionName,
     heartbeatStaleMs = HEARTBEAT_STALE_MS,
@@ -369,32 +370,22 @@ function checkHealth(opts = {}) {
       error: `phase "${phaseId}" not found in ${manifestPath}`,
     };
 
-  // --- Resolve workdir + phase dir.
-  // Workdir precedence:
-  //   1. explicit `workdir` opt (test override / Unit 11 advanced use)
-  //   2. manifest.workdir (relative paths resolved against manifest dir)
-  //   3. manifest dir (last-resort default)
-  // Empty-string manifest.workdir is treated as missing per the
-  // empty-string-as-override guard (PR #13 codex finding).
+  // --- Resolve the phase directory.
+  // Per agent-orchestrator's convention (scaffold-protocol.js line 113-116
+  // and docs/manifest-reference.md §workdir), protocol artifacts always
+  // live under the manifest's directory. `manifest.workdir` is the spawned
+  // tab's starting directory (`wt --startingDirectory`), NOT the protocol
+  // root — `prompt_file` and `completion_signal` paths "always resolve
+  // against the manifest's directory, regardless of workdir." We mirror
+  // that exactly: manifestDir is the protocol root, full stop. The
+  // `phaseDir` opt is the only escape hatch (tests + Unit 11 layouts that
+  // diverge from the convention).
   const manifestAbs = path.resolve(manifestPath);
   const manifestDir = path.dirname(manifestAbs);
-  let resolvedWorkdir;
-  if (typeof workdir === 'string' && workdir.trim() !== '') {
-    resolvedWorkdir = path.resolve(workdir);
-  } else if (
-    typeof loaded.manifest.workdir === 'string' &&
-    loaded.manifest.workdir.trim() !== ''
-  ) {
-    resolvedWorkdir = path.isAbsolute(loaded.manifest.workdir)
-      ? loaded.manifest.workdir
-      : path.resolve(manifestDir, loaded.manifest.workdir);
-  } else {
-    resolvedWorkdir = manifestDir;
-  }
   const resolvedPhaseDir =
     typeof phaseDir === 'string' && phaseDir.trim() !== ''
       ? path.resolve(phaseDir)
-      : defaultPhaseDir(resolvedWorkdir, phaseId);
+      : defaultPhaseDir(manifestDir, phaseId);
 
   // --- Resolve timeout. parse-manifest validates timeout_minutes as a
   // positive int when present, so we never see 0 / negative / string.
