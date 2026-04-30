@@ -289,6 +289,25 @@ function coerceTimestampMs(value) {
   return null;
 }
 
+/**
+ * Coerce a value to a positive integer, mirroring parse-manifest's
+ * `expectPositiveInt` semantics. Returns null when the value cannot
+ * sensibly be a positive int (null/undefined/empty string/non-finite/
+ * non-integer/zero/negative). Strings that parse cleanly to positive
+ * integers ("5", "30") return their numeric form — parse-manifest
+ * accepts those, so the health checker must accept them too.
+ *
+ * Empty string is treated as missing (returns null), NOT zero — the
+ * empty-string-as-explicit-override class of bugs (PR #13 codex finding).
+ */
+function asPositiveInt(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'string' && value.trim() === '') return null;
+  const n = Number(value);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) return null;
+  return n;
+}
+
 // -------------------- Path helpers --------------------
 
 function defaultPhaseDir(workdir, phaseId) {
@@ -389,17 +408,16 @@ function checkHealth(opts = {}) {
       ? path.resolve(phaseDir)
       : defaultPhaseDir(manifestDir, phaseId);
 
-  // --- Resolve timeouts. parse-manifest validates these as positive
-  // ints when present, so we never see 0 / negative / string. Defensive
-  // `> 0` guards remain in case a future writer bypasses validation.
+  // --- Resolve timeouts. parse-manifest's `expectPositiveInt` validates
+  // via Number(v) so values like the YAML-quoted `"5"` pass validation.
+  // We coerce the same way before checking, otherwise an accepted
+  // manifest with quoted-numeric timeout silently fell through to
+  // DEFAULT_TIMEOUT_MINUTES (codex round 4 [P2]).
   const D = loaded.manifest.defaults || {};
-  const timeoutMinutes = (() => {
-    if (Number.isInteger(phaseEntry.timeout_minutes) && phaseEntry.timeout_minutes > 0)
-      return phaseEntry.timeout_minutes;
-    if (Number.isInteger(D.phase_timeout_minutes) && D.phase_timeout_minutes > 0)
-      return D.phase_timeout_minutes;
-    return DEFAULT_TIMEOUT_MINUTES;
-  })();
+  const timeoutMinutes =
+    asPositiveInt(phaseEntry.timeout_minutes) ??
+    asPositiveInt(D.phase_timeout_minutes) ??
+    DEFAULT_TIMEOUT_MINUTES;
   // Heartbeat staleness threshold precedence:
   //   1. opts.heartbeatStaleMs (explicit override — tests + Unit 11 advanced use)
   //   2. defaults.heartbeat_timeout_minutes from manifest (× 60_000)
@@ -409,11 +427,8 @@ function checkHealth(opts = {}) {
   // produces correct `heartbeatStale` results.
   const effectiveStaleMs = (() => {
     if (heartbeatStaleMs !== undefined) return heartbeatStaleMs;
-    if (
-      Number.isInteger(D.heartbeat_timeout_minutes) &&
-      D.heartbeat_timeout_minutes > 0
-    )
-      return D.heartbeat_timeout_minutes * 60_000;
+    const def = asPositiveInt(D.heartbeat_timeout_minutes);
+    if (def !== null) return def * 60_000;
     return HEARTBEAT_STALE_MS;
   })();
 
@@ -440,17 +455,31 @@ function checkHealth(opts = {}) {
   const lookup =
     _pidLookup || ((name) => getSessionPid(name, { excludeWrappers: true }));
   let pid = null;
+  let pidLookupFailed = false;
   try {
     const found = lookup(expectedSessionName);
     pid = Number.isInteger(found) && found > 0 ? found : null;
   } catch (_) {
+    // Distinct from "lookup returned null": the lookup itself errored
+    // (transient WMI failure, blocked PowerShell, network share
+    // hiccup). Per the public contract, that is "couldn't decide" —
+    // pidAlive: null — not a confirmed missing process. Otherwise the
+    // orchestrator would enter recovery on a transient hiccup.
+    pidLookupFailed = true;
     pid = null;
   }
 
   // --- PID liveness. `null` distinguishes "lookup couldn't decide" from
-  // "definitely dead" so Unit 11 can render the cases differently.
+  // "definitely dead" so Unit 11 can render the cases differently:
+  //   - lookup threw → pidAlive: null (don't trigger recovery)
+  //   - lookup returned null → pidAlive: false (no PID found = crash)
+  //   - lookup returned PID, kill ESRCH → pidAlive: false (PID gone)
+  //   - lookup returned PID, kill ok/EPERM → pidAlive: true
+  //   - lookup returned PID, kill unknown error → pidAlive: null
   let pidAlive;
-  if (pid === null) {
+  if (pidLookupFailed) {
+    pidAlive = null; // codex round 4 [P2]: don't conflate transient lookup failure with crash
+  } else if (pid === null) {
     pidAlive = false; // no PID anywhere — agent never reported / never spawned
   } else {
     pidAlive = isPidAlive(pid, _killer);
@@ -597,6 +626,7 @@ module.exports = {
   findLastCheckpoint,
   readPhaseStatus,
   coerceTimestampMs,
+  asPositiveInt,
   defaultPhaseDir,
   defaultSessionName,
   VALID_ROLES,

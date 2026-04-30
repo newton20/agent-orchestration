@@ -23,6 +23,7 @@ const {
   findLastCheckpoint,
   readPhaseStatus,
   coerceTimestampMs,
+  asPositiveInt,
   defaultPhaseDir,
   defaultSessionName,
   VALID_ROLES,
@@ -337,6 +338,45 @@ test('coerceTimestampMs: garbage string → null', () => {
 test('coerceTimestampMs: non-finite number → null', () => {
   assert.strictEqual(coerceTimestampMs(Infinity), null);
   assert.strictEqual(coerceTimestampMs(NaN), null);
+});
+
+// =========================================================================
+// E2 — asPositiveInt (mirrors parse-manifest's expectPositiveInt semantics)
+// =========================================================================
+
+test('asPositiveInt: integer number → unchanged', () => {
+  assert.strictEqual(asPositiveInt(5), 5);
+  assert.strictEqual(asPositiveInt(60), 60);
+});
+
+test('asPositiveInt: numeric string → coerced (matches parse-manifest)', () => {
+  // parse-manifest validates via Number(v), so "5" passes validation.
+  // checkHealth must coerce identically — codex round 4 [P2].
+  assert.strictEqual(asPositiveInt('5'), 5);
+  assert.strictEqual(asPositiveInt('30'), 30);
+});
+
+test('asPositiveInt: zero, negative, fractional, non-finite → null', () => {
+  assert.strictEqual(asPositiveInt(0), null);
+  assert.strictEqual(asPositiveInt(-1), null);
+  assert.strictEqual(asPositiveInt(1.5), null);
+  assert.strictEqual(asPositiveInt(Infinity), null);
+  assert.strictEqual(asPositiveInt(NaN), null);
+});
+
+test('asPositiveInt: empty string → null (NOT zero — empty-string-as-override guard)', () => {
+  assert.strictEqual(asPositiveInt(''), null);
+  assert.strictEqual(asPositiveInt('   '), null);
+});
+
+test('asPositiveInt: garbage string → null', () => {
+  assert.strictEqual(asPositiveInt('forever'), null);
+  assert.strictEqual(asPositiveInt('5.5'), null);
+});
+
+test('asPositiveInt: null/undefined → null', () => {
+  assert.strictEqual(asPositiveInt(null), null);
+  assert.strictEqual(asPositiveInt(undefined), null);
 });
 
 // =========================================================================
@@ -723,6 +763,73 @@ test('checkHealth: falls back to DEFAULT_TIMEOUT_MINUTES (60) when neither set',
   assert.strictEqual(result.alive, true);
 });
 
+test('checkHealth: quoted-numeric timeout_minutes is honored (codex round 4 [P2])', () => {
+  // parse-manifest's expectPositiveInt validates via Number(v), so a
+  // YAML-quoted "5" passes. checkHealth must coerce identically;
+  // otherwise the quoted form silently falls through to
+  // DEFAULT_TIMEOUT_MINUTES.
+  const dir = mkTmp('ch-quoted-timeout');
+  const manifestPath = writeManifest(dir, {
+    name: 'test',
+    phases: [
+      {
+        id: 'phase-1',
+        completion_signal: 'docs/orchestration/phases/phase-1/impl-complete.md',
+        timeout_minutes: '5', // string form, accepted by parse-manifest
+        agents: [{ role: 'impl' }],
+      },
+    ],
+  });
+  const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
+  fs.mkdirSync(phaseDir, { recursive: true });
+  // Started 10 min ago — past 5-min quoted timeout
+  const startedAt = new Date(Date.now() - 10 * 60_000).toISOString();
+  writeStatus(manifestPath, {
+    phases: { 'phase-1': { started_at: startedAt } },
+  });
+
+  const result = checkHealth({
+    phaseId: 'phase-1', role: 'impl', manifestPath,
+    _pidLookup: () => 9999, _killer: KILLER_ALIVE,
+  });
+
+  assert.strictEqual(result.timedOut, true, 'quoted "5" must coerce to 5min timeout');
+});
+
+test('checkHealth: quoted-numeric defaults.heartbeat_timeout_minutes is honored', () => {
+  const dir = mkTmp('ch-quoted-hb');
+  const manifestPath = writeManifest(dir, {
+    name: 'test',
+    defaults: { heartbeat_timeout_minutes: '1' }, // string form
+    phases: [
+      {
+        id: 'phase-1',
+        completion_signal: 'docs/orchestration/phases/phase-1/impl-complete.md',
+        timeout_minutes: 30,
+        agents: [{ role: 'impl' }],
+      },
+    ],
+  });
+  const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
+  fs.mkdirSync(phaseDir, { recursive: true });
+  // Heartbeat 90s old — stale under 60s threshold
+  const hbTime = new Date(Date.now() - 90_000).toISOString();
+  fs.writeFileSync(
+    path.join(phaseDir, 'heartbeat.jsonl'),
+    JSON.stringify({ ts: hbTime, pid: 9999 }) + '\n'
+  );
+  writeStatus(manifestPath, {
+    phases: { 'phase-1': { started_at: new Date().toISOString() } },
+  });
+
+  const result = checkHealth({
+    phaseId: 'phase-1', role: 'impl', manifestPath,
+    _pidLookup: () => 9999, _killer: KILLER_ALIVE,
+  });
+
+  assert.strictEqual(result.heartbeatStale, true, 'quoted "1" must coerce to 60s heartbeat threshold');
+});
+
 test('checkHealth: timeout per-phase override beats defaults', () => {
   const dir = mkTmp('ch-timeout-override');
   const manifestPath = writeManifest(dir, {
@@ -894,7 +1001,12 @@ test('checkHealth: PID lookup returns null → pidAlive false', () => {
   assert.strictEqual(result.alive, false);
 });
 
-test('checkHealth: PID lookup throws → pidAlive false (no exception escapes)', () => {
+test('checkHealth: PID lookup throws → pidAlive null (NOT false — codex round 4 [P2])', () => {
+  // A thrown lookup is "couldn't decide" (transient WMI hiccup,
+  // PowerShell blocked by AV, etc.). Per the public contract, this
+  // must surface as pidAlive: null so Unit 11 doesn't enter recovery
+  // on a transient failure. False would conflate "lookup errored"
+  // with "agent crashed" and force a respawn loop.
   const dir = mkTmp('ch-pid-throws');
   const manifestPath = writeManifest(dir, makeBaseManifest());
   const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
@@ -909,7 +1021,8 @@ test('checkHealth: PID lookup throws → pidAlive false (no exception escapes)',
     _killer: KILLER_ALIVE,
   });
 
-  assert.strictEqual(result.pidAlive, false);
+  assert.strictEqual(result.pidAlive, null, 'lookup throw must NOT be conflated with confirmed crash');
+  assert.strictEqual(result.alive, false, 'alive still requires pidAlive === true');
 });
 
 test('checkHealth: status.pid is IGNORED — always uses getSessionPid (role-scoped via session name)', () => {
