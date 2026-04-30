@@ -25,7 +25,7 @@ what's done and what's pending.
 | 5 | SessionStart hook for prompt injection | **Done (pending Unit 11 integration)** — see [`hooks/`](./hooks/) |
 | 6 | Protocol header + prompt templates | **Done (pending Unit 7 integration)** — see [`templates/`](./templates/) |
 | 7 | Template-based prompt generator | **Done** — see [`scripts/generate-prompt.js`](./scripts/generate-prompt.js) |
-| 8 | Health checker (PID + timeout + heartbeat) | Pending |
+| 8 | Health checker (PID + timeout + heartbeat) | **Done** — see [`scripts/check-health.js`](./scripts/check-health.js) |
 | 11 | Main orchestrator (Node.js process, `/orchestrate` skill) | Pending |
 | 9, 10, 12 | Recovery analyst, email, `--init` | V1.5 (deferred) |
 
