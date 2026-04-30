@@ -527,6 +527,26 @@ test('parsePidLookupOutput: excludeWrappers also rejects powershell wrapper alon
   );
 });
 
+test('getSessionPid: throwOnError: true propagates runner errors (codex P1 round 5)', () => {
+  // Default mode swallows runner errors as null. Unit 8's health checker
+  // needs the failure to propagate so it can render pidAlive: null
+  // (couldn't tell) instead of false (confirmed crash).
+  const failingRunner = () => {
+    const e = new Error('powershell exited 1');
+    throw e;
+  };
+  // Default behavior: error swallowed, returns null.
+  assert.strictEqual(
+    getSessionPid('orch-a', { _runner: failingRunner }),
+    null
+  );
+  // throwOnError: error propagates.
+  assert.throws(
+    () => getSessionPid('orch-a', { _runner: failingRunner, throwOnError: true }),
+    /powershell exited 1/
+  );
+});
+
 test('parsePidLookupOutput: returns first non-wrapper PID when multiple children (agency wrapper + claude)', () => {
   // The agency wrapper's process and the claude child process both carry
   // --name on their CommandLine. Both count as non-shell-wrappers; the

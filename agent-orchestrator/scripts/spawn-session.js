@@ -601,11 +601,23 @@ function parsePidLookupOutput(stdout, name, { excludeWrappers = false } = {}) {
  *     for spawn-session's post-spawn lookup, which legitimately needs
  *     the wrapper PID before the inner claude child registers).
  *
+ *   throwOnError — when true, propagate runner errors (PowerShell
+ *     spawn failure, AV-blocked execution, missing PowerShell on PATH)
+ *     to the caller instead of swallowing them as `null`. Used by
+ *     Unit 8's health checker so the orchestrator can distinguish
+ *     "no matching process" (confirmed crash → recovery) from "lookup
+ *     itself errored" (transient → don't recover). Default false
+ *     preserves the spawn-session post-spawn-lookup contract: a
+ *     transient error during spawn shouldn't tear down the spawn.
+ *
  * Caveat: if multiple sessions share the same name, the first-returned
  * PID is used. Our session naming scheme (`orch-<phase>-<role>`)
  * guarantees uniqueness per-phase-per-role.
  */
-function getSessionPid(name, { _runner, excludeWrappers = false } = {}) {
+function getSessionPid(
+  name,
+  { _runner, excludeWrappers = false, throwOnError = false } = {}
+) {
   if (!name || typeof name !== 'string') return null;
   // _runner is invoked with (program, argv) so tests can verify both.
   // Default uses execFileSync — which does NOT go through cmd.exe, so
@@ -620,7 +632,8 @@ function getSessionPid(name, { _runner, excludeWrappers = false } = {}) {
   let out;
   try {
     out = runner('powershell', buildPidLookupArgs());
-  } catch (_) {
+  } catch (e) {
+    if (throwOnError) throw e;
     return null;
   }
   return parsePidLookupOutput(out, name, { excludeWrappers });

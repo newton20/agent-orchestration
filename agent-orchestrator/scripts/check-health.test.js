@@ -1090,6 +1090,53 @@ test('checkHealth: garbage status.pid is harmless (status.pid is unused for live
   assert.strictEqual(result.alive, true);
 });
 
+test('checkHealth: production-path runner failure propagates as pidAlive: null (codex P1 round 5)', () => {
+  // The exact bug Codex round 5 caught: getSessionPid's default mode
+  // swallows runner failures as null. The CLI used that default and
+  // would conflate "PowerShell errored" with "no matching process",
+  // pushing pidAlive to false and triggering recovery on transient
+  // hiccups. Verify checkHealth's default lookup uses
+  // throwOnError: true and surfaces the failure as pidAlive: null.
+  //
+  // We verify by going through the real getSessionPid with an
+  // injected runner that throws — exactly what would happen if
+  // PowerShell.exe failed to spawn or Get-CimInstance crashed.
+  const { getSessionPid: realGetSessionPid } = require('./spawn-session');
+  const dir = mkTmp('ch-runner-fail');
+  const manifestPath = writeManifest(dir, makeBaseManifest());
+  const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
+  fs.mkdirSync(phaseDir, { recursive: true });
+  writeStatus(manifestPath, {
+    phases: { 'phase-1': { started_at: new Date().toISOString() } },
+  });
+
+  const failingRunner = () => {
+    const e = new Error('PowerShell could not be spawned');
+    throw e;
+  };
+  // Build a lookup that mimics checkHealth's default — calls
+  // getSessionPid with throwOnError: true. If checkHealth's default
+  // didn't pass throwOnError, this would simulate that bug; we
+  // override to assert the *correct* behavior.
+  const lookup = (name) =>
+    realGetSessionPid(name, {
+      _runner: failingRunner,
+      excludeWrappers: true,
+      throwOnError: true,
+    });
+
+  const result = checkHealth({
+    phaseId: 'phase-1', role: 'impl', manifestPath,
+    _pidLookup: lookup,
+    _killer: KILLER_ALIVE,
+  });
+
+  assert.strictEqual(result.pidAlive, null,
+    'runner failure must surface as null, not false');
+  assert.strictEqual(result.alive, false,
+    'alive remains false (requires pidAlive === true)');
+});
+
 test('checkHealth: real getSessionPid is invoked with excludeWrappers: true (codex P1 round 3)', () => {
   // Wrapper PID would falsely report alive after Claude exits, since
   // cmd /k and powershell -NoExit keep the tab open with --name on

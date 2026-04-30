@@ -451,9 +451,18 @@ function checkHealth(opts = {}) {
   // Without this flag, getSessionPid's wrapper-fallback would mask a
   // crashed agent as alive until the phase timeout fires (codex round 3
   // [P1]).
+  // `throwOnError: true` is critical: getSessionPid otherwise swallows
+  // PowerShell/Get-CimInstance failures into `null`, making the
+  // production CLI conflate transient WMI hiccups with a confirmed
+  // missing process — Unit 11 would enter recovery on a one-off
+  // PowerShell crash. With throwOnError, the runner failure propagates,
+  // the surrounding try/catch sets pidLookupFailed, and pidAlive
+  // resolves to null ("couldn't tell"). Codex round 5 [P1].
   const expectedSessionName = sessionName || defaultSessionName(phaseId, role);
   const lookup =
-    _pidLookup || ((name) => getSessionPid(name, { excludeWrappers: true }));
+    _pidLookup ||
+    ((name) =>
+      getSessionPid(name, { excludeWrappers: true, throwOnError: true }));
   let pid = null;
   let pidLookupFailed = false;
   try {
