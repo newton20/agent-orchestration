@@ -402,7 +402,7 @@ test('checkHealth: alive (PID alive, within timeout, no heartbeat)', () => {
 
   const result = checkHealth({
     phaseId: 'phase-1', role: 'impl', manifestPath,
-    _killer: KILLER_ALIVE,
+    _pidLookup: () => 9999, _killer: KILLER_ALIVE,
   });
 
   assert.strictEqual(result.alive, true);
@@ -432,7 +432,7 @@ test('checkHealth: alive with fresh heartbeat', () => {
 
   const result = checkHealth({
     phaseId: 'phase-1', role: 'impl', manifestPath,
-    _killer: KILLER_ALIVE,
+    _pidLookup: () => 9999, _killer: KILLER_ALIVE,
   });
 
   assert.strictEqual(result.alive, true);
@@ -460,7 +460,7 @@ test('checkHealth: crashed (PID gone + stale heartbeat) — lastCheckpoint popul
 
   const result = checkHealth({
     phaseId: 'phase-1', role: 'qa', manifestPath,
-    _killer: KILLER_DEAD,
+    _pidLookup: () => 9999, _killer: KILLER_DEAD,
   });
 
   assert.strictEqual(result.alive, false);
@@ -487,7 +487,7 @@ test('checkHealth: long-running (PID alive + stale heartbeat + within timeout) �
 
   const result = checkHealth({
     phaseId: 'phase-1', role: 'impl', manifestPath,
-    _killer: KILLER_ALIVE,
+    _pidLookup: () => 9999, _killer: KILLER_ALIVE,
   });
 
   // Stale heartbeat alone does NOT flip alive — it's advisory.
@@ -523,7 +523,7 @@ test('checkHealth: timed out (PID alive + within heartbeat threshold + past time
 
   const result = checkHealth({
     phaseId: 'phase-1', role: 'impl', manifestPath,
-    _killer: KILLER_ALIVE,
+    _pidLookup: () => 9999, _killer: KILLER_ALIVE,
   });
 
   assert.strictEqual(result.timedOut, true);
@@ -546,7 +546,7 @@ test('checkHealth: no heartbeat file + PID alive → alive, heartbeatAge null', 
 
   const result = checkHealth({
     phaseId: 'phase-1', role: 'impl', manifestPath,
-    _killer: KILLER_ALIVE,
+    _pidLookup: () => 9999, _killer: KILLER_ALIVE,
   });
 
   assert.strictEqual(result.alive, true);
@@ -565,7 +565,7 @@ test('checkHealth: no heartbeat file + PID gone → dead', () => {
 
   const result = checkHealth({
     phaseId: 'phase-1', role: 'impl', manifestPath,
-    _killer: KILLER_DEAD,
+    _pidLookup: () => 9999, _killer: KILLER_DEAD,
   });
 
   assert.strictEqual(result.alive, false);
@@ -585,7 +585,7 @@ test('checkHealth: empty heartbeat file → no usable heartbeat', () => {
 
   const result = checkHealth({
     phaseId: 'phase-1', role: 'impl', manifestPath,
-    _killer: KILLER_ALIVE,
+    _pidLookup: () => 9999, _killer: KILLER_ALIVE,
   });
 
   assert.strictEqual(result.heartbeatAge, null);
@@ -607,7 +607,7 @@ test('checkHealth: malformed JSON last line → no heartbeat (does not throw)', 
 
   const result = checkHealth({
     phaseId: 'phase-1', role: 'impl', manifestPath,
-    _killer: KILLER_ALIVE,
+    _pidLookup: () => 9999, _killer: KILLER_ALIVE,
   });
 
   assert.strictEqual(result.heartbeatAge, null);
@@ -629,7 +629,7 @@ test('checkHealth: future heartbeat ts (clock skew) → age clamped to 0', () =>
 
   const result = checkHealth({
     phaseId: 'phase-1', role: 'impl', manifestPath,
-    _killer: KILLER_ALIVE,
+    _pidLookup: () => 9999, _killer: KILLER_ALIVE,
   });
 
   assert.strictEqual(result.heartbeatAge, 0); // clamped
@@ -652,13 +652,13 @@ test('checkHealth: heartbeatStaleMs override changes the stale threshold', () =>
 
   const r1 = checkHealth({
     phaseId: 'phase-1', role: 'impl', manifestPath,
-    heartbeatStaleMs: 60_000, _killer: KILLER_ALIVE,
+    heartbeatStaleMs: 60_000, _pidLookup: () => 9999, _killer: KILLER_ALIVE,
   });
   assert.strictEqual(r1.heartbeatStale, false);
 
   const r2 = checkHealth({
     phaseId: 'phase-1', role: 'impl', manifestPath,
-    heartbeatStaleMs: 10_000, _killer: KILLER_ALIVE,
+    heartbeatStaleMs: 10_000, _pidLookup: () => 9999, _killer: KILLER_ALIVE,
   });
   assert.strictEqual(r2.heartbeatStale, true);
 });
@@ -689,7 +689,7 @@ test('checkHealth: timeout uses defaults.phase_timeout_minutes when phase has no
 
   const result = checkHealth({
     phaseId: 'phase-1', role: 'impl', manifestPath,
-    _killer: KILLER_ALIVE,
+    _pidLookup: () => 9999, _killer: KILLER_ALIVE,
   });
 
   assert.strictEqual(result.timedOut, true);
@@ -716,7 +716,7 @@ test('checkHealth: falls back to DEFAULT_TIMEOUT_MINUTES (60) when neither set',
 
   const result = checkHealth({
     phaseId: 'phase-1', role: 'impl', manifestPath,
-    _killer: KILLER_ALIVE,
+    _pidLookup: () => 9999, _killer: KILLER_ALIVE,
   });
 
   assert.strictEqual(result.timedOut, false);
@@ -747,7 +747,7 @@ test('checkHealth: timeout per-phase override beats defaults', () => {
 
   const result = checkHealth({
     phaseId: 'phase-1', role: 'impl', manifestPath,
-    _killer: KILLER_ALIVE,
+    _pidLookup: () => 9999, _killer: KILLER_ALIVE,
   });
 
   assert.strictEqual(result.timedOut, true);
@@ -762,7 +762,7 @@ test('checkHealth: timedOut false when started_at missing', () => {
 
   const result = checkHealth({
     phaseId: 'phase-1', role: 'impl', manifestPath,
-    _killer: KILLER_ALIVE,
+    _pidLookup: () => 9999, _killer: KILLER_ALIVE,
   });
 
   assert.strictEqual(result.timedOut, false);
@@ -784,7 +784,7 @@ test('checkHealth: started_at as YAML Date object (DEFAULT_SCHEMA) is handled', 
 
   const result = checkHealth({
     phaseId: 'phase-1', role: 'impl', manifestPath,
-    _killer: KILLER_ALIVE,
+    _pidLookup: () => 9999, _killer: KILLER_ALIVE,
   });
 
   assert.strictEqual(result.timedOut, true);
@@ -802,7 +802,7 @@ test('checkHealth: started_at fallback to spawned_at (camelCase drift)', () => {
 
   const result = checkHealth({
     phaseId: 'phase-1', role: 'impl', manifestPath,
-    _killer: KILLER_ALIVE,
+    _pidLookup: () => 9999, _killer: KILLER_ALIVE,
   });
 
   assert.strictEqual(result.timedOut, true);
@@ -821,7 +821,7 @@ test('checkHealth: empty-string started_at treated as missing (NOT zero-epoch)',
 
   const result = checkHealth({
     phaseId: 'phase-1', role: 'impl', manifestPath,
-    _killer: KILLER_ALIVE,
+    _pidLookup: () => 9999, _killer: KILLER_ALIVE,
   });
 
   assert.strictEqual(result.timedOut, false);
@@ -840,13 +840,13 @@ test('checkHealth: _now injection allows deterministic deadline testing', () => 
 
   const r1 = checkHealth({
     phaseId: 'phase-1', role: 'impl', manifestPath,
-    _killer: KILLER_ALIVE, _now: () => startedMs + 30 * 60_000 - 1,
+    _pidLookup: () => 9999, _killer: KILLER_ALIVE, _now: () => startedMs + 30 * 60_000 - 1,
   });
   assert.strictEqual(r1.timedOut, false);
 
   const r2 = checkHealth({
     phaseId: 'phase-1', role: 'impl', manifestPath,
-    _killer: KILLER_ALIVE, _now: () => startedMs + 30 * 60_000 + 1,
+    _pidLookup: () => 9999, _killer: KILLER_ALIVE, _now: () => startedMs + 30 * 60_000 + 1,
   });
   assert.strictEqual(r2.timedOut, true);
 });
@@ -912,8 +912,12 @@ test('checkHealth: PID lookup throws → pidAlive false (no exception escapes)',
   assert.strictEqual(result.pidAlive, false);
 });
 
-test('checkHealth: status.pid is preferred over getSessionPid lookup', () => {
-  const dir = mkTmp('ch-prefers-status');
+test('checkHealth: status.pid is IGNORED — always uses getSessionPid (role-scoped via session name)', () => {
+  // Manifest-status only stores ONE pid per phase (Unit 4 shape). For
+  // multi-role phases (impl + qa), the last-written role's pid would
+  // otherwise mask the others. Codex round 2 [P2]. Verify the lookup
+  // path is always taken regardless of what's in status.pid.
+  const dir = mkTmp('ch-ignores-status-pid');
   const manifestPath = writeManifest(dir, makeBaseManifest());
   const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
   fs.mkdirSync(phaseDir, { recursive: true });
@@ -929,8 +933,8 @@ test('checkHealth: status.pid is preferred over getSessionPid lookup', () => {
     _killer: (pid) => { killerSawPid = pid; },
   });
 
-  assert.strictEqual(lookupCalled, false);
-  assert.strictEqual(killerSawPid, 7777);
+  assert.strictEqual(lookupCalled, true, 'lookup must be called (role disambiguation)');
+  assert.strictEqual(killerSawPid, 9999, 'killer sees lookup pid, not status.pid');
 });
 
 test('checkHealth: sessionName override changes the PID-lookup name', () => {
@@ -953,7 +957,9 @@ test('checkHealth: sessionName override changes the PID-lookup name', () => {
   assert.strictEqual(seen, 'custom-session-1');
 });
 
-test('checkHealth: garbage status.pid (string) → falls back to lookup', () => {
+test('checkHealth: garbage status.pid is harmless (status.pid is unused for liveness)', () => {
+  // Even if a corrupt status file has pid: 'not-a-pid', the live PID
+  // comes from getSessionPid, so the bad value can't poison the check.
   const dir = mkTmp('ch-garbage-pid');
   const manifestPath = writeManifest(dir, makeBaseManifest());
   const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
@@ -962,15 +968,46 @@ test('checkHealth: garbage status.pid (string) → falls back to lookup', () => 
     phases: { 'phase-1': { pid: 'not-a-pid', started_at: new Date().toISOString() } },
   });
 
-  let lookupCalled = false;
   const result = checkHealth({
     phaseId: 'phase-1', role: 'impl', manifestPath,
-    _pidLookup: () => { lookupCalled = true; return 9999; },
-    _killer: KILLER_ALIVE,
+    _pidLookup: () => 9999, _killer: KILLER_ALIVE,
   });
 
-  assert.strictEqual(lookupCalled, true);
   assert.strictEqual(result.pidAlive, true);
+  assert.strictEqual(result.alive, true);
+});
+
+test('checkHealth: role disambiguation — impl and qa lookups use distinct session names', () => {
+  // The core defect codex round 2 caught: with one shared status.pid,
+  // checking impl and qa would see the same pid. With session-name
+  // lookup, they're naturally scoped — impl looks up orch-X-impl,
+  // qa looks up orch-X-qa, and the WMI returns role-scoped PIDs.
+  const dir = mkTmp('ch-multi-role');
+  const manifestPath = writeManifest(dir, makeBaseManifest());
+  const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
+  fs.mkdirSync(phaseDir, { recursive: true });
+  writeStatus(manifestPath, {
+    phases: { 'phase-1': { pid: 7777, started_at: new Date().toISOString() } },
+  });
+
+  // Simulate WMI: impl session is dead (returns null), qa session is alive (returns pid)
+  const lookups = {
+    'orch-phase-1-impl': null,
+    'orch-phase-1-qa': 8888,
+  };
+  const lookup = (name) => lookups[name] ?? null;
+
+  const implResult = checkHealth({
+    phaseId: 'phase-1', role: 'impl', manifestPath,
+    _pidLookup: lookup, _killer: KILLER_ALIVE,
+  });
+  const qaResult = checkHealth({
+    phaseId: 'phase-1', role: 'qa', manifestPath,
+    _pidLookup: lookup, _killer: KILLER_ALIVE,
+  });
+
+  assert.strictEqual(implResult.pidAlive, false, 'impl is dead');
+  assert.strictEqual(qaResult.pidAlive, true, 'qa is alive');
 });
 
 test('checkHealth: PID kill returns null code (unknown error) → pidAlive null, alive false', () => {
@@ -984,30 +1021,83 @@ test('checkHealth: PID kill returns null code (unknown error) → pidAlive null,
 
   const result = checkHealth({
     phaseId: 'phase-1', role: 'impl', manifestPath,
-    _killer: KILLER_UNKNOWN,
+    _pidLookup: () => 1234, _killer: KILLER_UNKNOWN,
   });
 
   assert.strictEqual(result.pidAlive, null);
   assert.strictEqual(result.alive, false);
 });
 
-test('checkHealth: zero status.pid → falls back to lookup', () => {
-  const dir = mkTmp('ch-zero-pid');
-  const manifestPath = writeManifest(dir, makeBaseManifest());
+test('checkHealth: defaults.heartbeat_timeout_minutes from manifest is honored', () => {
+  // Codex round 2 [P2]: when a manifest sets a non-default heartbeat
+  // timeout, checkHealth must use it instead of HEARTBEAT_STALE_MS.
+  const dir = mkTmp('ch-manifest-hb-timeout');
+  const manifestPath = writeManifest(dir, {
+    name: 'test',
+    defaults: { heartbeat_timeout_minutes: 1 }, // 60_000ms
+    phases: [
+      {
+        id: 'phase-1',
+        completion_signal: 'docs/orchestration/phases/phase-1/impl-complete.md',
+        timeout_minutes: 30,
+        agents: [{ role: 'impl' }],
+      },
+    ],
+  });
   const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
   fs.mkdirSync(phaseDir, { recursive: true });
+  // Heartbeat 90s old — stale under 60s threshold, fresh under default 5min
+  const hbTime = new Date(Date.now() - 90_000).toISOString();
+  fs.writeFileSync(
+    path.join(phaseDir, 'heartbeat.jsonl'),
+    JSON.stringify({ ts: hbTime, pid: 9999 }) + '\n'
+  );
   writeStatus(manifestPath, {
-    phases: { 'phase-1': { pid: 0, started_at: new Date().toISOString() } },
+    phases: { 'phase-1': { started_at: new Date().toISOString() } },
   });
 
-  let lookupCalled = false;
-  checkHealth({
+  const result = checkHealth({
     phaseId: 'phase-1', role: 'impl', manifestPath,
-    _pidLookup: () => { lookupCalled = true; return 9999; },
-    _killer: KILLER_ALIVE,
+    _pidLookup: () => 9999, _killer: KILLER_ALIVE,
   });
 
-  assert.strictEqual(lookupCalled, true);
+  // 90s > 60s threshold from manifest → stale (would have been false under HEARTBEAT_STALE_MS)
+  assert.strictEqual(result.heartbeatStale, true);
+});
+
+test('checkHealth: opts.heartbeatStaleMs overrides manifest defaults.heartbeat_timeout_minutes', () => {
+  const dir = mkTmp('ch-hb-opts-override');
+  const manifestPath = writeManifest(dir, {
+    name: 'test',
+    defaults: { heartbeat_timeout_minutes: 1 }, // would mark 90s as stale
+    phases: [
+      {
+        id: 'phase-1',
+        completion_signal: 'docs/orchestration/phases/phase-1/impl-complete.md',
+        timeout_minutes: 30,
+        agents: [{ role: 'impl' }],
+      },
+    ],
+  });
+  const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
+  fs.mkdirSync(phaseDir, { recursive: true });
+  const hbTime = new Date(Date.now() - 90_000).toISOString();
+  fs.writeFileSync(
+    path.join(phaseDir, 'heartbeat.jsonl'),
+    JSON.stringify({ ts: hbTime, pid: 9999 }) + '\n'
+  );
+  writeStatus(manifestPath, {
+    phases: { 'phase-1': { started_at: new Date().toISOString() } },
+  });
+
+  // Opts override: 5min — 90s is well within fresh
+  const result = checkHealth({
+    phaseId: 'phase-1', role: 'impl', manifestPath,
+    heartbeatStaleMs: 5 * 60_000,
+    _pidLookup: () => 9999, _killer: KILLER_ALIVE,
+  });
+
+  assert.strictEqual(result.heartbeatStale, false);
 });
 
 // =========================================================================
@@ -1024,7 +1114,7 @@ test('checkHealth: phase directory missing → alive false, error set, lastCheck
 
   const result = checkHealth({
     phaseId: 'phase-1', role: 'impl', manifestPath,
-    _killer: KILLER_ALIVE,
+    _pidLookup: () => 9999, _killer: KILLER_ALIVE,
   });
 
   assert.strictEqual(result.alive, false);
@@ -1075,7 +1165,7 @@ test('checkHealth: phase dir missing keeps PID and timeout fields populated for 
 
   const result = checkHealth({
     phaseId: 'phase-1', role: 'impl', manifestPath,
-    _killer: KILLER_ALIVE,
+    _pidLookup: () => 9999, _killer: KILLER_ALIVE,
   });
 
   assert.strictEqual(result.alive, false);
@@ -1180,7 +1270,7 @@ test('checkHealth: phaseDir override takes precedence over derived workdir path'
 
   const result = checkHealth({
     phaseId: 'phase-1', role: 'impl', manifestPath,
-    phaseDir: customPhaseDir, _killer: KILLER_ALIVE,
+    phaseDir: customPhaseDir, _pidLookup: () => 9999, _killer: KILLER_ALIVE,
   });
 
   assert.strictEqual(result.lastCheckpoint, 'work-product.md');
@@ -1222,7 +1312,7 @@ test('checkHealth: manifest.workdir is NOT used for protocol root (matches scaff
   });
 
   const result = checkHealth({
-    phaseId: 'phase-1', role: 'impl', manifestPath, _killer: KILLER_ALIVE,
+    phaseId: 'phase-1', role: 'impl', manifestPath, _pidLookup: () => 9999, _killer: KILLER_ALIVE,
   });
 
   assert.strictEqual(result.lastCheckpoint, 'real-artifact.md');
@@ -1245,12 +1335,8 @@ test('CLI: --help prints usage and exits 0', () => {
 
 test('CLI: happy-path invocation exits 0 with valid JSON status', () => {
   const dir = mkTmp('cli-happy');
-  // Status uses process.pid (this Node) so the kernel signal-0 probe
-  // returns true without needing a _killer injection — the CLI doesn't
-  // accept one.
   const manifestPath = writeManifest(dir, {
     name: 'test',
-   
     phases: [
       {
         id: 'phase-1',
@@ -1264,9 +1350,15 @@ test('CLI: happy-path invocation exits 0 with valid JSON status', () => {
   fs.mkdirSync(phaseDir, { recursive: true });
   fs.writeFileSync(path.join(phaseDir, 'impl-prompt.md'), 'hi');
   writeStatus(manifestPath, {
-    phases: { 'phase-1': { pid: process.pid, started_at: new Date().toISOString() } },
+    phases: { 'phase-1': { started_at: new Date().toISOString() } },
   });
 
+  // The CLI doesn't accept _pidLookup injection, so it calls real
+  // getSessionPid(orch-phase-1-impl). The session was never spawned →
+  // PID lookup returns null → pidAlive is false → alive is false. We
+  // assert exit 0 + valid JSON shape (the goal: the binary doesn't
+  // crash on a real call). A live-session smoke test belongs in
+  // integration coverage, not unit tests.
   const r = spawnSync(
     process.execPath,
     [CLI_ENTRY, '--phase', 'phase-1', '--role', 'impl', '--manifest', manifestPath],
@@ -1274,7 +1366,11 @@ test('CLI: happy-path invocation exits 0 with valid JSON status', () => {
   );
   assert.strictEqual(r.status, 0, `stdout: ${r.stdout}\nstderr: ${r.stderr}`);
   const parsed = JSON.parse(r.stdout);
-  assert.strictEqual(parsed.alive, true);
-  assert.strictEqual(parsed.pidAlive, true);
+  assert.strictEqual(typeof parsed.alive, 'boolean');
+  assert.ok('pidAlive' in parsed);
+  assert.ok('timedOut' in parsed);
+  assert.ok('heartbeatAge' in parsed);
+  assert.ok('heartbeatStale' in parsed);
+  assert.ok('lastCheckpoint' in parsed);
   assert.strictEqual(parsed.lastCheckpoint, 'impl-prompt.md');
 });

@@ -308,7 +308,9 @@ function checkHealth(opts = {}) {
     manifestPath,
     phaseDir,
     sessionName,
-    heartbeatStaleMs = HEARTBEAT_STALE_MS,
+    // No destructure default for heartbeatStaleMs — `undefined` means
+    // "let manifest defaults take precedence over HEARTBEAT_STALE_MS".
+    heartbeatStaleMs,
     _now,
     _killer,
     _pidLookup,
@@ -387,41 +389,54 @@ function checkHealth(opts = {}) {
       ? path.resolve(phaseDir)
       : defaultPhaseDir(manifestDir, phaseId);
 
-  // --- Resolve timeout. parse-manifest validates timeout_minutes as a
-  // positive int when present, so we never see 0 / negative / string.
-  // Defensive `> 0` guard remains in case a future writer bypasses
-  // validation.
+  // --- Resolve timeouts. parse-manifest validates these as positive
+  // ints when present, so we never see 0 / negative / string. Defensive
+  // `> 0` guards remain in case a future writer bypasses validation.
+  const D = loaded.manifest.defaults || {};
   const timeoutMinutes = (() => {
     if (Number.isInteger(phaseEntry.timeout_minutes) && phaseEntry.timeout_minutes > 0)
       return phaseEntry.timeout_minutes;
-    const D = loaded.manifest.defaults || {};
     if (Number.isInteger(D.phase_timeout_minutes) && D.phase_timeout_minutes > 0)
       return D.phase_timeout_minutes;
     return DEFAULT_TIMEOUT_MINUTES;
   })();
+  // Heartbeat staleness threshold precedence:
+  //   1. opts.heartbeatStaleMs (explicit override — tests + Unit 11 advanced use)
+  //   2. defaults.heartbeat_timeout_minutes from manifest (× 60_000)
+  //   3. HEARTBEAT_STALE_MS (5 minutes — last-resort default)
+  // Production callers (Unit 11) and the CLI rely on the manifest field
+  // so a manifest configured for faster/slower heartbeat warnings
+  // produces correct `heartbeatStale` results.
+  const effectiveStaleMs = (() => {
+    if (heartbeatStaleMs !== undefined) return heartbeatStaleMs;
+    if (
+      Number.isInteger(D.heartbeat_timeout_minutes) &&
+      D.heartbeat_timeout_minutes > 0
+    )
+      return D.heartbeat_timeout_minutes * 60_000;
+    return HEARTBEAT_STALE_MS;
+  })();
 
-  // --- Read manifest-status for PID + started_at. Both fields are
-  // optional; we proceed even if they're missing.
+  // --- Read manifest-status for started_at. The PID field there is
+  // phase-scoped, NOT role-scoped (Unit 4's manifest-status shape only
+  // tracks one PID per phase), so for multi-role phases the last
+  // written role's PID would mask the others. PID resolution goes
+  // through getSessionPid(orch-<phase>-<role>) instead — the session
+  // name carries the role and the WMI lookup is naturally scoped.
   const statusEntry = readPhaseStatus(manifestPath, phaseId, _readFileSync, existsSync);
 
-  // --- PID resolution.
-  // Prefer manifest-status.phases[phaseId].pid (recorded by spawn-session
-  // at spawn time, written by parse-manifest.js's runUpdate). Fall back
-  // to a session-name lookup via getSessionPid so the checker survives
-  // a stale / deleted status file. Per the dispatch: do NOT reimplement
-  // PID lookup — getSessionPid owns the WMI contract.
+  // --- PID resolution. Always call getSessionPid(name) — the session
+  // name is `orch-<phase>-<role>`, so the lookup naturally scopes by
+  // role. Per the dispatch: do NOT reimplement PID lookup — getSessionPid
+  // owns the WMI contract.
   const expectedSessionName = sessionName || defaultSessionName(phaseId, role);
+  const lookup = _pidLookup || ((name) => getSessionPid(name));
   let pid = null;
-  if (statusEntry && Number.isInteger(statusEntry.pid) && statusEntry.pid > 0) {
-    pid = statusEntry.pid;
-  } else {
-    const lookup = _pidLookup || ((name) => getSessionPid(name));
-    try {
-      const found = lookup(expectedSessionName);
-      pid = Number.isInteger(found) && found > 0 ? found : null;
-    } catch (_) {
-      pid = null;
-    }
+  try {
+    const found = lookup(expectedSessionName);
+    pid = Number.isInteger(found) && found > 0 ? found : null;
+  } catch (_) {
+    pid = null;
   }
 
   // --- PID liveness. `null` distinguishes "lookup couldn't decide" from
@@ -467,7 +482,7 @@ function checkHealth(opts = {}) {
       if (parsed && Number.isFinite(parsed.tsMs)) {
         const ageMs = Math.max(0, now - parsed.tsMs);
         heartbeatAge = Math.floor(ageMs / 1000);
-        heartbeatStale = ageMs > heartbeatStaleMs;
+        heartbeatStale = ageMs > effectiveStaleMs;
       }
     }
   }
