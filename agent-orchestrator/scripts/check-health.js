@@ -46,6 +46,8 @@
  *                         //    docs/manifest-reference.md §workdir)
  *     sessionName,        // optional override; default orch-<phaseId>-<role>
  *     heartbeatStaleMs,   // optional, default 5 * 60_000
+ *     startupGraceMs,     // optional, default 60_000 — pidAlive: null instead of false
+ *                         //   when WMI lookup misses but started_at is within this window
  *     // injection seams for tests:
  *     _now, _killer, _pidLookup,
  *     _readFileSync, _existsSync, _statSync, _readdirSync,
@@ -98,6 +100,14 @@ const { getSessionPid } = require('./spawn-session');
 const VALID_ROLES = Object.freeze(['impl', 'qa', 'coord']);
 const DEFAULT_TIMEOUT_MINUTES = 60;
 const HEARTBEAT_STALE_MS = 5 * 60_000;
+// Startup grace window: when the WMI lookup returns no Claude child but
+// the manifest-status `started_at` is within this window, treat the
+// state as `pidAlive: null` ("still starting up") instead of `false`
+// ("crashed"). Prevents Unit 11 from triggering recovery on a session
+// that's still spawning — wt → cmd /k → claude takes a few seconds on
+// cold launches and longer when the binary needs to JIT or auth.
+// Codex round 7 [P2].
+const DEFAULT_STARTUP_GRACE_MS = 60_000;
 
 // Files whose mtime is not informative as a "checkpoint" — either the
 // agent rewrites them continuously (heartbeat.jsonl) or they're
@@ -368,6 +378,7 @@ function checkHealth(opts = {}) {
     // No destructure default for heartbeatStaleMs — `undefined` means
     // "let manifest defaults take precedence over HEARTBEAT_STALE_MS".
     heartbeatStaleMs,
+    startupGraceMs = DEFAULT_STARTUP_GRACE_MS,
     _now,
     _killer,
     _pidLookup,
@@ -394,6 +405,10 @@ function checkHealth(opts = {}) {
   if (heartbeatStaleMs !== undefined && (!Number.isFinite(heartbeatStaleMs) || heartbeatStaleMs < 0))
     throw new Error(
       `checkHealth: heartbeatStaleMs must be a non-negative finite number, got ${JSON.stringify(heartbeatStaleMs)}`
+    );
+  if (!Number.isFinite(startupGraceMs) || startupGraceMs < 0)
+    throw new Error(
+      `checkHealth: startupGraceMs must be a non-negative finite number, got ${JSON.stringify(startupGraceMs)}`
     );
 
   const now = typeof _now === 'function' ? _now() : Date.now();
@@ -519,7 +534,8 @@ function checkHealth(opts = {}) {
   // --- PID liveness. `null` distinguishes "lookup couldn't decide" from
   // "definitely dead" so Unit 11 can render the cases differently:
   //   - lookup threw → pidAlive: null (don't trigger recovery)
-  //   - lookup returned null → pidAlive: false (no PID found = crash)
+  //   - lookup returned null, startup grace active → pidAlive: null (still spawning)
+  //   - lookup returned null, past grace → pidAlive: false (no PID found = crash)
   //   - lookup returned PID, kill ESRCH → pidAlive: false (PID gone)
   //   - lookup returned PID, kill ok/EPERM → pidAlive: true
   //   - lookup returned PID, kill unknown error → pidAlive: null
@@ -527,7 +543,24 @@ function checkHealth(opts = {}) {
   if (pidLookupFailed) {
     pidAlive = null; // codex round 4 [P2]: don't conflate transient lookup failure with crash
   } else if (pid === null) {
-    pidAlive = false; // no PID anywhere — agent never reported / never spawned
+    // Codex round 7 [P2]: during the startup window (between
+    // spawn-session calling wt and the inner Claude child registering
+    // with WMI), excludeWrappers: true would correctly return null,
+    // but the agent isn't dead — it's still booting. Treat as
+    // "couldn't tell" so Unit 11 doesn't tear down a session that's
+    // about to come up. Once started_at is older than the grace
+    // window, null lookup means crash.
+    if (statusEntry) {
+      const startedMs = coerceTimestampMs(statusEntry.started_at)
+        ?? coerceTimestampMs(statusEntry.spawned_at);
+      if (startedMs !== null && now - startedMs < startupGraceMs) {
+        pidAlive = null;
+      } else {
+        pidAlive = false;
+      }
+    } else {
+      pidAlive = false;
+    }
   } else {
     pidAlive = isPidAlive(pid, _killer);
   }
@@ -683,6 +716,7 @@ module.exports = {
   VALID_ROLES,
   DEFAULT_TIMEOUT_MINUTES,
   HEARTBEAT_STALE_MS,
+  DEFAULT_STARTUP_GRACE_MS,
   CHECKPOINT_EXCLUDE_NAMES,
   CHECKPOINT_EXCLUDE_SUFFIXES,
 };

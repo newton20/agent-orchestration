@@ -29,6 +29,7 @@ const {
   VALID_ROLES,
   DEFAULT_TIMEOUT_MINUTES,
   HEARTBEAT_STALE_MS,
+  DEFAULT_STARTUP_GRACE_MS,
   CHECKPOINT_EXCLUDE_NAMES,
   CHECKPOINT_EXCLUDE_SUFFIXES,
 } = require('./check-health');
@@ -96,6 +97,10 @@ test('exports VALID_ROLES = [impl, qa, coord]', () => {
 test('exports DEFAULT_TIMEOUT_MINUTES = 60 and HEARTBEAT_STALE_MS = 5min', () => {
   assert.strictEqual(DEFAULT_TIMEOUT_MINUTES, 60);
   assert.strictEqual(HEARTBEAT_STALE_MS, 5 * 60_000);
+});
+
+test('exports DEFAULT_STARTUP_GRACE_MS = 60_000 (60 seconds)', () => {
+  assert.strictEqual(DEFAULT_STARTUP_GRACE_MS, 60_000);
 });
 
 test('CHECKPOINT_EXCLUDE_NAMES contains heartbeat.jsonl', () => {
@@ -1020,13 +1025,121 @@ test('checkHealth: PID resolved via getSessionPid fallback when status has no pi
   assert.strictEqual(result.alive, true);
 });
 
-test('checkHealth: PID lookup returns null → pidAlive false', () => {
-  const dir = mkTmp('ch-pid-null');
+test('checkHealth: lookup null + within startup grace → pidAlive null (codex P2 round 7)', () => {
+  // Just-spawned session: spawn-session has run wt but the inner
+  // Claude child hasn't registered with WMI yet. excludeWrappers:
+  // true correctly returns null (only the wrapper is visible).
+  // Without grace, we'd report pidAlive: false → Unit 11 triggers
+  // recovery on a still-spawning session. Grace surfaces this as
+  // pidAlive: null instead.
+  const dir = mkTmp('ch-startup-grace');
+  const manifestPath = writeManifest(dir, makeBaseManifest());
+  const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
+  fs.mkdirSync(phaseDir, { recursive: true });
+  // Started 5 seconds ago — well within 60s grace
+  const startedAt = new Date(Date.now() - 5_000).toISOString();
+  writeStatus(manifestPath, {
+    phases: { 'phase-1': { started_at: startedAt } },
+  });
+
+  const result = checkHealth({
+    phaseId: 'phase-1', role: 'impl', manifestPath,
+    _pidLookup: () => null, // Claude child not yet visible
+    _killer: KILLER_ALIVE,
+  });
+
+  assert.strictEqual(result.pidAlive, null, 'startup grace must surface null, not false');
+  assert.strictEqual(result.alive, false); // alive still requires pidAlive === true
+});
+
+test('checkHealth: lookup null + past startup grace → pidAlive false (confirmed crash)', () => {
+  const dir = mkTmp('ch-past-grace');
+  const manifestPath = writeManifest(dir, makeBaseManifest());
+  const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
+  fs.mkdirSync(phaseDir, { recursive: true });
+  // Started 5 minutes ago — well past 60s grace
+  const startedAt = new Date(Date.now() - 5 * 60_000).toISOString();
+  writeStatus(manifestPath, {
+    phases: { 'phase-1': { started_at: startedAt } },
+  });
+
+  const result = checkHealth({
+    phaseId: 'phase-1', role: 'impl', manifestPath,
+    _pidLookup: () => null,
+    _killer: KILLER_ALIVE,
+  });
+
+  assert.strictEqual(result.pidAlive, false, 'past grace, null lookup is a confirmed crash');
+});
+
+test('checkHealth: startupGraceMs override is respected', () => {
+  const dir = mkTmp('ch-grace-override');
+  const manifestPath = writeManifest(dir, makeBaseManifest());
+  const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
+  fs.mkdirSync(phaseDir, { recursive: true });
+  const startedAt = new Date(Date.now() - 30_000).toISOString();
+  writeStatus(manifestPath, {
+    phases: { 'phase-1': { started_at: startedAt } },
+  });
+
+  // Default 60s: 30s ago is within grace → null
+  const r1 = checkHealth({
+    phaseId: 'phase-1', role: 'impl', manifestPath,
+    _pidLookup: () => null, _killer: KILLER_ALIVE,
+  });
+  assert.strictEqual(r1.pidAlive, null);
+
+  // 10s grace: 30s ago is past grace → false
+  const r2 = checkHealth({
+    phaseId: 'phase-1', role: 'impl', manifestPath,
+    _pidLookup: () => null, _killer: KILLER_ALIVE,
+    startupGraceMs: 10_000,
+  });
+  assert.strictEqual(r2.pidAlive, false);
+});
+
+test('checkHealth: lookup null + no started_at → pidAlive false (no grace anchor)', () => {
+  const dir = mkTmp('ch-grace-no-anchor');
   const manifestPath = writeManifest(dir, makeBaseManifest());
   const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
   fs.mkdirSync(phaseDir, { recursive: true });
   writeStatus(manifestPath, {
-    phases: { 'phase-1': { started_at: new Date().toISOString() } },
+    phases: { 'phase-1': { } }, // no started_at
+  });
+
+  const result = checkHealth({
+    phaseId: 'phase-1', role: 'impl', manifestPath,
+    _pidLookup: () => null, _killer: KILLER_ALIVE,
+  });
+
+  assert.strictEqual(result.pidAlive, false);
+});
+
+test('checkHealth: invalid startupGraceMs throws', () => {
+  assert.throws(
+    () => checkHealth({
+      phaseId: 'phase-1', role: 'impl', manifestPath: '/x', startupGraceMs: -1,
+    }),
+    /startupGraceMs/
+  );
+  assert.throws(
+    () => checkHealth({
+      phaseId: 'phase-1', role: 'impl', manifestPath: '/x', startupGraceMs: 'huge',
+    }),
+    /startupGraceMs/
+  );
+});
+
+test('checkHealth: PID lookup returns null + past grace → pidAlive false', () => {
+  const dir = mkTmp('ch-pid-null');
+  const manifestPath = writeManifest(dir, makeBaseManifest());
+  const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
+  fs.mkdirSync(phaseDir, { recursive: true });
+  // Started 5 minutes ago — well past 60s startup grace
+  writeStatus(manifestPath, {
+    phases: {
+      'phase-1': { started_at: new Date(Date.now() - 5 * 60_000).toISOString() },
+    },
   });
 
   const result = checkHealth({
@@ -1192,8 +1305,14 @@ test('checkHealth: real getSessionPid is invoked with excludeWrappers: true (cod
   const manifestPath = writeManifest(dir, makeBaseManifest());
   const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
   fs.mkdirSync(phaseDir, { recursive: true });
+  // Started 5 minutes ago — past 60s startup grace. The wrapper-masks-
+  // crashed-agent scenario is what we're testing; grace would otherwise
+  // surface as null, which is correct in the startup window but not
+  // here.
   writeStatus(manifestPath, {
-    phases: { 'phase-1': { started_at: new Date().toISOString() } },
+    phases: {
+      'phase-1': { started_at: new Date(Date.now() - 5 * 60_000).toISOString() },
+    },
   });
   // Simulate WMI: only cmd /k wrapper survives.
   const stdout = JSON.stringify([
@@ -1268,8 +1387,14 @@ test('checkHealth: role disambiguation — impl and qa lookups use distinct sess
   const manifestPath = writeManifest(dir, makeBaseManifest());
   const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
   fs.mkdirSync(phaseDir, { recursive: true });
+  // Past 60s startup grace so a null lookup reads as crash, not "still spawning".
   writeStatus(manifestPath, {
-    phases: { 'phase-1': { pid: 7777, started_at: new Date().toISOString() } },
+    phases: {
+      'phase-1': {
+        pid: 7777,
+        started_at: new Date(Date.now() - 5 * 60_000).toISOString(),
+      },
+    },
   });
 
   // Simulate WMI: impl session is dead (returns null), qa session is alive (returns pid)
