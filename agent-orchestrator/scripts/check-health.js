@@ -138,43 +138,81 @@ function isPidAlive(pid, _killer) {
 // -------------------- Heartbeat parsing --------------------
 
 /**
- * Parse the last non-empty line of a JSONL heartbeat log. Returns
+ * Parse a JSONL heartbeat log and return the freshest valid record
+ * matching `opts.role` (when supplied), or the file's most recent
+ * record when no role filter is given. Returns
  *   { tsMs, pid }
  * where tsMs is the parsed `ts` field as epoch ms and pid is the
  * agent-reported `pid` (null if the field is absent or malformed).
  *
- * Strict-tail semantics per the Unit 8 dispatch: only the LAST
- * non-empty line is examined. A malformed last line returns null
- * (no heartbeat) — we do not walk back to a previous valid record,
- * because a partial-write tail that's stuck malformed would mask a
- * dead agent from the supervisor indefinitely.
+ * Two operating modes:
+ *
+ * - **No role filter (V1 default):** Strict-tail. Examines only the
+ *   LAST non-empty line. A malformed last line returns null — we do
+ *   not walk back to an earlier valid record, because a partial-
+ *   write tail stuck malformed would otherwise mask a dead agent
+ *   from the supervisor indefinitely. (Dispatch contract.)
+ *
+ * - **Role filter (`{ role: 'impl' | 'qa' | 'coord' }`):** Walks lines
+ *   from end to start, skipping malformed lines and entries for other
+ *   roles, returning the most recent valid record for the requested
+ *   role. Required for multi-role phases where impl and qa share the
+ *   same `heartbeat.jsonl` and would otherwise see each other's
+ *   activity as their own — codex round 6 [P2]. The strict-tail rule
+ *   doesn't translate to multi-role: a fresh `impl` write would
+ *   otherwise mask a dead `qa` regardless of how careful `qa` was.
  *
  * The protocol-header.md format is:
  *   {"ts": "<ISO 8601 UTC>", "pid": <int>, "role": "...", "phase_id": "...", "message": "..."}
  */
-function parseHeartbeatTail(content) {
+function parseHeartbeatTail(content, { role } = {}) {
   if (typeof content !== 'string' || content.length === 0) return null;
   const lines = content.split(/\r?\n/);
-  let lastLine = null;
+
+  if (role === undefined) {
+    // V1 default — strict-tail. Last non-empty line, or null if it's malformed.
+    let lastLine = null;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const trimmed = lines[i].trim();
+      if (trimmed !== '') {
+        lastLine = trimmed;
+        break;
+      }
+    }
+    if (lastLine === null) return null;
+    return parseHeartbeatLine(lastLine);
+  }
+
+  // Role filter — walk back, skipping malformed / wrong-role lines.
   for (let i = lines.length - 1; i >= 0; i--) {
     const trimmed = lines[i].trim();
-    if (trimmed !== '') {
-      lastLine = trimmed;
-      break;
-    }
+    if (trimmed === '') continue;
+    const obj = tryParseJson(trimmed);
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) continue;
+    if (obj.role !== role) continue;
+    const tsMs = coerceTimestampMs(obj.ts);
+    if (tsMs === null) continue;
+    const pid = Number.isInteger(obj.pid) && obj.pid > 0 ? obj.pid : null;
+    return { tsMs, pid };
   }
-  if (lastLine === null) return null;
-  let obj;
-  try {
-    obj = JSON.parse(lastLine);
-  } catch (_) {
-    return null;
-  }
+  return null;
+}
+
+function parseHeartbeatLine(line) {
+  const obj = tryParseJson(line);
   if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null;
   const tsMs = coerceTimestampMs(obj.ts);
   if (tsMs === null) return null;
   const pid = Number.isInteger(obj.pid) && obj.pid > 0 ? obj.pid : null;
   return { tsMs, pid };
+}
+
+function tryParseJson(line) {
+  try {
+    return JSON.parse(line);
+  } catch (_) {
+    return null;
+  }
 }
 
 // -------------------- Last-checkpoint scan --------------------
@@ -524,7 +562,11 @@ function checkHealth(opts = {}) {
       content = null;
     }
     if (typeof content === 'string') {
-      const parsed = parseHeartbeatTail(content);
+      // Filter by role: in multi-role phases the heartbeat file is
+      // shared (impl + qa append to the same file), and each entry
+      // carries its `role`. Without a filter, a fresh impl write
+      // would mask a dead qa. Codex round 6 [P2].
+      const parsed = parseHeartbeatTail(content, { role });
       if (parsed && Number.isFinite(parsed.tsMs)) {
         const ageMs = Math.max(0, now - parsed.tsMs);
         heartbeatAge = Math.floor(ageMs / 1000);

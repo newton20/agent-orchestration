@@ -233,6 +233,43 @@ test('parseHeartbeatTail: CRLF line endings tolerated', () => {
   assert.strictEqual(r.pid, 2);
 });
 
+test('parseHeartbeatTail: role filter returns most recent matching role', () => {
+  // Codex round 6 [P2]: shared heartbeat file across roles. Without
+  // role filter the last impl write would mask a stale qa.
+  const content = [
+    '{"ts":"2026-04-29T05:00:00Z","pid":1,"role":"qa"}',
+    '{"ts":"2026-04-29T05:01:00Z","pid":2,"role":"impl"}',
+    '{"ts":"2026-04-29T05:02:00Z","pid":2,"role":"impl"}',
+  ].join('\n');
+  const qa = parseHeartbeatTail(content, { role: 'qa' });
+  const impl = parseHeartbeatTail(content, { role: 'impl' });
+  assert.strictEqual(qa.tsMs, Date.parse('2026-04-29T05:00:00Z'));
+  assert.strictEqual(impl.tsMs, Date.parse('2026-04-29T05:02:00Z'));
+});
+
+test('parseHeartbeatTail: role filter walks past malformed and wrong-role lines', () => {
+  const content = [
+    '{"ts":"2026-04-29T05:00:00Z","pid":1,"role":"impl"}', // older impl entry
+    '{"ts":"2026-04-29T05:01:00Z","pid":2,"role":"qa"}',
+    '{ malformed',
+    '{"ts":"2026-04-29T05:03:00Z","pid":3,"role":"qa"}',  // newer qa
+  ].join('\n');
+  const r = parseHeartbeatTail(content, { role: 'impl' });
+  assert.strictEqual(r.tsMs, Date.parse('2026-04-29T05:00:00Z'));
+  assert.strictEqual(r.pid, 1);
+});
+
+test('parseHeartbeatTail: role filter — no matching role → null', () => {
+  const content = '{"ts":"2026-04-29T05:00:00Z","pid":1,"role":"impl"}\n';
+  assert.strictEqual(parseHeartbeatTail(content, { role: 'qa' }), null);
+});
+
+test('parseHeartbeatTail: no-role-filter strict-tail unchanged (malformed last line → null)', () => {
+  // Default behavior must remain strict-tail when role isn't supplied.
+  const content = '{"ts":"2026-04-29T05:00:00Z"}\n{garbage';
+  assert.strictEqual(parseHeartbeatTail(content), null);
+});
+
 // =========================================================================
 // D — findLastCheckpoint
 // =========================================================================
@@ -463,7 +500,7 @@ test('checkHealth: alive with fresh heartbeat', () => {
   const hbTime = new Date(Date.now() - 60_000).toISOString();
   fs.writeFileSync(
     path.join(phaseDir, 'heartbeat.jsonl'),
-    JSON.stringify({ ts: hbTime, pid: 9999 }) + '\n'
+    JSON.stringify({ ts: hbTime, pid: 9999, role: 'impl', phase_id: 'phase-1' }) + '\n'
   );
   const startedAt = new Date(Date.now() - 5 * 60_000).toISOString();
   writeStatus(manifestPath, {
@@ -491,7 +528,7 @@ test('checkHealth: crashed (PID gone + stale heartbeat) — lastCheckpoint popul
   const hbTime = new Date(Date.now() - 10 * 60_000).toISOString();
   fs.writeFileSync(
     path.join(phaseDir, 'heartbeat.jsonl'),
-    JSON.stringify({ ts: hbTime, pid: 9999 }) + '\n'
+    JSON.stringify({ ts: hbTime, pid: 9999, role: 'qa', phase_id: 'phase-1' }) + '\n'
   );
   const startedAt = new Date(Date.now() - 12 * 60_000).toISOString();
   writeStatus(manifestPath, {
@@ -518,7 +555,7 @@ test('checkHealth: long-running (PID alive + stale heartbeat + within timeout) �
   const hbTime = new Date(Date.now() - 8 * 60_000).toISOString(); // stale (>5min)
   fs.writeFileSync(
     path.join(phaseDir, 'heartbeat.jsonl'),
-    JSON.stringify({ ts: hbTime, pid: 9999 }) + '\n'
+    JSON.stringify({ ts: hbTime, pid: 9999, role: 'impl', phase_id: 'phase-1' }) + '\n'
   );
   const startedAt = new Date(Date.now() - 10 * 60_000).toISOString(); // <30min timeout
   writeStatus(manifestPath, {
@@ -554,7 +591,7 @@ test('checkHealth: timed out (PID alive + within heartbeat threshold + past time
   fs.writeFileSync(path.join(phaseDir, 'impl-prompt.md'), 'hi');
   fs.writeFileSync(
     path.join(phaseDir, 'heartbeat.jsonl'),
-    JSON.stringify({ ts: new Date().toISOString(), pid: 9999 }) + '\n'
+    JSON.stringify({ ts: new Date().toISOString(), pid: 9999, role: 'impl', phase_id: 'phase-1' }) + '\n'
   );
   const startedAt = new Date(Date.now() - 15 * 60_000).toISOString(); // past 10-min deadline
   writeStatus(manifestPath, {
@@ -661,7 +698,7 @@ test('checkHealth: future heartbeat ts (clock skew) → age clamped to 0', () =>
   const futureTs = new Date(Date.now() + 60_000).toISOString();
   fs.writeFileSync(
     path.join(phaseDir, 'heartbeat.jsonl'),
-    JSON.stringify({ ts: futureTs, pid: 9999 }) + '\n'
+    JSON.stringify({ ts: futureTs, pid: 9999, role: 'impl', phase_id: 'phase-1' }) + '\n'
   );
   writeStatus(manifestPath, {
     phases: { 'phase-1': { pid: 9999, started_at: new Date().toISOString() } },
@@ -684,7 +721,7 @@ test('checkHealth: heartbeatStaleMs override changes the stale threshold', () =>
   const hbTime = new Date(Date.now() - 30_000).toISOString(); // 30s old
   fs.writeFileSync(
     path.join(phaseDir, 'heartbeat.jsonl'),
-    JSON.stringify({ ts: hbTime, pid: 9999 }) + '\n'
+    JSON.stringify({ ts: hbTime, pid: 9999, role: 'impl', phase_id: 'phase-1' }) + '\n'
   );
   writeStatus(manifestPath, {
     phases: { 'phase-1': { pid: 9999, started_at: new Date().toISOString() } },
@@ -816,7 +853,7 @@ test('checkHealth: quoted-numeric defaults.heartbeat_timeout_minutes is honored'
   const hbTime = new Date(Date.now() - 90_000).toISOString();
   fs.writeFileSync(
     path.join(phaseDir, 'heartbeat.jsonl'),
-    JSON.stringify({ ts: hbTime, pid: 9999 }) + '\n'
+    JSON.stringify({ ts: hbTime, pid: 9999, role: 'impl', phase_id: 'phase-1' }) + '\n'
   );
   writeStatus(manifestPath, {
     phases: { 'phase-1': { started_at: new Date().toISOString() } },
@@ -1181,6 +1218,47 @@ test('checkHealth: real getSessionPid is invoked with excludeWrappers: true (cod
   assert.strictEqual(result.alive, false);
 });
 
+test('checkHealth: heartbeat filtered by role — fresh impl write does NOT mask stale qa (codex P2 round 6)', () => {
+  // Multi-role phases share heartbeat.jsonl; impl and qa each append
+  // entries tagged with their `role`. Without filtering, qa's freshness
+  // would be reported as impl's last write age — a fresh impl entry
+  // would falsely report qa as alive even when qa hasn't heartbeated
+  // in 30 minutes.
+  const dir = mkTmp('ch-multirole-hb');
+  const manifestPath = writeManifest(dir, makeBaseManifest());
+  const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
+  fs.mkdirSync(phaseDir, { recursive: true });
+  // qa last heartbeated 30 min ago; impl heartbeated 30s ago. The
+  // protocol allows both to share heartbeat.jsonl.
+  const qaTs = new Date(Date.now() - 30 * 60_000).toISOString();
+  const implTs = new Date(Date.now() - 30_000).toISOString();
+  const lines = [
+    JSON.stringify({ ts: qaTs, pid: 1, role: 'qa', phase_id: 'phase-1' }),
+    JSON.stringify({ ts: implTs, pid: 2, role: 'impl', phase_id: 'phase-1' }),
+  ];
+  fs.writeFileSync(path.join(phaseDir, 'heartbeat.jsonl'), lines.join('\n') + '\n');
+  writeStatus(manifestPath, {
+    phases: { 'phase-1': { started_at: new Date().toISOString() } },
+  });
+
+  const qaResult = checkHealth({
+    phaseId: 'phase-1', role: 'qa', manifestPath,
+    _pidLookup: () => 9999, _killer: KILLER_ALIVE,
+  });
+  const implResult = checkHealth({
+    phaseId: 'phase-1', role: 'impl', manifestPath,
+    _pidLookup: () => 9999, _killer: KILLER_ALIVE,
+  });
+
+  // qa should see the 30-min-old qa heartbeat → stale
+  assert.strictEqual(qaResult.heartbeatStale, true, 'qa heartbeat must read as stale');
+  assert.ok(qaResult.heartbeatAge >= 30 * 60 - 5, `qa age expected ~30min, got ${qaResult.heartbeatAge}s`);
+  // impl should see the 30s-old impl heartbeat → fresh
+  assert.strictEqual(implResult.heartbeatStale, false, 'impl heartbeat must read as fresh');
+  assert.ok(implResult.heartbeatAge >= 28 && implResult.heartbeatAge <= 32,
+    `impl age expected ~30s, got ${implResult.heartbeatAge}s`);
+});
+
 test('checkHealth: role disambiguation — impl and qa lookups use distinct session names', () => {
   // The core defect codex round 2 caught: with one shared status.pid,
   // checking impl and qa would see the same pid. With session-name
@@ -1254,7 +1332,7 @@ test('checkHealth: defaults.heartbeat_timeout_minutes from manifest is honored',
   const hbTime = new Date(Date.now() - 90_000).toISOString();
   fs.writeFileSync(
     path.join(phaseDir, 'heartbeat.jsonl'),
-    JSON.stringify({ ts: hbTime, pid: 9999 }) + '\n'
+    JSON.stringify({ ts: hbTime, pid: 9999, role: 'impl', phase_id: 'phase-1' }) + '\n'
   );
   writeStatus(manifestPath, {
     phases: { 'phase-1': { started_at: new Date().toISOString() } },
@@ -1288,7 +1366,7 @@ test('checkHealth: opts.heartbeatStaleMs overrides manifest defaults.heartbeat_t
   const hbTime = new Date(Date.now() - 90_000).toISOString();
   fs.writeFileSync(
     path.join(phaseDir, 'heartbeat.jsonl'),
-    JSON.stringify({ ts: hbTime, pid: 9999 }) + '\n'
+    JSON.stringify({ ts: hbTime, pid: 9999, role: 'impl', phase_id: 'phase-1' }) + '\n'
   );
   writeStatus(manifestPath, {
     phases: { 'phase-1': { started_at: new Date().toISOString() } },
