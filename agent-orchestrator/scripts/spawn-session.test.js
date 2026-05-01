@@ -488,6 +488,65 @@ test('parsePidLookupOutput: falls back to wrapper PID if no child visible yet', 
   assert.strictEqual(parsePidLookupOutput(stdout, 'orch-a'), 5555);
 });
 
+test('parsePidLookupOutput: excludeWrappers returns null when only the wrapper survives (codex P1 round 3)', () => {
+  // The bug Codex caught: cmd /k and powershell -NoExit keep the tab
+  // open after Claude exits, with --name still on their CommandLine.
+  // Default mode would return the wrapper PID and Unit 8 would falsely
+  // report alive. excludeWrappers mode returns null, so checkHealth
+  // detects the crashed agent immediately.
+  const stdout = JSON.stringify([
+    { ProcessId: 5555, CommandLine: 'cmd /k claude --name orch-a --model sonnet' },
+  ]);
+  assert.strictEqual(
+    parsePidLookupOutput(stdout, 'orch-a', { excludeWrappers: true }),
+    null
+  );
+});
+
+test('parsePidLookupOutput: excludeWrappers still returns the primary when both visible', () => {
+  const stdout = JSON.stringify([
+    { ProcessId: 5555, CommandLine: 'cmd /k claude --name orch-a --model sonnet' },
+    { ProcessId: 9999, CommandLine: 'claude.exe --name orch-a --model sonnet' },
+  ]);
+  assert.strictEqual(
+    parsePidLookupOutput(stdout, 'orch-a', { excludeWrappers: true }),
+    9999
+  );
+});
+
+test('parsePidLookupOutput: excludeWrappers also rejects powershell wrapper alone', () => {
+  const stdout = JSON.stringify([
+    {
+      ProcessId: 5555,
+      CommandLine: 'powershell -NoExit -Command "agency claude --name orch-a"',
+    },
+  ]);
+  assert.strictEqual(
+    parsePidLookupOutput(stdout, 'orch-a', { excludeWrappers: true }),
+    null
+  );
+});
+
+test('getSessionPid: throwOnError: true propagates runner errors (codex P1 round 5)', () => {
+  // Default mode swallows runner errors as null. Unit 8's health checker
+  // needs the failure to propagate so it can render pidAlive: null
+  // (couldn't tell) instead of false (confirmed crash).
+  const failingRunner = () => {
+    const e = new Error('powershell exited 1');
+    throw e;
+  };
+  // Default behavior: error swallowed, returns null.
+  assert.strictEqual(
+    getSessionPid('orch-a', { _runner: failingRunner }),
+    null
+  );
+  // throwOnError: error propagates.
+  assert.throws(
+    () => getSessionPid('orch-a', { _runner: failingRunner, throwOnError: true }),
+    /powershell exited 1/
+  );
+});
+
 test('parsePidLookupOutput: returns first non-wrapper PID when multiple children (agency wrapper + claude)', () => {
   // The agency wrapper's process and the claude child process both carry
   // --name on their CommandLine. Both count as non-shell-wrappers; the

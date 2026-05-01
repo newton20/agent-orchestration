@@ -534,7 +534,7 @@ function isShellWrapperCmdline(cmdline) {
   return SHELL_WRAPPERS.has(bare);
 }
 
-function parsePidLookupOutput(stdout, name) {
+function parsePidLookupOutput(stdout, name, { excludeWrappers = false } = {}) {
   if (typeof stdout !== 'string' || stdout.trim() === '') return null;
   if (!name || typeof name !== 'string') return null;
   let parsed;
@@ -557,8 +557,21 @@ function parsePidLookupOutput(stdout, name) {
   );
 
   // Two-pass: prefer non-wrapper matches (the claude / agency binary)
-  // so Unit 8's health check watches something that actually dies when
-  // Claude exits. Fall back to any match if only the wrapper is visible.
+  // so the caller watches something that actually dies when Claude
+  // exits.
+  //
+  // The `excludeWrappers` mode is for Unit 8's health checker: cmd /k
+  // and powershell -NoExit keep the wrapper alive after Claude exits
+  // (so the user can read post-mortem output), and the wrapper
+  // CommandLine still contains `--name`. A naïve fallback to the
+  // wrapper PID in that case would make checkHealth report a crashed
+  // agent as alive until the phase timeout fires. With
+  // excludeWrappers: true, only the primary (Claude child) PID is
+  // returned — null when only the wrapper survives.
+  //
+  // Default mode preserves backward compat for spawn-session's own
+  // post-spawn lookup, which legitimately wants the wrapper PID
+  // before the inner claude child registers.
   let wrapperPid = null;
   for (const row of rows) {
     const pid = Number(row && row.ProcessId);
@@ -569,7 +582,7 @@ function parsePidLookupOutput(stdout, name) {
     if (!isShellWrapperCmdline(cmdline)) return pid;
     if (wrapperPid === null) wrapperPid = pid;
   }
-  return wrapperPid;
+  return excludeWrappers ? null : wrapperPid;
 }
 
 /**
@@ -579,11 +592,32 @@ function parsePidLookupOutput(stdout, name) {
  * tab's title). Injectable runner makes this testable without shelling
  * out.
  *
+ * Options:
+ *   excludeWrappers — when true, return null if only a shell-wrapper
+ *     (cmd /k, powershell -NoExit) match is visible. Used by Unit 8's
+ *     health checker to detect "Claude child exited but tab still
+ *     open"; the wrapper PID would otherwise mask a crashed agent
+ *     until the phase timeout. Default false (preserves backward-compat
+ *     for spawn-session's post-spawn lookup, which legitimately needs
+ *     the wrapper PID before the inner claude child registers).
+ *
+ *   throwOnError — when true, propagate runner errors (PowerShell
+ *     spawn failure, AV-blocked execution, missing PowerShell on PATH)
+ *     to the caller instead of swallowing them as `null`. Used by
+ *     Unit 8's health checker so the orchestrator can distinguish
+ *     "no matching process" (confirmed crash → recovery) from "lookup
+ *     itself errored" (transient → don't recover). Default false
+ *     preserves the spawn-session post-spawn-lookup contract: a
+ *     transient error during spawn shouldn't tear down the spawn.
+ *
  * Caveat: if multiple sessions share the same name, the first-returned
  * PID is used. Our session naming scheme (`orch-<phase>-<role>`)
  * guarantees uniqueness per-phase-per-role.
  */
-function getSessionPid(name, { _runner } = {}) {
+function getSessionPid(
+  name,
+  { _runner, excludeWrappers = false, throwOnError = false } = {}
+) {
   if (!name || typeof name !== 'string') return null;
   // _runner is invoked with (program, argv) so tests can verify both.
   // Default uses execFileSync — which does NOT go through cmd.exe, so
@@ -598,10 +632,11 @@ function getSessionPid(name, { _runner } = {}) {
   let out;
   try {
     out = runner('powershell', buildPidLookupArgs());
-  } catch (_) {
+  } catch (e) {
+    if (throwOnError) throw e;
     return null;
   }
-  return parsePidLookupOutput(out, name);
+  return parsePidLookupOutput(out, name, { excludeWrappers });
 }
 
 // -------------------- spawnSession --------------------
