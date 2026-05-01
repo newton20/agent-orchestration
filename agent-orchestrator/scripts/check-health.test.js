@@ -1966,7 +1966,48 @@ test('readHeartbeatRecord: re-expands from 64 KiB → 256 KiB when latest record
   assert.strictEqual(r.pid, 1);
 });
 
-test('readHeartbeatRecord: latest role-matching record beyond max window → null + heartbeatCorrupt', () => {
+test('checkHealth: heartbeat tail exhausted on >1 MiB file with no role match → heartbeatStale true + heartbeatTruncated true (ce:review round 2)', () => {
+  // ce:review round 2 (P2 functional regression): pre-fix, a >1 MiB
+  // heartbeat with no role-matching line in the tail silently lost
+  // its stale advisory. Surface the truncated state so Unit 11 can
+  // still treat the role as stale.
+  const totalSize = HEARTBEAT_TAIL_WINDOW_BYTES[2] + 16 * 1024;
+  const qaLine =
+    JSON.stringify({ ts: '2026-04-29T05:00:00Z', pid: 1, role: 'qa' }) + '\n';
+  const tailBuffer = Buffer.from('\n' + qaLine.repeat(20000), 'utf8');
+  const fakeFsSeams = {
+    _openSync: () => 99,
+    _fstatSync: () => ({ size: totalSize }),
+    _readSync: (_fd, buf, _o, length, _offset) => {
+      // Always return qa-padded content for any read, no impl record
+      // anywhere. Returns exactly `length` bytes.
+      const slice = tailBuffer.slice(0, Math.min(length, tailBuffer.length));
+      slice.copy(buf, 0);
+      return slice.length;
+    },
+    _closeSync: () => {},
+  };
+  const dir = mkTmp('ch-tail-truncated');
+  const manifestPath = writeManifest(dir, makeBaseManifest());
+  const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
+  fs.mkdirSync(phaseDir, { recursive: true });
+  // Create the heartbeat file so existsSync returns true. Real fs
+  // probes exist; injected seams take over for the tail-read.
+  fs.writeFileSync(path.join(phaseDir, 'heartbeat.jsonl'), 'dummy');
+  writeStatus(manifestPath, {
+    phases: { 'phase-1': { started_at: new Date().toISOString() } },
+  });
+  const result = checkHealth({
+    phaseId: 'phase-1', role: 'impl', manifestPath,
+    _pidLookup: () => 9999, _killer: KILLER_ALIVE,
+    ...fakeFsSeams,
+  });
+  assert.strictEqual(result.heartbeatTruncated, true, 'tail exhausted → truncated');
+  assert.strictEqual(result.heartbeatStale, true, 'tail exhausted always implies stale');
+  assert.strictEqual(result.heartbeatAge, null, 'no exact age computable from bounded read');
+});
+
+test('readHeartbeatRecord: latest role-matching record beyond max window → diagnostic with truncated: true', () => {
   // Simulate a file > 1 MiB where the impl record sits at the very
   // start (offset 0). All windows up to 1 MiB read only qa-padded
   // tail. Per todo 067 AC: return null with diagnostic; the absent
@@ -1991,13 +2032,11 @@ test('readHeartbeatRecord: latest role-matching record beyond max window → nul
     _closeSync: () => {},
   };
   const r = readHeartbeatRecord('/fake-path', 'impl', opts);
-  // No impl match anywhere we looked → null OR a diagnostic-only record.
-  // Per AC the call returns "no usable heartbeat" (tsMs=null or null).
-  if (r === null) {
-    // No corruption observed — fine.
-  } else {
-    assert.strictEqual(r.tsMs, null, 'no role-matching record found in 1 MiB tail');
-  }
+  // ce:review round 2: must surface the truncated diagnostic so
+  // checkHealth can mark heartbeatStale: true + heartbeatTruncated.
+  assert.ok(r, 'must return a diagnostic, not null, when tail is exhausted');
+  assert.strictEqual(r.tsMs, null, 'no role-matching record found in 1 MiB tail');
+  assert.strictEqual(r.truncated, true, 'truncated diagnostic surfaces the size-bounded read');
 });
 
 test('readHeartbeatRecord: window starts exactly at a record boundary — first line is NOT dropped (codex round 1)', () => {
@@ -2275,6 +2314,7 @@ test('schema_version: success-path output has the documented V1 field set', () =
       'heartbeatAge',
       'heartbeatStale',
       'heartbeatCorrupt',
+      'heartbeatTruncated',
       'lastCheckpoint',
     ],
     'V1 success-path field set drift — bump schema_version and update --help (todo 076) before changing.'

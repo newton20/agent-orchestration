@@ -394,6 +394,22 @@ function readHeartbeatRecord(filePath, role, opts = {}) {
       // Whole file fit in this window: nothing more to expand to.
       if (startOffset === 0) return parsed || null;
     }
+    // We walked through every window (largest = HEARTBEAT_TAIL_WINDOW_BYTES
+    // last entry, currently 1 MiB) without finding a role-matching
+    // record AND without ever hitting startOffset === 0 (which would
+    // have returned earlier). The file is therefore larger than the
+    // largest window. Surface a `truncated: true` diagnostic so
+    // checkHealth can mark heartbeatStale + heartbeatTruncated — pre-
+    // PR #17, the full-file scan would have surfaced an old role
+    // record as `heartbeatStale: true`; without this signal, a role
+    // that stopped emitting before >1 MiB of other-role activity
+    // would silently lose its stale advisory (ce:review round 2 — P2
+    // functional regression).
+    if (lastDiagnostic === null) {
+      lastDiagnostic = { tsMs: null, pid: null, corrupt: false, truncated: true };
+    } else {
+      lastDiagnostic.truncated = true;
+    }
     return lastDiagnostic;
   } finally {
     if (fd !== undefined) {
@@ -684,6 +700,16 @@ function checkHealth(opts = {}) {
     // to the freshness verdict; Unit 11 renders it as "possibly hung
     // agent producing garbage" rather than as a recovery trigger.
     heartbeatCorrupt: false,
+    // heartbeatTruncated (PR #17 ce:review round 2): true when the
+    // tail-read exhausted its largest window without finding a
+    // role-matching record on a non-trivial file. Combined with
+    // heartbeatStale: true, it tells Unit 11 "this role hasn't
+    // emitted in at least the size of the tail window — count as
+    // stale, but don't expect an exact age." Without this signal, a
+    // role that stopped emitting before >1 MiB of other-role
+    // activity in a shared heartbeat file would silently lose its
+    // stale advisory.
+    heartbeatTruncated: false,
     lastCheckpoint: null,
   };
 
@@ -927,6 +953,7 @@ function checkHealth(opts = {}) {
   let heartbeatAge = null;
   let heartbeatStale = false;
   let heartbeatCorrupt = false;
+  let heartbeatTruncated = false;
   if (existsSync(heartbeatPath)) {
     // Filter by role: in multi-role phases the heartbeat file is
     // shared (impl + qa append to the same file), and each entry
@@ -948,6 +975,15 @@ function checkHealth(opts = {}) {
       // encountered during the walk, even if an older valid record
       // was eventually found.
       if (parsed.corrupt === true) heartbeatCorrupt = true;
+      // ce:review round 2 (PR #17): tail-exhausted on a >1 MiB file.
+      // Combined with heartbeatStale: true, this is the coarse
+      // "we know the role is stale but couldn't compute exact age"
+      // signal. Always implies stale — pre-PR-#17 the full-file
+      // scan surfaced this case as `heartbeatStale: true` directly.
+      if (parsed.truncated === true) {
+        heartbeatTruncated = true;
+        heartbeatStale = true;
+      }
       if (Number.isFinite(parsed.tsMs)) {
         const ageMs = Math.max(0, now - parsed.tsMs);
         heartbeatAge = Math.floor(ageMs / 1000);
@@ -978,6 +1014,7 @@ function checkHealth(opts = {}) {
     heartbeatAge,
     heartbeatStale,
     heartbeatCorrupt,
+    heartbeatTruncated,
     lastCheckpoint,
   };
   if (phaseDirMissing) {
@@ -1075,6 +1112,17 @@ function printHelp() {
       '      hung agent producing garbage" (orthogonal to the',
       '      freshness verdict).',
       '',
+      '  heartbeatTruncated (boolean)',
+      '      true when the heartbeat tail-read exhausted its largest',
+      '      window (1 MiB) without finding a role-matching record on',
+      '      a non-trivial file. Always implies heartbeatStale: true —',
+      '      the role hasn\'t emitted in at least the size of the tail',
+      '      window, but exact heartbeatAge cannot be computed from a',
+      '      bounded read. Pre-PR-#17 the full-file scan surfaced this',
+      '      case as heartbeatStale: true directly; the new field lets',
+      '      Unit 11 distinguish "stale with known age" from "stale,',
+      '      age unknown."',
+      '',
       '  lastCheckpoint (string | null)',
       '      basename of the most-recently-modified non-transient file',
       '      in the phase directory, or null if absent. The recovery',
@@ -1102,6 +1150,7 @@ function printHelp() {
       '    "heartbeatAge": 12,',
       '    "heartbeatStale": false,',
       '    "heartbeatCorrupt": false,',
+      '    "heartbeatTruncated": false,',
       '    "lastCheckpoint": "impl-prompt.md"',
       '  }',
       '',
