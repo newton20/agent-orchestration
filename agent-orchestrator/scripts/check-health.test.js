@@ -20,16 +20,21 @@ const {
   checkHealth,
   isPidAlive,
   parseHeartbeatTail,
+  readHeartbeatRecord,
   findLastCheckpoint,
   readPhaseStatus,
   coerceTimestampMs,
   asPositiveInt,
   defaultPhaseDir,
   defaultSessionName,
+  parseCliArgs,
+  parseNonNegativeIntFlag,
   VALID_ROLES,
   DEFAULT_TIMEOUT_MINUTES,
   HEARTBEAT_STALE_MS,
   DEFAULT_STARTUP_GRACE_MS,
+  HEARTBEAT_TAIL_WINDOW_BYTES,
+  MAX_CHECKPOINT_ENTRIES,
   CHECKPOINT_EXCLUDE_NAMES,
   CHECKPOINT_EXCLUDE_SUFFIXES,
 } = require('./check-health');
@@ -341,6 +346,77 @@ test('findLastCheckpoint: mixed extensions ranked purely by mtime', () => {
   fs.utimesSync(md, new Date(2020, 0, 1), new Date(2020, 0, 1));
   fs.utimesSync(json, new Date(2026, 0, 1), new Date(2026, 0, 1));
   assert.strictEqual(findLastCheckpoint(dir), 'b.json');
+});
+
+// -------------------------------------------------------------------------
+// findLastCheckpoint cap (todo 068)
+// -------------------------------------------------------------------------
+
+test('findLastCheckpoint: cap exposed and equals 256', () => {
+  // The cap value is part of the contract — operators may legitimately
+  // care about the threshold when designing scaffolds. Pin it.
+  assert.strictEqual(MAX_CHECKPOINT_ENTRIES, 256);
+});
+
+test('findLastCheckpoint: at exactly the cap (256 entries) — full mtime scan still runs', () => {
+  // Boundary: behavior must be unchanged at the cap, only > cap.
+  const fakeEntries = Array.from({ length: MAX_CHECKPOINT_ENTRIES }, (_, i) => ({
+    name: `file-${i}.md`,
+    isFile: () => true,
+  }));
+  let statCount = 0;
+  const fakeStat = () => {
+    statCount++;
+    return { mtimeMs: 1000 + statCount };
+  };
+  const result = findLastCheckpoint('/fake', () => fakeEntries, fakeStat);
+  assert.ok(result, 'at-cap directory still produces a winner');
+  assert.strictEqual(statCount, MAX_CHECKPOINT_ENTRIES, 'all entries stat-d at the cap');
+});
+
+test('findLastCheckpoint: above cap (>256 entries) → ZERO statSyncs and null return (todo 068 safety property)', () => {
+  // The verifiable safety property per the AC: cap-exceeded branch
+  // executes ZERO per-entry statSync calls. We inject a counting
+  // _statSync and assert count === 0.
+  const fakeEntries = Array.from({ length: MAX_CHECKPOINT_ENTRIES + 1 }, (_, i) => ({
+    name: `file-${i}.md`,
+    isFile: () => true,
+  }));
+  let statCount = 0;
+  const countingStat = () => {
+    statCount++;
+    return { mtimeMs: 1 };
+  };
+  let warning = null;
+  const result = findLastCheckpoint(
+    '/fake',
+    () => fakeEntries,
+    countingStat,
+    (msg) => { warning = msg; }
+  );
+  assert.strictEqual(statCount, 0, 'past cap, ZERO per-entry statSync calls');
+  assert.strictEqual(result, null, 'past cap, lastCheckpoint is null');
+  // Advisory diagnostic must surface (log line per AC).
+  assert.match(warning, /phase dir overflowed/);
+});
+
+test('findLastCheckpoint: above cap does NOT name-sort + take-first (would discard newest with timestamp-prefixed names)', () => {
+  // Named entries are timestamp-prefixed; ascending name sort would
+  // pick the OLDEST. Verify we don't fall into that trap by surfacing
+  // null instead of a plausible-but-wrong "winner."
+  const fakeEntries = Array.from({ length: 300 }, (_, i) => ({
+    name: `2026-04-${String(i + 1).padStart(2, '0')}-checkpoint.md`,
+    isFile: () => true,
+  }));
+  const result = findLastCheckpoint('/fake', () => fakeEntries, () => ({ mtimeMs: 1 }), () => {});
+  assert.strictEqual(result, null, 'must NOT name-sort + take-first as a fallback');
+});
+
+test('findLastCheckpoint: empty dir below cap still returns null (no advisory)', () => {
+  let warningCount = 0;
+  const result = findLastCheckpoint('/fake', () => [], () => ({ mtimeMs: 1 }), () => { warningCount++; });
+  assert.strictEqual(result, null);
+  assert.strictEqual(warningCount, 0, 'empty dir is not an overflow case');
 });
 
 // =========================================================================
@@ -939,14 +1015,23 @@ test('checkHealth: started_at as YAML Date object (DEFAULT_SCHEMA) is handled', 
   assert.strictEqual(result.timedOut, true);
 });
 
-test('checkHealth: started_at fallback to spawned_at (camelCase drift)', () => {
-  const dir = mkTmp('ch-spawned-at');
+test('checkHealth: spawned_at-only row is ignored (todo 078 — fallback removed)', () => {
+  // PR #17 dropped the `spawned_at` fallback. A status row that only
+  // carries `spawned_at` (camelCase drift from spawn-session's
+  // spawnedAt return shape) is now silently ignored by the timeout
+  // check. The 1-hour-old started_at would have produced
+  // `timedOut: true` under the pre-PR-#17 fallback; with the fallback
+  // removed, the timeout check is skipped (no canonical timestamp)
+  // and the verdict is governed only by pidAlive. This makes a
+  // misnamed writer loud — operators get a stuck "alive but never
+  // times out" rather than a silently-correct fallback.
+  const dir = mkTmp('ch-spawned-at-only');
   const manifestPath = writeManifest(dir, makeBaseManifest());
   const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
   fs.mkdirSync(phaseDir, { recursive: true });
-  const startedAt = new Date(Date.now() - 60 * 60_000).toISOString();
+  const oneHourAgo = new Date(Date.now() - 60 * 60_000).toISOString();
   writeStatus(manifestPath, {
-    phases: { 'phase-1': { pid: 9999, spawned_at: startedAt } },
+    phases: { 'phase-1': { pid: 9999, spawned_at: oneHourAgo } },
   });
 
   const result = checkHealth({
@@ -954,7 +1039,12 @@ test('checkHealth: started_at fallback to spawned_at (camelCase drift)', () => {
     _pidLookup: () => 9999, _killer: KILLER_ALIVE,
   });
 
-  assert.strictEqual(result.timedOut, true);
+  assert.strictEqual(
+    result.timedOut,
+    false,
+    'spawned_at must NOT be read; timeout check is skipped without started_at'
+  );
+  assert.strictEqual(result.pidAlive, true, 'pid lookup still resolves the live pid');
 });
 
 test('checkHealth: empty-string started_at treated as missing (NOT zero-epoch)', () => {
@@ -1052,7 +1142,13 @@ test('checkHealth: lookup null + within startup grace → pidAlive null (codex P
   assert.strictEqual(result.alive, false); // alive still requires pidAlive === true
 });
 
-test('checkHealth: lookup null + past startup grace → pidAlive false (confirmed crash)', () => {
+test('checkHealth: lookup null + past startup grace → pidAlive null + reason session_not_found (todo 071 BEHAVIOR CHANGE)', () => {
+  // BEHAVIOR CHANGE vs PR #15: this case used to surface as
+  // `pidAlive: false`. PR #17 (todo 071) makes it
+  // `pidAlive: null + pidAliveReason: 'session_not_found'` so Unit 11's
+  // tri-state convergence ("two consecutive nulls past grace = crash")
+  // applies uniformly. ESRCH from kill(pid, 0) STAYS pidAlive: false —
+  // see the kill-ESRCH test below.
   const dir = mkTmp('ch-past-grace');
   const manifestPath = writeManifest(dir, makeBaseManifest());
   const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
@@ -1069,7 +1165,9 @@ test('checkHealth: lookup null + past startup grace → pidAlive false (confirme
     _killer: KILLER_ALIVE,
   });
 
-  assert.strictEqual(result.pidAlive, false, 'past grace, null lookup is a confirmed crash');
+  assert.strictEqual(result.pidAlive, null, 'past grace, null lookup → null (not false)');
+  assert.strictEqual(result.pidAliveReason, 'session_not_found');
+  assert.strictEqual(result.alive, false, 'alive still requires pidAlive === true');
 });
 
 test('checkHealth: startupGraceMs override is respected', () => {
@@ -1082,23 +1180,30 @@ test('checkHealth: startupGraceMs override is respected', () => {
     phases: { 'phase-1': { started_at: startedAt } },
   });
 
-  // Default 60s: 30s ago is within grace → null
+  // Default 60s: 30s ago is within grace → null + 'startup_grace'
   const r1 = checkHealth({
     phaseId: 'phase-1', role: 'impl', manifestPath,
     _pidLookup: () => null, _killer: KILLER_ALIVE,
   });
   assert.strictEqual(r1.pidAlive, null);
+  assert.strictEqual(r1.pidAliveReason, 'startup_grace');
 
-  // 10s grace: 30s ago is past grace → false
+  // 10s grace: 30s ago is past grace → null + 'session_not_found'
+  // (todo 071 behavior change — was pidAlive: false pre-PR-#17).
   const r2 = checkHealth({
     phaseId: 'phase-1', role: 'impl', manifestPath,
     _pidLookup: () => null, _killer: KILLER_ALIVE,
     startupGraceMs: 10_000,
   });
-  assert.strictEqual(r2.pidAlive, false);
+  assert.strictEqual(r2.pidAlive, null);
+  assert.strictEqual(r2.pidAliveReason, 'session_not_found');
 });
 
-test('checkHealth: lookup null + no started_at → pidAlive false (no grace anchor)', () => {
+test('checkHealth: lookup null + no started_at → pidAlive null + reason session_not_found (todo 071)', () => {
+  // No started_at means no grace anchor — checkHealth cannot tell
+  // whether we're inside the startup window. PR #17 unifies this with
+  // "past grace": pidAlive: null + reason 'session_not_found' so Unit
+  // 11's tri-state convergence applies. (Pre-PR-#17 returned false.)
   const dir = mkTmp('ch-grace-no-anchor');
   const manifestPath = writeManifest(dir, makeBaseManifest());
   const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
@@ -1112,7 +1217,8 @@ test('checkHealth: lookup null + no started_at → pidAlive false (no grace anch
     _pidLookup: () => null, _killer: KILLER_ALIVE,
   });
 
-  assert.strictEqual(result.pidAlive, false);
+  assert.strictEqual(result.pidAlive, null);
+  assert.strictEqual(result.pidAliveReason, 'session_not_found');
 });
 
 test('checkHealth: invalid startupGraceMs throws', () => {
@@ -1130,7 +1236,10 @@ test('checkHealth: invalid startupGraceMs throws', () => {
   );
 });
 
-test('checkHealth: PID lookup returns null + past grace → pidAlive false', () => {
+test('checkHealth: PID lookup returns null + past grace → pidAlive null + reason session_not_found (todo 071)', () => {
+  // Pre-PR-#17 surfaced pidAlive: false; todo 071 unifies all
+  // "WMI lookup miss past grace" cases under
+  // pidAlive: null + reason 'session_not_found'.
   const dir = mkTmp('ch-pid-null');
   const manifestPath = writeManifest(dir, makeBaseManifest());
   const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
@@ -1147,16 +1256,20 @@ test('checkHealth: PID lookup returns null + past grace → pidAlive false', () 
     _pidLookup: () => null, _killer: KILLER_ALIVE,
   });
 
-  assert.strictEqual(result.pidAlive, false);
+  assert.strictEqual(result.pidAlive, null);
+  assert.strictEqual(result.pidAliveReason, 'session_not_found');
   assert.strictEqual(result.alive, false);
 });
 
-test('checkHealth: PID lookup throws → pidAlive null (NOT false — codex round 4 [P2])', () => {
+test('checkHealth: PID lookup throws → pidAlive null + reason lookup_failed (todo 071)', () => {
   // A thrown lookup is "couldn't decide" (transient WMI hiccup,
   // PowerShell blocked by AV, etc.). Per the public contract, this
   // must surface as pidAlive: null so Unit 11 doesn't enter recovery
   // on a transient failure. False would conflate "lookup errored"
   // with "agent crashed" and force a respawn loop.
+  // Todo 071 (PR #17): the reason channel is 'lookup_failed' so the
+  // caller can distinguish this from a startup-grace null or a
+  // session-not-found null.
   const dir = mkTmp('ch-pid-throws');
   const manifestPath = writeManifest(dir, makeBaseManifest());
   const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
@@ -1170,6 +1283,7 @@ test('checkHealth: PID lookup throws → pidAlive null (NOT false — codex roun
     _pidLookup: () => { throw new Error('WMI failure'); },
     _killer: KILLER_ALIVE,
   });
+  assert.strictEqual(result.pidAliveReason, 'lookup_failed');
 
   assert.strictEqual(result.pidAlive, null, 'lookup throw must NOT be conflated with confirmed crash');
   assert.strictEqual(result.alive, false, 'alive still requires pidAlive === true');
@@ -1332,8 +1446,14 @@ test('checkHealth: real getSessionPid is invoked with excludeWrappers: true (cod
     _killer: KILLER_ALIVE, // even if wrapper PID were used, alive would be true
   });
 
-  // Expected: wrapper-aware lookup returns null → pidAlive false → alive false
-  assert.strictEqual(result.pidAlive, false, 'wrapper-only must read as dead');
+  // Expected: wrapper-aware lookup returns null → past grace →
+  // pidAlive: null + reason 'session_not_found' (todo 071 BEHAVIOR
+  // CHANGE: was pidAlive: false pre-PR-#17). The wrapper-mask
+  // regression anchor still holds — wrapper-only must NOT read as
+  // alive — and the contract is now "tri-state convergence applies"
+  // rather than "single-poll confirmed crash."
+  assert.strictEqual(result.pidAlive, null, 'wrapper-only must NOT read as alive');
+  assert.strictEqual(result.pidAliveReason, 'session_not_found');
   assert.strictEqual(result.alive, false);
 });
 
@@ -1413,8 +1533,14 @@ test('checkHealth: role disambiguation — impl and qa lookups use distinct sess
     _pidLookup: lookup, _killer: KILLER_ALIVE,
   });
 
-  assert.strictEqual(implResult.pidAlive, false, 'impl is dead');
+  // impl: lookup returns null past grace → null + 'session_not_found'
+  // (todo 071 behavior change). Either way, alive is false.
+  assert.strictEqual(implResult.pidAlive, null, 'impl null lookup → null (todo 071)');
+  assert.strictEqual(implResult.pidAliveReason, 'session_not_found');
+  assert.strictEqual(implResult.alive, false);
+  // qa: lookup returns 8888 → kill ok → pidAlive true.
   assert.strictEqual(qaResult.pidAlive, true, 'qa is alive');
+  assert.strictEqual(qaResult.pidAliveReason, null, 'no reason set when pidAlive is true');
 });
 
 test('checkHealth: PID kill returns null code (unknown error) → pidAlive null, alive false', () => {
@@ -1527,6 +1653,8 @@ test('checkHealth: phase directory missing → alive false, error set, lastCheck
   assert.strictEqual(result.alive, false);
   assert.strictEqual(result.lastCheckpoint, null);
   assert.match(result.error, /phase directory not found/);
+  // Todo 072 (PR #17): runtime diagnostic, not config — Unit 11 keeps polling.
+  assert.strictEqual(result.errorKind, 'runtime');
 });
 
 test('checkHealth: manifest does not exist → returns error, does not throw', () => {
@@ -1536,6 +1664,8 @@ test('checkHealth: manifest does not exist → returns error, does not throw', (
   });
   assert.strictEqual(result.alive, false);
   assert.match(result.error, /manifest not found/);
+  // Todo 072 (PR #17): config failure — Unit 11 should pause polling.
+  assert.strictEqual(result.errorKind, 'config');
 });
 
 test('checkHealth: phaseId not in manifest → returns error', () => {
@@ -1548,6 +1678,7 @@ test('checkHealth: phaseId not in manifest → returns error', () => {
 
   assert.strictEqual(result.alive, false);
   assert.match(result.error, /phase "phase-99" not found/);
+  assert.strictEqual(result.errorKind, 'config');
 });
 
 test('checkHealth: invalid manifest YAML → returns error', () => {
@@ -1561,6 +1692,7 @@ test('checkHealth: invalid manifest YAML → returns error', () => {
 
   assert.strictEqual(result.alive, false);
   assert.ok(typeof result.error === 'string' && result.error.length > 0);
+  assert.strictEqual(result.errorKind, 'config');
 });
 
 test('checkHealth: phase dir missing keeps PID and timeout fields populated for diagnostics', () => {
@@ -1653,10 +1785,15 @@ test('checkHealth: invalid heartbeatStaleMs throws', () => {
 // M — defaults + overrides
 // =========================================================================
 
-test('defaultPhaseDir composes <workdir>/docs/orchestration/phases/<phaseId>', () => {
+test('defaultPhaseDir composes <manifestDir>/docs/orchestration/phases/<phaseId>', () => {
+  // Per todo 070 (PR #17), the parameter is `manifestDir` — the manifest's
+  // containing directory, NOT `manifest.workdir`. The fixture path uses
+  // a manifest-dir-shaped value so future readers don't reintroduce the
+  // workdir mental model the rename was meant to retire.
+  const manifestDir = path.join('/path', 'to', 'manifest-root');
   assert.strictEqual(
-    defaultPhaseDir('/tmp/repo', 'phase-3'),
-    path.join('/tmp/repo', 'docs', 'orchestration', 'phases', 'phase-3')
+    defaultPhaseDir(manifestDir, 'phase-3'),
+    path.join(manifestDir, 'docs', 'orchestration', 'phases', 'phase-3')
   );
 });
 
@@ -1728,16 +1865,847 @@ test('checkHealth: manifest.workdir is NOT used for protocol root (matches scaff
 });
 
 // =========================================================================
+// K — Heartbeat tail-read fixed window (todo 067)
+// =========================================================================
+//
+// Behavior:
+//   - Files smaller than the 64 KiB initial window: read fully, no
+//     partial-line drop applied.
+//   - Files between 64 KiB and 256 KiB: 64 KiB tail read first; if the
+//     latest role-matching record falls within that tail, return it.
+//     Otherwise re-expand to 256 KiB.
+//   - Files larger than 1 MiB with the latest role-matching record
+//     beyond the maximum window: return null + heartbeatCorrupt as
+//     observed (tail-only signal — itself a freshness clue for Unit 11).
+
+test('readHeartbeatRecord: small file (< 64 KiB) parsed without partial-line drop', () => {
+  const dir = mkTmp('hb-tail-small');
+  const filePath = path.join(dir, 'heartbeat.jsonl');
+  const ts = '2026-04-29T05:00:00Z';
+  fs.writeFileSync(filePath, JSON.stringify({ ts, pid: 1, role: 'impl' }) + '\n');
+  const r = readHeartbeatRecord(filePath, 'impl');
+  assert.strictEqual(r.tsMs, Date.parse(ts));
+  assert.strictEqual(r.pid, 1);
+  assert.strictEqual(r.corrupt, false);
+});
+
+test('readHeartbeatRecord: tail-window read finds latest record at end of large file', () => {
+  // File > 64 KiB: garbage prefix + latest impl record at the end.
+  // The walk goes end → start, so it lands on the impl line first
+  // and returns without scanning the prefix. corrupt: false because
+  // we never had to look at the corrupt prefix.
+  const dir = mkTmp('hb-tail-window');
+  const filePath = path.join(dir, 'heartbeat.jsonl');
+  const padding = ('x'.repeat(80) + '\n').repeat(900); // ~73 KiB of garbage
+  const ts = '2026-04-29T05:00:00Z';
+  const tail = JSON.stringify({ ts, pid: 7777, role: 'impl' }) + '\n';
+  fs.writeFileSync(filePath, padding + tail);
+  const r = readHeartbeatRecord(filePath, 'impl');
+  assert.strictEqual(r.tsMs, Date.parse(ts));
+  assert.strictEqual(r.pid, 7777);
+  // We returned on the very last line; the corrupt prefix was never
+  // examined during the role-filter walk.
+  assert.strictEqual(r.corrupt, false);
+});
+
+test('readHeartbeatRecord: tail-window walks past corrupt suffix lines to find a valid record', () => {
+  // File > 64 KiB with malformed lines AT THE END (after the latest
+  // impl record). The walk encounters the malformed lines first
+  // (corrupt = true) before salvaging the impl record further back.
+  const dir = mkTmp('hb-tail-corrupt-suffix');
+  const filePath = path.join(dir, 'heartbeat.jsonl');
+  const padding = ('x'.repeat(80) + '\n').repeat(900); // ~73 KiB of garbage prefix (irrelevant — sits in the dropped head)
+  const ts = '2026-04-29T05:00:00Z';
+  const middle = JSON.stringify({ ts, pid: 7777, role: 'impl' }) + '\n';
+  const corruptSuffix = '{ malformed-tail\nstill-not-json\n';
+  fs.writeFileSync(filePath, padding + middle + corruptSuffix);
+  const r = readHeartbeatRecord(filePath, 'impl');
+  assert.strictEqual(r.tsMs, Date.parse(ts));
+  assert.strictEqual(r.pid, 7777);
+  assert.strictEqual(r.corrupt, true, 'walk traversed malformed suffix → corrupt advisory');
+});
+
+test('readHeartbeatRecord: re-expands from 64 KiB → 256 KiB when latest record sits past the smaller window', () => {
+  // The latest impl record is at the START of the file. Push 200 KiB of
+  // qa records after it. 64 KiB tail sees only qa → no impl match.
+  // 256 KiB tail covers the full file → impl record found.
+  const dir = mkTmp('hb-tail-reexpand');
+  const filePath = path.join(dir, 'heartbeat.jsonl');
+  const implTs = '2026-04-29T05:00:00Z';
+  const implLine = JSON.stringify({ ts: implTs, pid: 1, role: 'impl' }) + '\n';
+  // Each qa line is ~70 bytes; 3000 lines ≈ 210 KiB > 64 KiB but
+  // entire file ≈ implLine + 210 KiB ≈ 210 KiB < 256 KiB.
+  const qaLine =
+    JSON.stringify({ ts: '2026-04-29T05:00:01Z', pid: 2, role: 'qa' }) + '\n';
+  const padding = qaLine.repeat(3000);
+  fs.writeFileSync(filePath, implLine + padding);
+  const stat = fs.statSync(filePath);
+  assert.ok(
+    stat.size > HEARTBEAT_TAIL_WINDOW_BYTES[0] && stat.size < HEARTBEAT_TAIL_WINDOW_BYTES[1],
+    `file size ${stat.size} must be in (64 KiB, 256 KiB) for this test to exercise the re-expand`
+  );
+  const r = readHeartbeatRecord(filePath, 'impl');
+  assert.strictEqual(r.tsMs, Date.parse(implTs));
+  assert.strictEqual(r.pid, 1);
+});
+
+test('readHeartbeatRecord: latest role-matching record beyond max window → null + heartbeatCorrupt', () => {
+  // Simulate a file > 1 MiB where the impl record sits at the very
+  // start (offset 0). All windows up to 1 MiB read only qa-padded
+  // tail. Per todo 067 AC: return null with diagnostic; the absent
+  // freshness reading is itself a "this agent stopped emitting"
+  // signal for Unit 11. Use injected fs seams so we don't actually
+  // create a 1+ MiB file on disk.
+  const totalSize = HEARTBEAT_TAIL_WINDOW_BYTES[2] + 16 * 1024; // 1 MiB + 16 KiB
+  // Build a synthetic "tail" that's qa-only — every read returns this
+  // tail. (Actual byte offsets don't matter for this seam-only test.)
+  const qaLine =
+    JSON.stringify({ ts: '2026-04-29T05:00:00Z', pid: 1, role: 'qa' }) + '\n';
+  const tailBuffer = Buffer.from('\n' + qaLine.repeat(20000), 'utf8');
+  const opts = {
+    _openSync: () => 99,
+    _fstatSync: () => ({ size: totalSize }),
+    _readSync: (_fd, buf, _o, length, _offset) => {
+      // Always return qa-padded content, exactly `length` bytes.
+      const slice = tailBuffer.slice(0, Math.min(length, tailBuffer.length));
+      slice.copy(buf, 0);
+      return slice.length;
+    },
+    _closeSync: () => {},
+  };
+  const r = readHeartbeatRecord('/fake-path', 'impl', opts);
+  // No impl match anywhere we looked → null OR a diagnostic-only record.
+  // Per AC the call returns "no usable heartbeat" (tsMs=null or null).
+  if (r === null) {
+    // No corruption observed — fine.
+  } else {
+    assert.strictEqual(r.tsMs, null, 'no role-matching record found in 1 MiB tail');
+  }
+});
+
+test('readHeartbeatRecord: empty file → null', () => {
+  const dir = mkTmp('hb-tail-empty');
+  const filePath = path.join(dir, 'heartbeat.jsonl');
+  fs.writeFileSync(filePath, '');
+  assert.strictEqual(readHeartbeatRecord(filePath, 'impl'), null);
+});
+
+test('readHeartbeatRecord: missing file → null (no throw)', () => {
+  assert.strictEqual(
+    readHeartbeatRecord(path.join(os.tmpdir(), 'definitely-not-here-xyz.jsonl'), 'impl'),
+    null
+  );
+});
+
+test('checkHealth: heartbeat tail-read keeps existing small-file behavior intact', () => {
+  // Regression anchor: with a normal-sized heartbeat (< 64 KiB), the
+  // tail-read must produce identical results to the pre-todo-067
+  // full-file read.
+  const dir = mkTmp('ch-hb-tail-regression');
+  const manifestPath = writeManifest(dir, makeBaseManifest());
+  const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
+  fs.mkdirSync(phaseDir, { recursive: true });
+  const ts = new Date(Date.now() - 30_000).toISOString();
+  fs.writeFileSync(
+    path.join(phaseDir, 'heartbeat.jsonl'),
+    JSON.stringify({ ts, pid: 9999, role: 'impl', message: 'tick' }) + '\n'
+  );
+  writeStatus(manifestPath, {
+    phases: { 'phase-1': { started_at: new Date().toISOString() } },
+  });
+  const result = checkHealth({
+    phaseId: 'phase-1', role: 'impl', manifestPath,
+    _pidLookup: () => 9999, _killer: KILLER_ALIVE,
+  });
+  assert.ok(typeof result.heartbeatAge === 'number' && result.heartbeatAge >= 28 && result.heartbeatAge <= 32);
+  assert.strictEqual(result.heartbeatStale, false);
+  assert.strictEqual(result.heartbeatCorrupt, false);
+});
+
+// =========================================================================
+// L0 — heartbeatCorrupt diagnostic (todo 083)
+// =========================================================================
+//
+// Three cases per the AC:
+//   1. clean walk → false
+//   2. malformed-tail-only → true (no valid record salvageable)
+//   3. malformed-tail + older-valid-record → true AND freshness still
+//      surfaces (the corruption advisory rides alongside the recovered
+//      heartbeat).
+//
+// Codex round 1 of triage corrected the AC away from "AND no valid
+// record" — that wording would silently drop the corruption signal
+// whenever an older record salvaged the freshness reading.
+
+test('heartbeatCorrupt: clean walk → heartbeatCorrupt false', () => {
+  const dir = mkTmp('hbc-clean');
+  const manifestPath = writeManifest(dir, makeBaseManifest());
+  const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
+  fs.mkdirSync(phaseDir, { recursive: true });
+  const ts = new Date(Date.now() - 30_000).toISOString();
+  fs.writeFileSync(
+    path.join(phaseDir, 'heartbeat.jsonl'),
+    JSON.stringify({ ts, pid: 9999, role: 'impl' }) + '\n'
+  );
+  writeStatus(manifestPath, {
+    phases: { 'phase-1': { started_at: new Date().toISOString() } },
+  });
+  const result = checkHealth({
+    phaseId: 'phase-1', role: 'impl', manifestPath,
+    _pidLookup: () => 9999, _killer: KILLER_ALIVE,
+  });
+  assert.strictEqual(result.heartbeatCorrupt, false, 'clean walk → false');
+  assert.ok(typeof result.heartbeatAge === 'number');
+});
+
+test('heartbeatCorrupt: malformed-tail-only walk → heartbeatCorrupt true (no record salvaged)', () => {
+  const dir = mkTmp('hbc-malformed-only');
+  const manifestPath = writeManifest(dir, makeBaseManifest());
+  const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
+  fs.mkdirSync(phaseDir, { recursive: true });
+  // Only malformed lines — no salvageable record at all.
+  fs.writeFileSync(
+    path.join(phaseDir, 'heartbeat.jsonl'),
+    '{ malformed\nnot-json either\n'
+  );
+  writeStatus(manifestPath, {
+    phases: { 'phase-1': { started_at: new Date().toISOString() } },
+  });
+  const result = checkHealth({
+    phaseId: 'phase-1', role: 'impl', manifestPath,
+    _pidLookup: () => 9999, _killer: KILLER_ALIVE,
+  });
+  assert.strictEqual(result.heartbeatCorrupt, true, 'any malformed line → true');
+  assert.strictEqual(result.heartbeatAge, null, 'no valid record → no age');
+  assert.strictEqual(result.heartbeatStale, false);
+});
+
+test('heartbeatCorrupt: malformed-tail + older-valid-record walk → corrupt true AND freshness surfaces (codex round 1)', () => {
+  // Codex round 1 of triage on PR #16 caught this case. Pre-correction
+  // wording "...AND found no valid record..." would silently drop the
+  // corruption signal here — defeating the advisory's stated purpose.
+  // The corrected condition is "any malformed line seen during the walk."
+  const dir = mkTmp('hbc-malformed-plus-valid');
+  const manifestPath = writeManifest(dir, makeBaseManifest());
+  const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
+  fs.mkdirSync(phaseDir, { recursive: true });
+  const olderTs = new Date(Date.now() - 60_000).toISOString();
+  // Older valid impl record + newer corrupt tail. The walk encounters
+  // the malformed line first (corrupt = true), then salvages the
+  // older record. Both signals must surface.
+  fs.writeFileSync(
+    path.join(phaseDir, 'heartbeat.jsonl'),
+    JSON.stringify({ ts: olderTs, pid: 7777, role: 'impl' }) + '\n' +
+      '{ malformed-tail\n'
+  );
+  writeStatus(manifestPath, {
+    phases: { 'phase-1': { started_at: new Date().toISOString() } },
+  });
+  const result = checkHealth({
+    phaseId: 'phase-1', role: 'impl', manifestPath,
+    _pidLookup: () => 9999, _killer: KILLER_ALIVE,
+  });
+  assert.strictEqual(result.heartbeatCorrupt, true, 'corruption advisory rides alongside salvaged record');
+  assert.ok(
+    typeof result.heartbeatAge === 'number' && result.heartbeatAge >= 55 && result.heartbeatAge <= 65,
+    `freshness still surfaces (~60s); got ${result.heartbeatAge}s`
+  );
+});
+
+test('heartbeatCorrupt: wrong-role lines without malformation → corrupt false', () => {
+  // Validly-parsed JSON for another role is NOT corruption — it's a
+  // legitimate entry belonging to that other consumer.
+  const dir = mkTmp('hbc-wrong-role-clean');
+  const manifestPath = writeManifest(dir, makeBaseManifest());
+  const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
+  fs.mkdirSync(phaseDir, { recursive: true });
+  const ts = new Date(Date.now() - 30_000).toISOString();
+  fs.writeFileSync(
+    path.join(phaseDir, 'heartbeat.jsonl'),
+    JSON.stringify({ ts, pid: 1, role: 'qa' }) + '\n' +
+      JSON.stringify({ ts, pid: 2, role: 'impl' }) + '\n'
+  );
+  writeStatus(manifestPath, {
+    phases: { 'phase-1': { started_at: new Date().toISOString() } },
+  });
+  const result = checkHealth({
+    phaseId: 'phase-1', role: 'impl', manifestPath,
+    _pidLookup: () => 9999, _killer: KILLER_ALIVE,
+  });
+  assert.strictEqual(result.heartbeatCorrupt, false);
+});
+
+test('heartbeatCorrupt: parseHeartbeatTail role-filter return shape includes corrupt', () => {
+  // Direct unit test on the helper. Verifies the contract change: the
+  // role-filter return now carries `corrupt`. Strict-tail mode is
+  // unchanged (no role argument).
+  const ts = '2026-04-29T05:00:00Z';
+  // Clean walk
+  const clean = parseHeartbeatTail(
+    JSON.stringify({ ts, pid: 1, role: 'impl' }) + '\n',
+    { role: 'impl' }
+  );
+  assert.deepStrictEqual(clean, { tsMs: Date.parse(ts), pid: 1, corrupt: false });
+
+  // Malformed-only walk → object with null tsMs/pid + corrupt true
+  const malformed = parseHeartbeatTail('{ broken\n', { role: 'impl' });
+  assert.deepStrictEqual(malformed, { tsMs: null, pid: null, corrupt: true });
+
+  // Salvaged record with corruption → corrupt true alongside record
+  const salvaged = parseHeartbeatTail(
+    JSON.stringify({ ts, pid: 1, role: 'impl' }) + '\n{ broken\n',
+    { role: 'impl' }
+  );
+  assert.strictEqual(salvaged.tsMs, Date.parse(ts));
+  assert.strictEqual(salvaged.corrupt, true);
+});
+
+// =========================================================================
+// L1 — schema_version + errorKind contract (todos 072 + 075)
+// =========================================================================
+
+test('schema_version: success-path output has the documented V1 field set', () => {
+  // Todo 075 snapshot test (PR #17). Future field renames break this
+  // loudly. The full V1 success-path field set is the order
+  // schema_version → alive → pidAlive → pidAliveReason → timedOut →
+  // heartbeatAge → heartbeatStale → heartbeatCorrupt → lastCheckpoint.
+  // Error-path responses additionally carry `error` + `errorKind`
+  // (covered separately).
+  const dir = mkTmp('schema-success');
+  const manifestPath = writeManifest(dir, makeBaseManifest());
+  const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
+  fs.mkdirSync(phaseDir, { recursive: true });
+  fs.writeFileSync(path.join(phaseDir, 'work.md'), 'hi');
+  writeStatus(manifestPath, {
+    phases: { 'phase-1': { started_at: new Date().toISOString() } },
+  });
+
+  const result = checkHealth({
+    phaseId: 'phase-1', role: 'impl', manifestPath,
+    _pidLookup: () => 9999, _killer: KILLER_ALIVE,
+  });
+
+  assert.strictEqual(result.schema_version, 1, 'schema_version must equal 1');
+  // The first key in JSON serialization order.
+  assert.strictEqual(
+    Object.keys(result)[0],
+    'schema_version',
+    'schema_version must be the first field of the output'
+  );
+  // Pin the success-path field set. If a future PR renames or removes a
+  // field, this assertion fails loudly.
+  assert.deepStrictEqual(
+    Object.keys(result),
+    [
+      'schema_version',
+      'alive',
+      'pidAlive',
+      'pidAliveReason',
+      'timedOut',
+      'heartbeatAge',
+      'heartbeatStale',
+      'heartbeatCorrupt',
+      'lastCheckpoint',
+    ],
+    'V1 success-path field set drift — bump schema_version and update --help (todo 076) before changing.'
+  );
+  // Theme 1 coherence invariants:
+  assert.strictEqual(
+    result.pidAliveReason,
+    null,
+    'pidAliveReason must be null when pidAlive is true (only set on null)'
+  );
+  assert.strictEqual(result.error, undefined, 'no error on success path');
+  assert.strictEqual(
+    result.errorKind,
+    undefined,
+    'errorKind only set when error set'
+  );
+});
+
+test('schema_version: pre-flight config error carries schema_version + errorKind', () => {
+  const result = checkHealth({
+    phaseId: 'phase-1', role: 'impl',
+    manifestPath: path.join(os.tmpdir(), 'definitely-not-here-xyz.yaml'),
+  });
+  assert.strictEqual(result.schema_version, 1);
+  assert.strictEqual(Object.keys(result)[0], 'schema_version');
+  assert.strictEqual(result.errorKind, 'config');
+});
+
+test('schema_version: mid-flight runtime error carries schema_version + errorKind=runtime', () => {
+  const dir = mkTmp('schema-runtime-err');
+  const manifestPath = writeManifest(dir, makeBaseManifest());
+  // Do NOT create the phase directory.
+  writeStatus(manifestPath, {
+    phases: { 'phase-1': { pid: 9999, started_at: new Date().toISOString() } },
+  });
+  const result = checkHealth({
+    phaseId: 'phase-1', role: 'impl', manifestPath,
+    _pidLookup: () => 9999, _killer: KILLER_ALIVE,
+  });
+  assert.strictEqual(result.schema_version, 1);
+  assert.strictEqual(result.errorKind, 'runtime');
+  // Theme 1 coherence: pidAlive + heartbeatAge are still meaningfully
+  // populated on runtime errors so a debugger sees the partial signal.
+  assert.strictEqual(result.pidAlive, true, 'pidAlive populated for runtime-error diagnostics');
+});
+
+// =========================================================================
+// L2 — pidAliveReason tri-state contract (todo 071)
+// =========================================================================
+//
+// Per the dispatch's invariants:
+//   - WMI lookup-null past startup grace → pidAlive: null + 'session_not_found'
+//     (BEHAVIOR CHANGE vs PR #15)
+//   - ESRCH from kill(pid, 0) STAYS pidAlive: false (strongest dead signal)
+//   - lookup throw → null + 'lookup_failed'
+//   - within startup grace → null + 'startup_grace'
+//
+// The behavior-change tests live in section L (above). This section
+// covers the three pidAliveReason values + the ESRCH-stays-false
+// invariant + the pidAliveReason: null-when-known cases.
+
+test('pidAliveReason: startup_grace when within grace window', () => {
+  const dir = mkTmp('par-startup-grace');
+  const manifestPath = writeManifest(dir, makeBaseManifest());
+  const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
+  fs.mkdirSync(phaseDir, { recursive: true });
+  writeStatus(manifestPath, {
+    phases: { 'phase-1': { started_at: new Date(Date.now() - 5_000).toISOString() } },
+  });
+  const result = checkHealth({
+    phaseId: 'phase-1', role: 'impl', manifestPath,
+    _pidLookup: () => null, _killer: KILLER_ALIVE,
+  });
+  assert.strictEqual(result.pidAlive, null);
+  assert.strictEqual(result.pidAliveReason, 'startup_grace');
+});
+
+test('pidAliveReason: lookup_failed when lookup runner throws', () => {
+  const dir = mkTmp('par-lookup-throw');
+  const manifestPath = writeManifest(dir, makeBaseManifest());
+  const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
+  fs.mkdirSync(phaseDir, { recursive: true });
+  writeStatus(manifestPath, {
+    phases: { 'phase-1': { started_at: new Date().toISOString() } },
+  });
+  const result = checkHealth({
+    phaseId: 'phase-1', role: 'impl', manifestPath,
+    _pidLookup: () => { throw new Error('powershell timeout'); },
+    _killer: KILLER_ALIVE,
+  });
+  assert.strictEqual(result.pidAlive, null);
+  assert.strictEqual(result.pidAliveReason, 'lookup_failed');
+});
+
+test('pidAliveReason: session_not_found when WMI miss past grace', () => {
+  const dir = mkTmp('par-session-not-found');
+  const manifestPath = writeManifest(dir, makeBaseManifest());
+  const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
+  fs.mkdirSync(phaseDir, { recursive: true });
+  writeStatus(manifestPath, {
+    phases: { 'phase-1': { started_at: new Date(Date.now() - 5 * 60_000).toISOString() } },
+  });
+  const result = checkHealth({
+    phaseId: 'phase-1', role: 'impl', manifestPath,
+    _pidLookup: () => null, _killer: KILLER_ALIVE,
+  });
+  assert.strictEqual(result.pidAlive, null);
+  assert.strictEqual(result.pidAliveReason, 'session_not_found');
+});
+
+test('pidAliveReason: ESRCH from kill stays pidAlive: false (NOT null) — strongest dead signal invariant', () => {
+  // The dispatch's ESRCH invariant: when we have a real PID and the
+  // kernel says ESRCH, that's the strongest "dead" signal possible.
+  // Do NOT downgrade to null + 'session_not_found'. The tri-state
+  // null is reserved for cases where we genuinely couldn't decide.
+  const dir = mkTmp('par-esrch-stays-false');
+  const manifestPath = writeManifest(dir, makeBaseManifest());
+  const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
+  fs.mkdirSync(phaseDir, { recursive: true });
+  writeStatus(manifestPath, {
+    phases: { 'phase-1': { started_at: new Date().toISOString() } },
+  });
+  const result = checkHealth({
+    phaseId: 'phase-1', role: 'impl', manifestPath,
+    _pidLookup: () => 9999, _killer: KILLER_DEAD, // ESRCH path
+  });
+  assert.strictEqual(result.pidAlive, false, 'ESRCH stays false (strongest dead signal)');
+  assert.strictEqual(result.pidAliveReason, null, 'no reason channel when pidAlive is a definitive false');
+});
+
+test('pidAliveReason: kill returns unknown errno → null + lookup_failed', () => {
+  // isPidAlive returns null for any errno that isn't ESRCH or EPERM
+  // (kernel reported something we can't interpret). That's "couldn't
+  // decide" — same wire value as a runner failure (Unit 11 treats
+  // both as re-poll).
+  const dir = mkTmp('par-kill-unknown-errno');
+  const manifestPath = writeManifest(dir, makeBaseManifest());
+  const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
+  fs.mkdirSync(phaseDir, { recursive: true });
+  writeStatus(manifestPath, {
+    phases: { 'phase-1': { started_at: new Date().toISOString() } },
+  });
+  const killerUnknownErrno = () => {
+    const e = new Error('kernel returned unknown errno');
+    e.code = 'EWHAT'; // not ESRCH, not EPERM
+    throw e;
+  };
+  const result = checkHealth({
+    phaseId: 'phase-1', role: 'impl', manifestPath,
+    _pidLookup: () => 9999, _killer: killerUnknownErrno,
+  });
+  assert.strictEqual(result.pidAlive, null);
+  assert.strictEqual(result.pidAliveReason, 'lookup_failed');
+});
+
+test('pidAliveReason: null when pidAlive is true (no reason for known-alive)', () => {
+  const dir = mkTmp('par-true-no-reason');
+  const manifestPath = writeManifest(dir, makeBaseManifest());
+  const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
+  fs.mkdirSync(phaseDir, { recursive: true });
+  writeStatus(manifestPath, {
+    phases: { 'phase-1': { started_at: new Date().toISOString() } },
+  });
+  const result = checkHealth({
+    phaseId: 'phase-1', role: 'impl', manifestPath,
+    _pidLookup: () => 9999, _killer: KILLER_ALIVE,
+  });
+  assert.strictEqual(result.pidAlive, true);
+  assert.strictEqual(result.pidAliveReason, null);
+});
+
+// =========================================================================
+// M2 — Unit 11 batching seams (todo 086)
+// =========================================================================
+
+test('checkHealth: _loadedManifest bypasses loadManifest entirely', () => {
+  // No on-disk manifest exists. With _loadedManifest provided, the
+  // existsSync probe and loadManifest call are both skipped — the
+  // checkHealth result reflects the in-memory manifest verbatim.
+  const dir = mkTmp('seam-loaded-manifest');
+  const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
+  fs.mkdirSync(phaseDir, { recursive: true });
+  fs.writeFileSync(path.join(phaseDir, 'work.md'), 'hi');
+
+  const fakeManifestPath = path.join(dir, 'NOT-ON-DISK.yaml');
+  const inMemoryManifest = {
+    name: 'in-memory',
+    phases: [
+      { id: 'phase-1', completion_signal: 'docs/orchestration/phases/phase-1/done.md',
+        timeout_minutes: 60, agents: [{ role: 'impl' }] },
+    ],
+  };
+
+  const result = checkHealth({
+    phaseId: 'phase-1', role: 'impl', manifestPath: fakeManifestPath,
+    _loadedManifest: inMemoryManifest,
+    _pidLookup: () => 9999, _killer: KILLER_ALIVE,
+    _loadedStatus: null, // no status file expected; declare it explicitly
+  });
+  assert.strictEqual(result.error, undefined, 'no manifest-not-found error when _loadedManifest provided');
+  assert.strictEqual(result.lastCheckpoint, 'work.md');
+});
+
+test('checkHealth: _loadedStatus null short-circuits readPhaseStatus', () => {
+  // Caller declares "no status file". The _readFileSync seam would
+  // throw if invoked — so its non-invocation is the assertion.
+  const dir = mkTmp('seam-loaded-status-null');
+  const manifestPath = writeManifest(dir, makeBaseManifest());
+  const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
+  fs.mkdirSync(phaseDir, { recursive: true });
+  fs.writeFileSync(path.join(phaseDir, 'work.md'), 'hi');
+
+  let readFileCalls = 0;
+  const result = checkHealth({
+    phaseId: 'phase-1', role: 'impl', manifestPath,
+    _loadedStatus: null,
+    _readFileSync: (...args) => {
+      // Heartbeat path read is OK; status path read MUST not happen.
+      readFileCalls++;
+      return fs.readFileSync(...args);
+    },
+    _pidLookup: () => 9999, _killer: KILLER_ALIVE,
+  });
+  // No status file present anyway, but the seam ensures we never asked.
+  assert.strictEqual(result.alive, true);
+  // The heartbeat probe may or may not call readFileSync (no heartbeat
+  // file exists in this fixture), so the assertion is upper-bounded by
+  // "1 read at most" rather than 0. The point is the status path was
+  // not consulted via readPhaseStatus.
+  assert.ok(readFileCalls <= 1, `expected status-path read to be skipped, got ${readFileCalls} reads`);
+});
+
+test('checkHealth: _loadedStatus object indexes phases by phaseId', () => {
+  const dir = mkTmp('seam-loaded-status-obj');
+  const manifestPath = writeManifest(dir, makeBaseManifest());
+  const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
+  fs.mkdirSync(phaseDir, { recursive: true });
+  fs.writeFileSync(path.join(phaseDir, 'work.md'), 'hi');
+
+  // 1-hour-old started_at against the default 60min timeout → timed out.
+  const oldStart = new Date(Date.now() - 61 * 60_000).toISOString();
+  const inMemoryStatus = {
+    phases: { 'phase-1': { started_at: oldStart, pid: 9999 } },
+  };
+
+  const result = checkHealth({
+    phaseId: 'phase-1', role: 'impl', manifestPath,
+    _loadedStatus: inMemoryStatus,
+    _pidLookup: () => 9999, _killer: KILLER_ALIVE,
+  });
+  assert.strictEqual(result.timedOut, true, 'started_at from injected status drives timeout');
+});
+
+test('checkHealth: _pidSnapshot Map provides PID without invoking _pidLookup', () => {
+  const dir = mkTmp('seam-pid-snapshot-map');
+  const manifestPath = writeManifest(dir, makeBaseManifest());
+  const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
+  fs.mkdirSync(phaseDir, { recursive: true });
+  fs.writeFileSync(path.join(phaseDir, 'work.md'), 'hi');
+  writeStatus(manifestPath, {
+    phases: { 'phase-1': { started_at: new Date().toISOString() } },
+  });
+
+  let lookupCalls = 0;
+  const snapshot = new Map([['orch-phase-1-impl', { pid: 7777, parentPid: 1 }]]);
+  const result = checkHealth({
+    phaseId: 'phase-1', role: 'impl', manifestPath,
+    _pidSnapshot: snapshot,
+    _pidLookup: () => { lookupCalls++; return 9999; },
+    _killer: KILLER_ALIVE,
+  });
+  assert.strictEqual(lookupCalls, 0, '_pidSnapshot must short-circuit the lookup path');
+  assert.strictEqual(result.pidAlive, true);
+});
+
+test('checkHealth: _pidSnapshot missing entry past grace → null + reason session_not_found', () => {
+  // The snapshot is authoritative (the orchestrator covered the whole
+  // tick with one upstream WMI call). A missing entry past grace
+  // surfaces the same way as a real WMI miss past grace:
+  // pidAlive: null + reason 'session_not_found' (todo 071 behavior
+  // change — pre-PR-#17 was pidAlive: false). Unit 11's tri-state
+  // convergence ("two consecutive nulls past grace = crash") applies.
+  const dir = mkTmp('seam-pid-snapshot-miss');
+  const manifestPath = writeManifest(dir, makeBaseManifest());
+  const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
+  fs.mkdirSync(phaseDir, { recursive: true });
+  const oldStart = new Date(Date.now() - 5 * 60_000).toISOString();
+  writeStatus(manifestPath, {
+    phases: { 'phase-1': { started_at: oldStart } },
+  });
+
+  const result = checkHealth({
+    phaseId: 'phase-1', role: 'impl', manifestPath,
+    _pidSnapshot: new Map(), // empty — no entry for this session
+    startupGraceMs: 60_000, // 1min — well under the 5min started_at
+  });
+  assert.strictEqual(result.pidAlive, null);
+  assert.strictEqual(result.pidAliveReason, 'session_not_found');
+  assert.strictEqual(result.alive, false);
+});
+
+test('checkHealth: _pidSnapshot accepts plain-object form too (ergonomic)', () => {
+  const dir = mkTmp('seam-pid-snapshot-obj');
+  const manifestPath = writeManifest(dir, makeBaseManifest());
+  const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
+  fs.mkdirSync(phaseDir, { recursive: true });
+  fs.writeFileSync(path.join(phaseDir, 'work.md'), 'hi');
+  writeStatus(manifestPath, {
+    phases: { 'phase-1': { started_at: new Date().toISOString() } },
+  });
+
+  const snapshot = { 'orch-phase-1-impl': { pid: 4242 } };
+  const result = checkHealth({
+    phaseId: 'phase-1', role: 'impl', manifestPath,
+    _pidSnapshot: snapshot,
+    _killer: KILLER_ALIVE,
+  });
+  assert.strictEqual(result.pidAlive, true);
+});
+
+// =========================================================================
 // N — CLI smoke (≤2 spawnSync invocations per todo 044)
 // =========================================================================
 
 const CLI_ENTRY = path.resolve(__dirname, 'check-health.js');
 
-test('CLI: --help prints usage and exits 0', () => {
+test('CLI: --help prints usage, V1 schema, and tri-state semantics (todos 074 + 076)', () => {
   const r = spawnSync(process.execPath, [CLI_ENTRY, '--help'], { encoding: 'utf8' });
   assert.strictEqual(r.status, 0);
   assert.match(r.stdout, /Usage:/);
   assert.match(r.stdout, /--phase/);
+  // Todo 074 — timing flags surface in --help.
+  assert.match(r.stdout, /--startup-grace-ms/);
+  assert.match(r.stdout, /--heartbeat-stale-ms/);
+  // Todo 076 — OUTPUT section pins the V1 schema and tri-state.
+  assert.match(r.stdout, /OUTPUT \(schema_version: 1\)/);
+  assert.match(r.stdout, /pidAlive .*true \| false \| null/);
+  assert.match(r.stdout, /pidAliveReason/);
+  assert.match(r.stdout, /startup_grace/);
+  assert.match(r.stdout, /lookup_failed/);
+  assert.match(r.stdout, /session_not_found/);
+  assert.match(r.stdout, /errorKind/);
+  assert.match(r.stdout, /heartbeatCorrupt/);
+  assert.match(r.stdout, /heartbeatAge/);
+  // Tri-state policy: "do not trigger recovery on a single null."
+  assert.match(r.stdout, /must NOT trigger\s+recovery/);
+  // Worked example block is present.
+  assert.match(r.stdout, /Worked example/);
+  assert.match(r.stdout, /"schema_version": 1/);
+});
+
+// -------------------------------------------------------------------------
+// CLI parser (todo 074 — in-process, no spawnSync)
+// -------------------------------------------------------------------------
+
+function makeArgv(...rest) {
+  // process.argv[0] = node, [1] = script; parseCliArgs starts at index 2.
+  return ['node', 'check-health.js', ...rest];
+}
+
+test('parseCliArgs: required flags only — startup/heartbeat are undefined', () => {
+  const args = parseCliArgs(makeArgv('--phase', 'p1', '--role', 'impl', '--manifest', '/m'));
+  assert.strictEqual(args.phaseId, 'p1');
+  assert.strictEqual(args.role, 'impl');
+  assert.strictEqual(args.manifestPath, '/m');
+  assert.strictEqual(args.startupGraceMs, undefined);
+  assert.strictEqual(args.heartbeatStaleMs, undefined);
+});
+
+test('parseCliArgs: --startup-grace-ms and --heartbeat-stale-ms parse as integers', () => {
+  const args = parseCliArgs(
+    makeArgv(
+      '--phase', 'p1', '--role', 'impl', '--manifest', '/m',
+      '--startup-grace-ms', '30000',
+      '--heartbeat-stale-ms', '120000'
+    )
+  );
+  assert.strictEqual(args.startupGraceMs, 30000);
+  assert.strictEqual(args.heartbeatStaleMs, 120000);
+});
+
+test('parseCliArgs: --startup-grace-ms 0 is a valid explicit zero override (not "use default")', () => {
+  // Empty-string-as-explicit-override regression class. `0` differs from
+  // `undefined` (= default) and from `''` (= operator typo). The library
+  // accepts 0 as a valid grace window; the CLI must too.
+  const args = parseCliArgs(
+    makeArgv(
+      '--phase', 'p1', '--role', 'impl', '--manifest', '/m',
+      '--startup-grace-ms', '0'
+    )
+  );
+  assert.strictEqual(args.startupGraceMs, 0);
+});
+
+test('parseCliArgs: rejects negative integers', () => {
+  assert.throws(
+    () => parseCliArgs(
+      makeArgv('--phase', 'p1', '--role', 'impl', '--manifest', '/m',
+        '--startup-grace-ms', '-5')
+    ),
+    /must be a non-negative integer/
+  );
+});
+
+test('parseCliArgs: rejects non-integer values (1.5, NaN)', () => {
+  assert.throws(
+    () => parseCliArgs(
+      makeArgv('--phase', 'p1', '--role', 'impl', '--manifest', '/m',
+        '--heartbeat-stale-ms', '1.5')
+    ),
+    /must be a non-negative integer/
+  );
+  assert.throws(
+    () => parseCliArgs(
+      makeArgv('--phase', 'p1', '--role', 'impl', '--manifest', '/m',
+        '--heartbeat-stale-ms', 'NaN')
+    ),
+    /must be a non-negative integer/
+  );
+});
+
+test('parseCliArgs: rejects empty string and whitespace-only values', () => {
+  // Empty string would otherwise coerce via Number('') === 0 — but that
+  // looks like an explicit zero, when it really means "operator forgot
+  // the value." Trim+empty → loud error rather than silent default.
+  assert.throws(
+    () => parseNonNegativeIntFlag('--startup-grace-ms', ''),
+    /requires a non-negative integer/
+  );
+  assert.throws(
+    () => parseNonNegativeIntFlag('--startup-grace-ms', '   '),
+    /requires a non-negative integer/
+  );
+  assert.throws(
+    () => parseNonNegativeIntFlag('--startup-grace-ms', undefined),
+    /requires a non-negative integer/
+  );
+});
+
+test('parseCliArgs: --startup-grace-ms threads through to checkHealth library API', () => {
+  // Round-trip: parser produces { startupGraceMs }, the value is accepted
+  // by the library and shapes the verdict. The startup-grace branch only
+  // fires when the pid lookup misses; with the lookup returning null and
+  // started_at within the grace window, pidAlive must be `null`.
+  const dir = mkTmp('cli-startup-grace-passthrough');
+  const manifestPath = writeManifest(dir, makeBaseManifest());
+  const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
+  fs.mkdirSync(phaseDir, { recursive: true });
+  // started_at very recent (well within any grace > 0).
+  writeStatus(manifestPath, {
+    phases: { 'phase-1': { started_at: new Date().toISOString() } },
+  });
+
+  const args = parseCliArgs(
+    makeArgv(
+      '--phase', 'phase-1', '--role', 'impl', '--manifest', manifestPath,
+      '--startup-grace-ms', '120000' // 2 minutes
+    )
+  );
+  // Verify in-process pass-through: the library honors the override.
+  const result = checkHealth({
+    phaseId: args.phaseId,
+    role: args.role,
+    manifestPath: args.manifestPath,
+    startupGraceMs: args.startupGraceMs,
+    _pidLookup: () => null, // miss — startup-grace branch
+  });
+  assert.strictEqual(result.pidAlive, null, 'within-grace miss → pidAlive: null');
+});
+
+test('parseCliArgs: --heartbeat-stale-ms threads through to checkHealth library API', () => {
+  const dir = mkTmp('cli-heartbeat-stale-passthrough');
+  const manifestPath = writeManifest(dir, makeBaseManifest());
+  const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
+  fs.mkdirSync(phaseDir, { recursive: true });
+  // Heartbeat 60 seconds old.
+  const ts = new Date(Date.now() - 60_000).toISOString();
+  fs.writeFileSync(
+    path.join(phaseDir, 'heartbeat.jsonl'),
+    JSON.stringify({ ts, pid: 9999, role: 'impl', message: 'tick' }) + '\n'
+  );
+  writeStatus(manifestPath, {
+    phases: { 'phase-1': { started_at: new Date().toISOString() } },
+  });
+
+  // 30s threshold → the 60s-old heartbeat counts as stale.
+  const args = parseCliArgs(
+    makeArgv(
+      '--phase', 'phase-1', '--role', 'impl', '--manifest', manifestPath,
+      '--heartbeat-stale-ms', '30000'
+    )
+  );
+  const result = checkHealth({
+    phaseId: args.phaseId,
+    role: args.role,
+    manifestPath: args.manifestPath,
+    heartbeatStaleMs: args.heartbeatStaleMs,
+    _pidLookup: () => 9999,
+    _killer: KILLER_ALIVE,
+  });
+  assert.strictEqual(result.heartbeatStale, true, '60s heartbeat with 30s threshold = stale');
 });
 
 test('CLI: happy-path invocation exits 0 with valid JSON status', () => {

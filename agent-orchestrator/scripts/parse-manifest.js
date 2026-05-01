@@ -82,6 +82,14 @@ const KNOWN_PHASE = new Set([
 const VALID_ID_RE = /^[A-Za-z0-9._-]+$/;
 const UNSAFE_ID_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
 
+// Authoritative role enum for V1. Mutating this requires updating every
+// consumer (check-health, spawn-session naming convention, prompt
+// generation) AND the V1.5 recovery-role addition path (see todo 085 +
+// the `'V1.5 territory'` rejection test in check-health.test.js). All
+// in-tree consumers `require` this constant so the canonical list lives
+// in exactly one file. Hoisted from check-health per todo 077 (PR #17).
+const VALID_ROLES = Object.freeze(['impl', 'qa', 'coord']);
+
 // -------------------- CLI entry --------------------
 
 function printHelp() {
@@ -647,6 +655,85 @@ function statusPathFor(manifestPath) {
   return path.join(dir, `${base}-status.yaml`);
 }
 
+/**
+ * Canonical reader for manifest-status.yaml. Argument is the MANIFEST
+ * path (NOT the status path) for symmetry with `runUpdate(manifestPath, …)`
+ * and `loadManifest(manifestPath)` — callers always hold the manifest
+ * path; the sibling status path is derived internally via
+ * `statusPathFor()`.
+ *
+ * Hoisted from check-health's `readPhaseStatus` per todo 069 (PR #17) so
+ * reader and writer (`runUpdate`) share normalization. Future hardenings
+ * (schema bumps, additional UNSAFE_ID_KEYS, normalization tweaks)
+ * propagate to all consumers via this single source of truth.
+ *
+ * Returns:
+ *   { ok: true, status, statusPath }
+ *     — `status === null` when the status file does not exist OR exists
+ *       but parses to a non-object root (lenient mode preserves
+ *       runUpdate's "treat as fresh" behavior).
+ *     — `status` is `{ ...rest, phases }` otherwise. `phases` is always
+ *       an Object.create(null)-prototyped map with UNSAFE_ID_KEYS
+ *       (`__proto__`, `prototype`, `constructor`) stripped.
+ *   { ok: false, error, statusPath }
+ *     — read failure (EACCES etc.) or YAML parse error. The `error`
+ *       string mirrors the format runUpdate emitted before the refactor
+ *       (`corrupt status file at <path>: <reason>`).
+ *
+ * `_readFileSync` / `_existsSync` are test-injection seams; production
+ * callers omit them.
+ */
+function loadStatus(manifestPath, { _readFileSync, _existsSync } = {}) {
+  const readFileSync = _readFileSync || fs.readFileSync;
+  const existsSync = _existsSync || fs.existsSync;
+  const statusPath = statusPathFor(path.resolve(manifestPath));
+  if (!existsSync(statusPath)) return { ok: true, status: null, statusPath };
+  let raw;
+  try {
+    raw = readFileSync(statusPath, 'utf8');
+  } catch (e) {
+    return {
+      ok: false,
+      error: `cannot read ${statusPath}: ${e.message}`,
+      statusPath,
+    };
+  }
+  let parsed;
+  try {
+    // Pinned to DEFAULT_SCHEMA for parity with loadManifest() and
+    // runUpdate()'s pre-refactor load — preserves merge keys (`<<`)
+    // and timestamps; making the choice explicit at every site
+    // documents intent.
+    parsed = yaml.load(raw, { schema: yaml.DEFAULT_SCHEMA });
+  } catch (e) {
+    return {
+      ok: false,
+      error: `corrupt status file at ${statusPath}: ${e.message}`,
+      statusPath,
+    };
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    // Empty doc / scalar / array root — treat as no usable status.
+    // runUpdate then writes a fresh shape; readers return null.
+    return { ok: true, status: null, statusPath };
+  }
+  // Normalize phases. Always produce an Object.create(null) map so
+  // downstream `status.phases[id]` indexing is safe regardless of the
+  // value of `id` (the prototype-pollution defense the writer side
+  // already had; readers were missing it pre-refactor).
+  let phases;
+  const rawPhases = parsed.phases;
+  if (!rawPhases || typeof rawPhases !== 'object' || Array.isArray(rawPhases)) {
+    phases = Object.create(null);
+  } else {
+    phases = Object.create(null);
+    for (const k of Object.keys(rawPhases)) {
+      if (!UNSAFE_ID_KEYS.has(k)) phases[k] = rawPhases[k];
+    }
+  }
+  return { ok: true, status: { ...parsed, phases }, statusPath };
+}
+
 // Phase-id validation (VALID_ID_RE / UNSAFE_ID_KEYS) is declared near
 // the top of this file and enforced by validate(). runUpdate still checks
 // the provided phaseId independently because the caller passes it on the
@@ -717,39 +804,18 @@ function runUpdate(manifestPath, phaseId, updates) {
       error: `retry_count must be an integer, got ${JSON.stringify(updates.retry_count)}`,
     };
 
-  const statusPath = statusPathFor(path.resolve(manifestPath));
-  let status = { phases: Object.create(null) };
-  if (fs.existsSync(statusPath)) {
-    const raw = fs.readFileSync(statusPath, 'utf8');
-    let parsed;
-    try {
-      // Pin schema explicitly for parity with the loadManifest() call
-      // above and spawn-session.js's launcher load — preserves merge
-      // keys (`<<`) and timestamps; making the choice explicit at every
-      // site documents intent.
-      parsed = yaml.load(raw, { schema: yaml.DEFAULT_SCHEMA });
-    } catch (e) {
-      return {
-        ok: false,
-        error: `corrupt status file at ${statusPath}: ${e.message}`,
-      };
-    }
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      status = parsed;
-      if (
-        !status.phases ||
-        typeof status.phases !== 'object' ||
-        Array.isArray(status.phases)
-      )
-        status.phases = Object.create(null);
-      else {
-        const safe = Object.create(null);
-        for (const k of Object.keys(status.phases))
-          if (!UNSAFE_ID_KEYS.has(k)) safe[k] = status.phases[k];
-        status.phases = safe;
-      }
-    }
-  }
+  // Reader is the canonical loadStatus path (todo 069). Errors propagate
+  // verbatim so the pre-refactor "corrupt status file at X: ..." message
+  // shape is preserved. `status === null` covers both "file does not
+  // exist" and "file parses to non-object root" (lenient — fresh write
+  // overwrites the unreadable shape).
+  const loadResult = loadStatus(manifestPath);
+  if (!loadResult.ok) return { ok: false, error: loadResult.error };
+  const status =
+    loadResult.status === null
+      ? { phases: Object.create(null) }
+      : loadResult.status;
+  const statusPath = loadResult.statusPath;
 
   const existing = status.phases[phaseId] || {};
   status.phases[phaseId] = { ...existing, ...updates };
@@ -796,7 +862,9 @@ module.exports = {
   analyzeDeps,
   normalizePhases,
   statusPathFor,
+  loadStatus,
   runUpdate,
   KNOWN_SHELLS,
   VALID_ID_RE,
+  VALID_ROLES,
 };

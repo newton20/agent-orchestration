@@ -527,23 +527,47 @@ test('parsePidLookupOutput: excludeWrappers also rejects powershell wrapper alon
   );
 });
 
-test('getSessionPid: throwOnError: true propagates runner errors (codex P1 round 5)', () => {
-  // Default mode swallows runner errors as null. Unit 8's health checker
-  // needs the failure to propagate so it can render pidAlive: null
-  // (couldn't tell) instead of false (confirmed crash).
+test('getSessionPid: throwOnError default true propagates runner errors (todo 073, PR #17)', () => {
+  // PR #17 flipped both defaults to `true` so external callers
+  // (check-health, future Unit 11, future recovery agent) get the
+  // safe-by-default behavior — runner errors propagate so the caller
+  // can render pidAlive: null ("couldn't tell") rather than conflate
+  // with "no matching process". The pre-#17 default-false swallowed
+  // errors as null; the swallowing path is still reachable via an
+  // explicit `throwOnError: false` override (used only by spawn-
+  // session's post-spawn lookup).
   const failingRunner = () => {
-    const e = new Error('powershell exited 1');
-    throw e;
+    throw new Error('powershell exited 1');
   };
-  // Default behavior: error swallowed, returns null.
+  // New default: error propagates.
+  assert.throws(
+    () => getSessionPid('orch-a', { _runner: failingRunner }),
+    /powershell exited 1/
+  );
+  // Explicit override restores the swallow-as-null path.
   assert.strictEqual(
-    getSessionPid('orch-a', { _runner: failingRunner }),
+    getSessionPid('orch-a', { _runner: failingRunner, throwOnError: false }),
     null
   );
-  // throwOnError: error propagates.
-  assert.throws(
-    () => getSessionPid('orch-a', { _runner: failingRunner, throwOnError: true }),
-    /powershell exited 1/
+});
+
+test('getSessionPid: excludeWrappers default true masks shell-wrapper-only matches (todo 073, PR #17)', () => {
+  // Pre-#17 default was false, which let the wrapper PID survive in
+  // the return value. PR #15 round 3 caught this masking a crashed
+  // agent as alive until the phase timeout. PR #17 makes
+  // excludeWrappers: true the safe default so a wrapper-only match
+  // returns null. spawn-session's own post-spawn lookup overrides
+  // explicitly to keep the pre-spawn-registration wrapper PID.
+  const wrapperOnly = JSON.stringify([
+    { ProcessId: 1234, CommandLine: 'cmd /k "claude --name orch-a"' },
+  ]);
+  const runner = () => wrapperOnly;
+  // New default: wrapper-only → null.
+  assert.strictEqual(getSessionPid('orch-a', { _runner: runner }), null);
+  // Explicit override restores the pre-#17 fallback to the wrapper PID.
+  assert.strictEqual(
+    getSessionPid('orch-a', { _runner: runner, excludeWrappers: false }),
+    1234
   );
 });
 
@@ -652,11 +676,16 @@ test('getSessionPid: uses injected runner with (program, argv), applies boundary
   assert.match(calls[0].argv[3], /Get-CimInstance Win32_Process/);
 });
 
-test('getSessionPid: returns null when runner throws', () => {
+test('getSessionPid: throwOnError: false explicit override swallows runner errors as null', () => {
+  // Pre-PR-#17 behavior: default throwOnError was false, runner errors
+  // surfaced as `null`. PR #17 flipped the default; the swallow path
+  // is still reachable via an explicit override (used only by
+  // spawn-session's own post-spawn lookup).
   const pid = getSessionPid('orch-x', {
     _runner: () => {
       throw new Error('powershell not found');
     },
+    throwOnError: false,
   });
   assert.strictEqual(pid, null);
 });

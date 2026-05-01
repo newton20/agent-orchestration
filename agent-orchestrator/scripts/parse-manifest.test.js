@@ -18,8 +18,10 @@ const {
   analyzeDeps,
   normalizePhases,
   statusPathFor,
+  loadStatus,
   runUpdate,
   VALID_ID_RE,
+  VALID_ROLES,
 } = require('./parse-manifest');
 const { FLAG_NAME_RE } = require('../hooks/session-start');
 
@@ -601,6 +603,98 @@ test('runUpdate: corrupt status file surfaces as error, not a crash', () => {
   assert.match(r.error, /corrupt status file/);
 });
 
+// -------------------- loadStatus (todo 069) --------------------
+
+test('loadStatus: missing status file → ok with status null', () => {
+  const file = write({ ...validMinimal });
+  const result = loadStatus(file);
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(result.status, null);
+  assert.match(result.statusPath, /-status\.yaml$/);
+});
+
+test('loadStatus: returns parsed status with phases map', () => {
+  const file = write({ ...validMinimal });
+  runUpdate(file, 'phase-0', { status: 'running', pid: 4242 });
+  const result = loadStatus(file);
+  assert.strictEqual(result.ok, true);
+  assert.ok(result.status);
+  assert.strictEqual(result.status.phases['phase-0'].status, 'running');
+  assert.strictEqual(result.status.phases['phase-0'].pid, 4242);
+});
+
+test('loadStatus: corrupt YAML → ok=false with corrupt-status-file error', () => {
+  const file = write({ ...validMinimal });
+  const statusPath = statusPathFor(path.resolve(file));
+  fs.writeFileSync(statusPath, '{ this is: not\n  valid yaml: [\n');
+  const result = loadStatus(file);
+  assert.strictEqual(result.ok, false);
+  assert.match(result.error, /corrupt status file/);
+});
+
+test('loadStatus: phases as array → status.phases coerced to empty map', () => {
+  const file = write({ ...validMinimal });
+  const statusPath = statusPathFor(path.resolve(file));
+  fs.writeFileSync(statusPath, yaml.dump({ phases: ['nope'] }));
+  const result = loadStatus(file);
+  assert.strictEqual(result.ok, true);
+  assert.ok(result.status);
+  assert.deepStrictEqual(Object.keys(result.status.phases), []);
+});
+
+test('loadStatus: __proto__ key under phases is dropped (no prototype pollution)', () => {
+  const file = write({ ...validMinimal });
+  const statusPath = statusPathFor(path.resolve(file));
+  // Hand-craft the YAML so the literal `__proto__` key reaches the
+  // loader — yaml.dump on an Object.create(null) map quotes it
+  // appropriately so js-yaml round-trips the key.
+  fs.writeFileSync(
+    statusPath,
+    'phases:\n' +
+      '  __proto__:\n' +
+      '    polluted: true\n' +
+      '  "phase-0":\n' +
+      '    status: running\n'
+  );
+  const result = loadStatus(file);
+  assert.strictEqual(result.ok, true);
+  assert.ok(result.status);
+  // The legitimate phase survives; the unsafe key is filtered.
+  assert.strictEqual(result.status.phases['phase-0'].status, 'running');
+  // The malicious payload must NOT have been written. Whether the phases
+  // map is null-prototyped (`__proto__` access returns undefined) or
+  // Object-prototyped (returns Object.prototype), what matters is that
+  // it does not carry the attacker-supplied { polluted: true } shape.
+  assert.notStrictEqual(
+    result.status.phases.__proto__ && result.status.phases.__proto__.polluted,
+    true,
+    'phases.__proto__ must not carry the malicious YAML payload'
+  );
+  assert.ok(
+    !Object.prototype.hasOwnProperty.call(result.status.phases, '__proto__'),
+    '__proto__ key must not appear as an own property on the phases map'
+  );
+  // Sanity-check: no global pollution either.
+  assert.strictEqual({}.polluted, undefined);
+});
+
+test('loadStatus: __proto__ filter survives end-to-end through readPhaseStatus', () => {
+  const { readPhaseStatus } = require('./check-health');
+  const file = write({ ...validMinimal });
+  const statusPath = statusPathFor(path.resolve(file));
+  fs.writeFileSync(
+    statusPath,
+    'phases:\n' +
+      '  __proto__:\n' +
+      '    polluted: true\n' +
+      '  "phase-0":\n' +
+      '    pid: 9999\n'
+  );
+  const entry = readPhaseStatus(file, 'phase-0');
+  assert.strictEqual(entry.pid, 9999);
+  assert.strictEqual({}.polluted, undefined);
+});
+
 // -------------------- Integration: the plugin's own example --------------------
 
 test('the plugin\'s schema/manifest-example.yaml validates', () => {
@@ -640,6 +734,25 @@ test('the prototype\'s manifest-example.yaml validates', () => {
 // share the same ID character class. The prose pointers above each constant
 // carry the contract; this test makes drift between them a CI failure
 // rather than a comment-review oversight. See docs/todos/006 + 027.
+// VALID_ROLES is hoisted from check-health to parse-manifest in PR #17 so
+// the V1.5 recovery-role addition becomes a single-file edit. The same
+// reference must be visible to check-health (which validates inputs
+// against this list) and the spawn-session naming convention.
+test('VALID_ROLES is exported, frozen, and contains the V1 role set', () => {
+  assert.ok(Array.isArray(VALID_ROLES), 'VALID_ROLES must be exported as an array');
+  assert.deepStrictEqual([...VALID_ROLES], ['impl', 'qa', 'coord']);
+  assert.ok(Object.isFrozen(VALID_ROLES), 'VALID_ROLES must be frozen so consumers cannot mutate it');
+});
+
+test('VALID_ROLES is the same reference imported by check-health', () => {
+  const fromCheckHealth = require('./check-health').VALID_ROLES;
+  assert.strictEqual(
+    fromCheckHealth,
+    VALID_ROLES,
+    'check-health re-exports the same VALID_ROLES reference; mutations or replacements must propagate'
+  );
+});
+
 test('VALID_ID_RE and FLAG_NAME_RE share the same ID character class', () => {
   assert.ok(VALID_ID_RE instanceof RegExp, 'VALID_ID_RE must be exported as a RegExp');
   assert.ok(FLAG_NAME_RE instanceof RegExp, 'FLAG_NAME_RE must be exported as a RegExp');
