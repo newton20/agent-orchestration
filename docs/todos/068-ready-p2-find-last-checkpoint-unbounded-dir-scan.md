@@ -125,8 +125,14 @@ with 067 + 069-078 + 083 + 086.
 
 ## Acceptance Criteria
 
-- [ ] `findLastCheckpoint` on a phase directory with 50,000 files
-      completes in <10 ms (no `statSync` calls past the cap).
+- [ ] When `entries.length > 256`, the function executes ZERO
+      per-entry `statSync` calls (verifiable by injecting a
+      counting `_statSync` and asserting `count === 0` past the
+      cap). This is the safety property the cap is for; raw
+      enumeration cost via `readdirSync` is still O(N) but
+      bounded by NTFS MFT walk speed (~10s of ms even for
+      50,000 entries on a healthy disk), and is the same I/O
+      cost incurred today below the cap.
 - [ ] When `entries.length > 256`, the function returns `null` for
       `lastCheckpoint` and surfaces an advisory diagnostic (log
       line or returned in result).
@@ -137,6 +143,12 @@ with 067 + 069-078 + 083 + 086.
 - [ ] Implementation does NOT use name-sort + take-first as the
       cap strategy (would discard newest entries with
       timestamp-prefixed names).
+- [ ] **Optional follow-up:** if profiling shows raw enumeration
+      becomes the bottleneck (>100ms on observed phase dirs),
+      switch to bounded enumeration via `fs.opendirSync` +
+      per-entry `dir.readSync` with early exit at cap+1. Out of
+      scope for this todo; capture as a new pending todo if it
+      surfaces in production.
 
 ## Work Log
 
