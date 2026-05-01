@@ -57,12 +57,24 @@ the heartbeat-by-role contract in PR #15 itself.
 
 ### Option A — Add pidAliveReason field (recommended)
 
-Populate only when `pidAlive === null`. Values:
+Populate only when `pidAlive === null`. Values (snake_case wire
+form for JSON-output stability):
 
-- `'lookup-error'` — runner threw or returned malformed.
-- `'startup-grace'` — within grace window.
-- `'kill-unknown-errno'` — `kill(pid, 0)` returned an unrecognized
-  errno.
+- `'startup_grace'` — within startup grace window; PID lookup not
+  yet meaningful (deterministic resolve as agent registers in WMI).
+- `'lookup_failed'` — runner threw OR `kill(pid, 0)` returned an
+  unrecognized errno. Both are "couldn't determine"; folded into
+  one wire value because Unit 11 treats them identically (re-poll).
+- `'session_not_found'` — WMI lookup returned no match past startup
+  grace. **Behavior change vs PR #15:** today this surfaces as
+  `pidAlive: false`; with this todo applied, it surfaces as
+  `pidAlive: null` + `pidAliveReason: 'session_not_found'` so Unit
+  11's tri-state convergence applies. Past startup grace, Unit 11
+  treats this as a confirmed crash signal.
+
+Note: `kill(pid, 0)` returning ESRCH (definitively no such process)
+remains `pidAlive: false` — we had a PID and the kernel said it's
+gone; that's the strongest possible "dead" signal.
 
 Document as nullable so simple Unit 11 consumers can ignore it for
 the basic two-null heuristic; advanced consumers can read it.
@@ -125,13 +137,21 @@ Dispatch as part of the **pre-Unit-11 hardening PR bundle**.
 
 ## Acceptance Criteria
 
-- [ ] `result.pidAliveReason` is `'lookup-error'`,
-      `'startup-grace'`, or `'kill-unknown-errno'` whenever
+- [ ] `result.pidAliveReason` is `'startup_grace'`,
+      `'lookup_failed'`, or `'session_not_found'` whenever
       `pidAlive === null`.
 - [ ] When `pidAlive` is true or false, `pidAliveReason` is null
       or omitted.
-- [ ] One test per reason value.
-- [ ] Existing tri-state tests (true / false / null) unchanged.
+- [ ] One test per reason value (3 tests).
+- [ ] **Behavior change test:** WMI lookup returning null PAST
+      startup grace produces `pidAlive: null` +
+      `pidAliveReason: 'session_not_found'` (was `pidAlive: false`
+      pre-this-todo).
+- [ ] `kill(pid, 0)` returning ESRCH still produces `pidAlive: false`
+      (we had a PID and the kernel said it's gone; strongest dead
+      signal).
+- [ ] Existing tests for `pidAlive: true` (kill OK / EPERM)
+      unchanged.
 
 ## Work Log
 

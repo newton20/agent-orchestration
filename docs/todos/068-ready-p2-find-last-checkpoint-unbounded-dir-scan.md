@@ -50,17 +50,22 @@ a misbehaving role can pin a CPU core indefinitely.
 
 ### Option A — Cap entries (recommended)
 
-If `entries.length > MAX_ENTRIES` (e.g., 5000), log a warning and
-return the most recent N entries by NAME (skip stat). Names that
-sort by name often correlate with timestamp prefixes; even when
-they don't, returning *some* recent file beats hanging the
-orchestrator. Optionally fall back to "no checkpoint found" with
-a diagnostic.
+If `entries.length > MAX_ENTRIES` (e.g., 256), skip the stat
+phase entirely and return `null` plus an advisory diagnostic
+("phase dir overflowed — checkpoint untrustworthy"). Trying to
+pick a "best" name from N>cap entries is unsafe: timestamp-prefix
+naming sorts ascending so name-sort + take-first would discard
+the NEWEST entries, and even mtime-sort requires the stat'ing we
+were trying to bound. Past the cap the phase has clearly gone
+off the rails and the recovery anchor should signal that, not
+fabricate a confident-looking pick.
 
-- **Pros:** Bounded cost. Simple. No state. Defensible policy
-  ("phase dir exceeded sanity threshold").
-- **Cons:** May return a non-newest checkpoint when name order
-  doesn't match mtime order — but the alternative is hanging.
+- **Pros:** Bounded cost in the cap-exceeded branch (zero stats).
+  Safe-by-default (no incorrect "newest" claims). Defensible
+  policy ("phase dir exceeded sanity threshold; signal it").
+- **Cons:** Loses the checkpoint anchor entirely past the cap —
+  but at >256 files in a phase dir, the anchor was already
+  unreliable.
 - **Effort:** Small (~10 lines + 2 tests).
 - **Risk:** Low.
 
@@ -90,12 +95,19 @@ change.
 ## Recommended Action
 
 **Option A — approved 2026-04-29 by coord.** Cap entries scanned
-by `findLastCheckpoint` (default cap: 256). Sort `readdirSync`
-output by string-name (cheap, deterministic), take the first N
-entries, run `statSync` on those only. A phase directory with
-runaway log dumps (>256 files) gets a "checkpoint maybe stale —
-phase dir overflowed" advisory rather than blocking the polling
-hot path.
+by `findLastCheckpoint` (default cap: 256). When
+`entries.length > MAX_ENTRIES`, skip `statSync` entirely and
+return `null` plus a "checkpoint untrustworthy — phase dir
+overflowed" advisory rather than picking a wrong "newest" by
+name-sort. Below the cap, behavior is unchanged (full mtime
+scan).
+
+Codex round 1 (this PR) flagged that the original phrasing
+("sort by name, take first N") would silently discard the newest
+entries when filenames are timestamp-prefixed — recommend
+phase-dir-overflow as a binary "give up + signal it" instead of
+"guess from a sample." This todo's Option A and Acceptance
+Criteria reflect that fix.
 
 Option B (cache + invalidate by directory mtime) adds state +
 correctness risk on Windows where dir-mtime semantics vary by
@@ -108,19 +120,23 @@ with 067 + 069-078 + 083 + 086.
 
 - Affected file: `agent-orchestrator/scripts/check-health.js`
 - Site: lines 244-274 (`findLastCheckpoint`).
-- Suggested `MAX_ENTRIES` threshold: 5000.
+- `MAX_ENTRIES` threshold: 256 (per coord triage).
 - Test file to extend: `agent-orchestrator/scripts/check-health.test.js`
 
 ## Acceptance Criteria
 
 - [ ] `findLastCheckpoint` on a phase directory with 50,000 files
-      completes in <100 ms.
-- [ ] When entry count exceeds the cap, a warning diagnostic is
-      surfaced (log line or returned in result).
-- [ ] Phase directories with <5000 entries behave identically to
+      completes in <10 ms (no `statSync` calls past the cap).
+- [ ] When `entries.length > 256`, the function returns `null` for
+      `lastCheckpoint` and surfaces an advisory diagnostic (log
+      line or returned in result).
+- [ ] Phase directories with ≤256 entries behave identically to
       current implementation (same return value, same mtime
       comparison).
 - [ ] Empty directory still returns null/undefined as today.
+- [ ] Implementation does NOT use name-sort + take-first as the
+      cap strategy (would discard newest entries with
+      timestamp-prefixed names).
 
 ## Work Log
 

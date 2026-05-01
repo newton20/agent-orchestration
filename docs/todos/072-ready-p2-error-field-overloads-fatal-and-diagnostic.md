@@ -61,13 +61,13 @@ matcher.
 Two viable shapes:
 
 1. Replace `error` (string) with
-   `error: { kind: 'config' | 'transient', message: string } |
+   `error: { kind: 'config' | 'runtime', message: string } |
    null`.
 2. Keep `error` (string) AND add `errorKind: 'config' |
-   'transient' | null`.
+   'runtime' | null`.
 
 Either approach makes the policy decision crisp at the API
-boundary. `kind: 'config'` → pause + surface. `kind: 'transient'`
+boundary. `kind: 'config'` → pause + surface. `kind: 'runtime'`
 → count toward recovery heuristic but keep polling. Variant 2 is
 backward-compatible with any existing string consumer; variant 1
 is cleaner. Pick at triage.
@@ -129,7 +129,7 @@ Dispatch as part of the **pre-Unit-11 hardening PR bundle**.
 - [ ] When manifest is missing / invalid / phase absent,
       `errorKind === 'config'` (or equivalent shape).
 - [ ] When phase directory is missing on disk,
-      `errorKind === 'transient'` and `pidAlive`, `timedOut`,
+      `errorKind === 'runtime'` and `pidAlive`, `timedOut`,
       `heartbeatAge` are populated as today.
 - [ ] One test per case.
 - [ ] Existing error-message tests pass with adjusted assertions.

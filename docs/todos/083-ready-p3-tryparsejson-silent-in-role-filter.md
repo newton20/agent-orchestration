@@ -42,10 +42,22 @@ Set `heartbeatCorrupt: true` in the result when role-filter encountered any malf
 
 **Option A — approved 2026-04-29 by coord.** Add a
 `heartbeatCorrupt` boolean diagnostic to `checkHealth`'s return
-value. Set true when role-filter mode encountered any
-non-parseable lines AND found no valid record matching the role.
+value. Set true when role-filter mode encountered ANY
+non-parseable lines during the walk, regardless of whether a
+valid record was eventually found further back in the file.
 Distinguishes "no recent qa heartbeat" (no qa lines at all)
-from "qa heartbeat exists but is corrupted."
+from "qa heartbeat lines exist but the newest is corrupted"
+(operator-debugging signal preserved even when an older valid
+record salvages the freshness reading).
+
+Codex round 1 (this PR) flagged that the original phrasing
+("…AND found no valid record…") would silently drop the
+malformed-tail signal whenever an older valid record exists —
+defeating the diagnostic's stated purpose of surfacing
+corruption. The corrected condition is "any malformed line seen
+during the walk" — heartbeatCorrupt remains advisory
+(orthogonal to the heartbeat freshness signal), so reporting it
+alongside a recovered tsMs is the right shape.
 
 The diagnostic is informational, not policy-driving. Unit 11
 treats `heartbeatCorrupt: true` as a "possibly hung agent
@@ -69,8 +81,17 @@ Coord-pre-acked deviations: `process.kill(pid, 0)` over tasklist; `status.pid` i
 
 ## Acceptance Criteria
 
-- [ ] Either `heartbeatCorrupt` is exposed in role-filter mode results, or JSDoc documents the silent-skip behavior explicitly.
-- [ ] Tests cover the chosen behavior (corruption in role-filter walk).
+- [ ] `heartbeatCorrupt: true` whenever role-filter mode skipped
+      ANY non-parseable line during the walk — including the
+      case where an older valid record was eventually found
+      (the freshness reading still surfaces; the corruption
+      advisory rides alongside it).
+- [ ] `heartbeatCorrupt: false` (or unset) when the role-filter
+      walk encountered no malformed lines.
+- [ ] Strict-tail mode (no role filter) is unchanged — malformed
+      last line still returns null, no `heartbeatCorrupt` field.
+- [ ] Tests cover three cases: clean walk, malformed-tail-only
+      walk, malformed-tail + older-valid-record walk.
 
 ## Work Log
 

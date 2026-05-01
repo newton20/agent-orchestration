@@ -49,11 +49,16 @@ Multi-source-of-truth risk for the manifest-status contract.
 
 ### Option A — Add loadStatus to parse-manifest, reuse from check-health (recommended)
 
-Export `loadStatus(manifestDir) → { ok, status, error }` from
-`parse-manifest.js`. Refactor `runUpdate` to call it internally
+Export `loadStatus(manifestPath) → { ok, status, error }` from
+`parse-manifest.js`. The argument is `manifestPath` (NOT a status
+path or directory) for symmetry with `runUpdate(manifestPath, …)`
+and `loadManifest(manifestPath)` — `loadStatus` derives the
+sibling status path internally via `statusPathFor(manifestPath)`,
+so callers pass the same primary key the writer side already
+takes. Refactor `runUpdate` to call `loadStatus` internally
 (no behavior change). Reduce `check-health.js`'s `readPhaseStatus`
-to a thin wrapper that calls `loadStatus` and indexes into
-`status.phases[phaseId]`.
+to a thin wrapper that calls `loadStatus(manifestPath)` and
+indexes into `status.phases[phaseId]`.
 
 - **Pros:** Single source of truth. Future normalization added in
   one place flows to both consumers automatically. The
@@ -90,9 +95,14 @@ Document the discrepancy and revisit if/when a real bug surfaces.
 (or equivalent) to `parse-manifest.js`'s exports — the canonical
 manifest-status YAML loader with the same `__proto__` filter,
 shape validation, and YAML schema pin (DEFAULT_SCHEMA per todo
-031) that `runUpdate` uses on the writer side. Replace
-`check-health.js`'s inline parse + structural guards with
-`require('./parse-manifest').loadStatus(statusPath)`.
+031) that `runUpdate` uses on the writer side. The exported
+signature is `loadStatus(manifestPath) → { ok, status, error }`
+(NOT `loadStatus(statusPath)`) for symmetry with
+`runUpdate(manifestPath, …)` and `loadManifest(manifestPath)` —
+callers pass the manifest path; `loadStatus` derives the
+sibling status path internally. Replace `check-health.js`'s
+inline parse + structural guards with
+`require('./parse-manifest').loadStatus(manifestPath)`.
 
 Closes the reuse-discipline gap and ensures readers + writers
 share normalization. Future hardenings (e.g., schema version

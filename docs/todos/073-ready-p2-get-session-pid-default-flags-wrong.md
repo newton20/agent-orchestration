@@ -95,19 +95,26 @@ runtime warning when neither is set. Keep the defaults.
 
 ## Recommended Action
 
-**Option A — approved 2026-04-29 by coord.** Flip the defaults on
-`getSessionPid`:
+**Option A — approved 2026-04-29 by coord.** Flip BOTH defaults
+on `getSessionPid`:
 - `excludeWrappers: true` (was `false`) — every external caller
   wants the inner Claude process, not the cmd.exe / powershell.exe
-  / agency wrapper
-- `throwOnError: false` is already correct as default for callers
-  that need loop survival; verify this stays as default
+  / agency wrapper.
+- `throwOnError: true` (was `false`) — every external caller wants
+  runner failures to propagate so they can distinguish "lookup
+  errored, can't tell" from "no matching process, definitely
+  missing" (codex round 5 of PR #15 caught the conflation when
+  this defaulted false). Loop-survival concerns are addressed by
+  callers wrapping the call in try/catch and converting the throw
+  into a tri-state null at their layer (check-health does this
+  today at L520-535).
 
 Update the one internal caller in `spawn-session` that depended
-on the old `excludeWrappers: false` to pass `excludeWrappers:
-false` explicitly. That site loses default-friendliness in
-exchange for every external caller (check-health, future Unit 11,
-future recovery agent) getting the safe default.
+on the old defaults to pass `{ excludeWrappers: false,
+throwOnError: false }` explicitly. That site loses
+default-friendliness in exchange for every external caller
+(check-health, future Unit 11, future recovery agent) getting
+the safe default.
 
 Option B (move wrapper detection into checkHealth) duplicates
 logic that's correctly placed in spawn-session. Option C (footgun
