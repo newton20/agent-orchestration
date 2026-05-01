@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p3
 issue_id: "083"
 tags: [code-review, unit-8, check-health, observability, diagnostics]
@@ -40,7 +40,26 @@ Set `heartbeatCorrupt: true` in the result when role-filter encountered any malf
 
 ## Recommended Action
 
-_Pending triage._
+**Option A — approved 2026-04-29 by coord.** Add a
+`heartbeatCorrupt` boolean diagnostic to `checkHealth`'s return
+value. Set true when role-filter mode encountered any
+non-parseable lines AND found no valid record matching the role.
+Distinguishes "no recent qa heartbeat" (no qa lines at all)
+from "qa heartbeat exists but is corrupted."
+
+The diagnostic is informational, not policy-driving. Unit 11
+treats `heartbeatCorrupt: true` as a "possibly hung agent
+producing garbage" advisory, separate from the existing alive /
+heartbeatStale signals.
+
+Bundle with todos 071 (pidAliveReason), 072 (errorKind), 075
+(schema_version), 076 (--help) as a coherent V1 schema_version: 1
+definition for `checkHealth`'s output.
+
+Option B (document trade-off only) leaves the silent-skip in
+place; future debugging requires adding telemetry.
+
+Dispatch as part of the **pre-Unit-11 hardening PR bundle**.
 
 ## Technical Details
 

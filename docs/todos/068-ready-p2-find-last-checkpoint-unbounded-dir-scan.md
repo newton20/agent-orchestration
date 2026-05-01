@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "068"
 tags: [code-review, unit-8, check-health, performance, dos]
@@ -89,7 +89,20 @@ change.
 
 ## Recommended Action
 
-_Pending triage._
+**Option A — approved 2026-04-29 by coord.** Cap entries scanned
+by `findLastCheckpoint` (default cap: 256). Sort `readdirSync`
+output by string-name (cheap, deterministic), take the first N
+entries, run `statSync` on those only. A phase directory with
+runaway log dumps (>256 files) gets a "checkpoint maybe stale —
+phase dir overflowed" advisory rather than blocking the polling
+hot path.
+
+Option B (cache + invalidate by directory mtime) adds state +
+correctness risk on Windows where dir-mtime semantics vary by
+filesystem. Option C (defer) leaves the per-poll cost unbounded.
+
+Dispatch as part of the **pre-Unit-11 hardening PR bundle** along
+with 067 + 069-078 + 083 + 086.
 
 ## Technical Details
 

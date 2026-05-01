@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "069"
 tags: [code-review, unit-8, check-health, parse-manifest, reuse, single-source-of-truth]
@@ -86,7 +86,22 @@ Document the discrepancy and revisit if/when a real bug surfaces.
 
 ## Recommended Action
 
-_Pending triage._
+**Option A — approved 2026-04-29 by coord.** Add `loadStatus`
+(or equivalent) to `parse-manifest.js`'s exports — the canonical
+manifest-status YAML loader with the same `__proto__` filter,
+shape validation, and YAML schema pin (DEFAULT_SCHEMA per todo
+031) that `runUpdate` uses on the writer side. Replace
+`check-health.js`'s inline parse + structural guards with
+`require('./parse-manifest').loadStatus(statusPath)`.
+
+Closes the reuse-discipline gap and ensures readers + writers
+share normalization. Future hardenings (e.g., schema version
+bump) propagate to all consumers via one source of truth.
+
+Option B (apply UNSAFE_ID_KEYS inline in readPhaseStatus) preserves
+the duplication; Option C (defer) ships the same drift to Unit 11.
+
+Dispatch as part of the **pre-Unit-11 hardening PR bundle**.
 
 ## Technical Details
 

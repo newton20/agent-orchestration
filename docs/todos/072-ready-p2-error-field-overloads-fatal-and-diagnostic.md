@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "072"
 tags: [code-review, unit-8, check-health, api-contract, error-handling, unit-11-prep]
@@ -93,7 +93,24 @@ Unit 11 may rely on (e.g., "manifest not found", "phase id absent",
 
 ## Recommended Action
 
-_Pending triage._
+**Option A — approved 2026-04-29 by coord.** Add an `errorKind`
+discriminator to `checkHealth`'s return value when `error` is set.
+Values:
+- `'config'` — pre-flight config failure (manifest not found,
+  invalid YAML, phase id absent in manifest). Unit 11 should not
+  retry; the caller's config is broken.
+- `'runtime'` — mid-flight diagnostic (phase directory missing
+  but config valid; transient FS error). Unit 11 may retry or
+  treat as not-yet-spawned.
+
+Eliminates substring-matching against drifting message strings.
+The `error` field stays as the human-readable detail; `errorKind`
+becomes the machine-parseable policy switch.
+
+Bundle the schema-doc update with todo 075 (schema_version) + 076
+(--help) for a single coherent JSON-output story.
+
+Dispatch as part of the **pre-Unit-11 hardening PR bundle**.
 
 ## Technical Details
 

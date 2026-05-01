@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "077"
 tags: [code-review, unit-8, parse-manifest, single-source-of-truth, v1.5-prep]
@@ -87,7 +87,24 @@ Document in a comment near `VALID_ROLES` that V1.5 will add
 
 ## Recommended Action
 
-_Pending triage._
+**Option A — approved 2026-04-29 by coord.** Hoist `VALID_ROLES`
+to `parse-manifest.js`'s `module.exports` (analogous to how
+`VALID_ID_RE` was hoisted in PR #11). Update `check-health.js`
+and `spawn-session.js` to `require` it from parse-manifest rather
+than each maintaining their own copy. Document in the
+parse-manifest export comment: "Authoritative role enum;
+mutating this requires updating every consumer + the V1.5
+recovery role addition path (see todo 085)."
+
+Closes the future-V1.5-drift hazard captured in the codex
+review. The recovery role addition becomes a one-file edit in
+parse-manifest plus targeted updates per consumer that
+specifically exclude/include `recovery`.
+
+Option B (defer to V1.5 unit author) ships the duplication
+permanently into V1.
+
+Dispatch as part of the **pre-Unit-11 hardening PR bundle**.
 
 ## Technical Details
 

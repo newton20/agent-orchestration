@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p3
 issue_id: "086"
 tags: [code-review, unit-8, check-health, performance, unit-11-prep, batching]
@@ -47,7 +47,33 @@ Let Unit 11 wrap and bypass `checkHealth`'s internal loaders.
 
 ## Recommended Action
 
-_Pending triage._
+**Option A — approved 2026-04-29 by coord.** Add three injection
+seams to `checkHealth`'s opts:
+- `_loadedManifest` — already-loaded manifest object; if set,
+  skip `loadManifest(manifestPath)`
+- `_loadedStatus` — already-loaded manifest-status (per todo 069's
+  `loadStatus`); if set, skip the read
+- `_pidSnapshot` — already-fetched WMI/process-table snapshot
+  (Map<sessionName, {pid, parentPid, ...}>); if set, skip
+  `getSessionPid` invocation
+
+The underscore prefix signals "advanced caller (Unit 11) opt-in;
+not part of the everyday API." Default behavior unchanged for the
+CLI + simple programmatic callers.
+
+Unit 11 builds `pollAllPhases({manifest, status, snapshot})` once
+per tick; each per-phase `checkHealth` call passes the
+pre-loaded artifacts. Per-poll cost drops from O(N × disk +
+WMI per phase) to O(disk + WMI once + N × in-memory checks).
+
+Option B (defer) leaves Unit 11 to either (a) re-load every poll
+or (b) bypass the public surface entirely. Both are bad
+outcomes.
+
+Dispatch as part of the **pre-Unit-11 hardening PR bundle** —
+the underscore-prefix convention should land with the other
+pre-Unit-11 contracts so Unit 11's design has a complete
+batching API surface to consume.
 
 ## Technical Details
 

@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "067"
 tags: [code-review, unit-8, check-health, performance, security, dos]
@@ -99,7 +99,22 @@ periodically. No code change in `check-health.js`.
 
 ## Recommended Action
 
-_Pending triage._
+**Option A — approved 2026-04-29 by coord.** Replace the
+`readFileSync` of the entire file with a tail-read fixed-window
+read (e.g., open `r` mode, `fstatSync` → seek to `size - WINDOW`,
+read backward until enough lines for the role-filter, parse only
+that window). Window default: 64 KiB (sufficient for ~500 typical
+heartbeat lines at ~120 bytes each). Bounded memory regardless of
+file size; the supervisor can DoS-tolerate a runaway heartbeat
+writer.
+
+Option B (stat-and-skip ceiling) doesn't bound the parsed buffer
+once the ceiling is hit; if the ceiling is generous, the failure
+mode is "we parse less of the file" silently. Option C (defer to
+operator) leaves Unit 11's polling loop exposed.
+
+Dispatch as part of the **pre-Unit-11 hardening PR bundle** along
+with todos 068-078 + 083 + 086.
 
 ## Technical Details
 

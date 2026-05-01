@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "071"
 tags: [code-review, unit-8, check-health, api-contract, unit-11-prep]
@@ -91,7 +91,25 @@ the configured `startupGraceMs`.
 
 ## Recommended Action
 
-_Pending triage._
+**Option A — approved 2026-04-29 by coord.** Add a `pidAliveReason`
+field to `checkHealth`'s return value. When `pidAlive: null`,
+`pidAliveReason` is one of:
+- `'startup_grace'` — within startup grace window; PID lookup not
+  yet meaningful
+- `'lookup_failed'` — runner error or transient WMI/process.kill
+  failure; Unit 11 should re-poll
+- `'session_not_found'` — WMI lookup returned no match; spawned
+  process never started or already exited cleanly
+
+Document the convergence behavior expected for each in the JSON
+schema doc (see todo 075 + 076 — bundle): `startup_grace` →
+re-poll; `lookup_failed` → re-poll up to N times; `session_not_found`
++ post-grace → treat as crash.
+
+Closes the "Unit 11 re-derives startup-grace from started_at"
+duplication noted by codex.
+
+Dispatch as part of the **pre-Unit-11 hardening PR bundle**.
 
 ## Technical Details
 

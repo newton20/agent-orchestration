@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "078"
 tags: [code-review, unit-8, check-health, spawn-session, naming-convention, drift]
@@ -101,7 +101,26 @@ decide.
 
 ## Recommended Action
 
-_Pending triage._
+**Option A — approved 2026-04-29 by coord.** Pick `started_at`
+as the canonical name (already used by check-health's primary
+read path). Drop the `spawned_at` fallback. Update any other
+consumer that writes/reads the field to use `started_at` only.
+
+Specifically: review `runUpdate` in parse-manifest and any
+spawn-session writes to manifest-status.yaml. If they write
+`spawnedAt` (camelCase) or `spawned_at`, migrate to
+`started_at`. One canonical name; one write path; no fallback to
+hide future drift.
+
+Coordinates with todo 069 (loadStatus in parse-manifest) — both
+land in the parse-manifest reuse work, plus check-health's
+fallback removal.
+
+Option B (pick spawnedAt + migrate parse-manifest) is a larger
+edit with no semantic gain. Option C (keep fallback) ships the
+ambiguity into Unit 11's writer surface.
+
+Dispatch as part of the **pre-Unit-11 hardening PR bundle**.
 
 ## Technical Details
 

@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "070"
 tags: [code-review, unit-8, check-health, naming, clarity]
@@ -79,7 +79,20 @@ manifest.workdir`.
 
 ## Recommended Action
 
-_Pending triage._
+**Option A — approved 2026-04-29 by coord.** Rename
+`defaultPhaseDir(workdir, phaseId)` → `defaultPhaseDir(manifestDir,
+phaseId)` and update the JSDoc to explicitly state that protocol
+artifacts live under the manifest's directory (per Unit 3's
+scaffold-protocol convention), NOT under `manifest.workdir` (which
+is the spawned session's cwd, a different concept).
+
+Update the in-tree caller signature accordingly. The export shape
+changes only in parameter naming; behavior unchanged.
+
+Option B (keep name + JSDoc warning) preserves the misleading
+mental model in the public API.
+
+Dispatch as part of the **pre-Unit-11 hardening PR bundle**.
 
 ## Technical Details
 

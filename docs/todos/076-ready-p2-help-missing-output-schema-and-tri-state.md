@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "076"
 tags: [code-review, unit-8, check-health, cli, documentation, agent-native]
@@ -86,7 +86,27 @@ file.
 
 ## Recommended Action
 
-_Pending triage._
+**Option A — approved 2026-04-29 by coord.** Extend `printHelp`
+with an "Output schema" section documenting:
+- stdout is JSON, single object
+- All fields with type + meaning: `schema_version`, `alive`,
+  `pidAlive` (true | false | null with each null-reason),
+  `pidAliveReason` (when null), `timedOut`, `heartbeatAge`,
+  `heartbeatStale`, `heartbeatCorrupt` (per todo 083),
+  `lastCheckpoint`, `error` (when fatal), `errorKind` (per todo
+  072)
+- Exit code semantics: 0 = check completed (alive/dead carried
+  in JSON), 1 = validation/config error
+
+Bundle with todos 071, 072, 075, 083 as a coherent V1 schema
+definition. The --help text is the agent-facing contract for the
+JSON output; it should match the schema_version: 1 spec exactly.
+
+Option B (separate doc) makes the help text incomplete in the
+field where it's first read. Option C (defer) leaves operators
+reading source.
+
+Dispatch as part of the **pre-Unit-11 hardening PR bundle**.
 
 ## Technical Details
 

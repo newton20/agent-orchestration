@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "074"
 tags: [code-review, unit-8, check-health, cli, operator-dx]
@@ -86,7 +86,20 @@ script if they need to override these.
 
 ## Recommended Action
 
-_Pending triage._
+**Option A — approved 2026-04-29 by coord.** Add both
+`--startup-grace-ms` and `--heartbeat-stale-ms` to the CLI flag
+parser, threading values through to the library API's existing
+`startupGraceMs` / `heartbeatStaleMs` opts. Defaults match library
+defaults. Update `--help` (todo 076 will subsume this) to
+document the flags.
+
+Operators dogfooding cold-Claude or auth-blocked starts need both
+overrides without source edits. Symmetric with library API.
+
+Option B (only --startup-grace-ms) leaves heartbeat-stale tuning
+to recompile/edit. Option C (defer) leaves operators stuck.
+
+Dispatch as part of the **pre-Unit-11 hardening PR bundle**.
 
 ## Technical Details
 

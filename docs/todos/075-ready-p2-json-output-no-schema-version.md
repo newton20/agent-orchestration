@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "075"
 tags: [code-review, unit-8, check-health, api-versioning, agent-native]
@@ -89,7 +89,23 @@ Document that consumers should treat the JSON shape as unstable.
 
 ## Recommended Action
 
-_Pending triage._
+**Option A + Option B — approved 2026-04-29 by coord.** Add
+`schema_version: 1` as the first field of `checkHealth`'s return
+value. AND add a snapshot-style test that pins the field set
+(parses JSON output, asserts the keys match the documented
+schema). Both together: future renames break the snapshot
+loudly + consumers can detect breaking shape changes by reading
+`schema_version`.
+
+Bundle with todos 071 (`pidAliveReason`), 072 (`errorKind`), 076
+(--help schema doc), and 083 (`heartbeatCorrupt`) — these all
+extend the same JSON output. Land them as a coherent
+`schema_version: 1` definition.
+
+Option C (defer) ships V1 without a versioning anchor; future
+breakage is silent.
+
+Dispatch as part of the **pre-Unit-11 hardening PR bundle**.
 
 ## Technical Details
 

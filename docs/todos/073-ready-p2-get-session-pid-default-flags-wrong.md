@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "073"
 tags: [code-review, unit-8, spawn-session, api-defaults, footgun]
@@ -95,7 +95,25 @@ runtime warning when neither is set. Keep the defaults.
 
 ## Recommended Action
 
-_Pending triage._
+**Option A — approved 2026-04-29 by coord.** Flip the defaults on
+`getSessionPid`:
+- `excludeWrappers: true` (was `false`) — every external caller
+  wants the inner Claude process, not the cmd.exe / powershell.exe
+  / agency wrapper
+- `throwOnError: false` is already correct as default for callers
+  that need loop survival; verify this stays as default
+
+Update the one internal caller in `spawn-session` that depended
+on the old `excludeWrappers: false` to pass `excludeWrappers:
+false` explicitly. That site loses default-friendliness in
+exchange for every external caller (check-health, future Unit 11,
+future recovery agent) getting the safe default.
+
+Option B (move wrapper detection into checkHealth) duplicates
+logic that's correctly placed in spawn-session. Option C (footgun
++ explicit opts) preserves the current foot-gun.
+
+Dispatch as part of the **pre-Unit-11 hardening PR bundle**.
 
 ## Technical Details
 
