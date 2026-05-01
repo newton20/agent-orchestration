@@ -631,13 +631,28 @@ function checkHealth(opts = {}) {
     );
   if (typeof manifestPath !== 'string' || manifestPath.trim() === '')
     throw new Error('checkHealth: manifestPath is required (non-empty string)');
-  if (heartbeatStaleMs !== undefined && (!Number.isFinite(heartbeatStaleMs) || heartbeatStaleMs < 0))
+  // Library + CLI must agree on the type contract (PR #17 ce:review
+  // round 1: pre-fix the lib accepted any non-negative finite number
+  // while the CLI required a non-negative integer — agent consumers
+  // hitting the lib path could pass 30000.5 silently). Both knobs are
+  // documented as "non-negative integer milliseconds" in --help; pin
+  // Number.isInteger here so the contracts match.
+  if (
+    heartbeatStaleMs !== undefined &&
+    (!Number.isFinite(heartbeatStaleMs) ||
+      !Number.isInteger(heartbeatStaleMs) ||
+      heartbeatStaleMs < 0)
+  )
     throw new Error(
-      `checkHealth: heartbeatStaleMs must be a non-negative finite number, got ${JSON.stringify(heartbeatStaleMs)}`
+      `checkHealth: heartbeatStaleMs must be a non-negative integer, got ${JSON.stringify(heartbeatStaleMs)}`
     );
-  if (!Number.isFinite(startupGraceMs) || startupGraceMs < 0)
+  if (
+    !Number.isFinite(startupGraceMs) ||
+    !Number.isInteger(startupGraceMs) ||
+    startupGraceMs < 0
+  )
     throw new Error(
-      `checkHealth: startupGraceMs must be a non-negative finite number, got ${JSON.stringify(startupGraceMs)}`
+      `checkHealth: startupGraceMs must be a non-negative integer, got ${JSON.stringify(startupGraceMs)}`
     );
 
   const now = typeof _now === 'function' ? _now() : Date.now();
@@ -804,9 +819,13 @@ function checkHealth(opts = {}) {
   if (_pidSnapshot !== undefined) {
     // Batching seam (todo 086): the orchestrator handed us a Map (or
     // plain object) with the WMI snapshot for the whole tick. The
-    // snapshot is authoritative — a missing entry is "definitely not
-    // running" (no transient-failure case applies because the whole
-    // tick's snapshot succeeded as a single PowerShell call upstream).
+    // snapshot is authoritative for "did we observe this session in
+    // the snapshot?" — no transient-failure case applies because the
+    // whole tick's snapshot succeeded as a single PowerShell call
+    // upstream. Note: this only resolves `pid` from the snapshot;
+    // the startup-grace overlay below still fires when `started_at`
+    // is fresh, so a snapshot taken mid-spawn still surfaces as
+    // pidAlive: null + 'startup_grace' rather than 'session_not_found'.
     const entry =
       _pidSnapshot instanceof Map
         ? _pidSnapshot.get(expectedSessionName)
@@ -1030,7 +1049,9 @@ function printHelp() {
       '        - "session_not_found": WMI lookup returned no match',
       '          past startup grace; treat as crash on convergence.',
       '      null when pidAlive is true or false (no ambiguity to',
-      '      disambiguate).',
+      '      disambiguate). A single null reading is NEVER',
+      '      sufficient to trigger recovery — see pidAlive\'s',
+      '      tri-state convergence rule.',
       '',
       '  timedOut (boolean)',
       '      true when now - started_at > timeout_minutes. Independent',

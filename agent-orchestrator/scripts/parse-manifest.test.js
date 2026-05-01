@@ -738,6 +738,46 @@ test('the prototype\'s manifest-example.yaml validates', () => {
 // the V1.5 recovery-role addition becomes a single-file edit. The same
 // reference must be visible to check-health (which validates inputs
 // against this list) and the spawn-session naming convention.
+test('phase id of bare dots ("..", "...") rejected as path-traversal hazard (ce:review round 1)', () => {
+  // VALID_ID_RE allows `.` in the character class so timestamp-prefixed
+  // ids round-trip cleanly. But a bare `..` would resolve `<manifestDir>/
+  // docs/orchestration/phases/..` to the protocol root one level up.
+  const m1 = {
+    name: 'dotty',
+    phases: [{ id: '..', completion_signal: 'x.md', agent: { role: 'impl' } }],
+  };
+  const r1 = validate(m1);
+  assert.strictEqual(r1.valid, false);
+  assert.ok(
+    r1.errors.some((e) => /path-traversal/.test(e.message)),
+    'bare ".." must be rejected with a path-traversal error'
+  );
+  const m2 = {
+    name: 'dottier',
+    phases: [{ id: '...', completion_signal: 'x.md', agent: { role: 'impl' } }],
+  };
+  const r2 = validate(m2);
+  assert.strictEqual(r2.valid, false);
+  // Single dot is also rejected.
+  const m3 = {
+    name: 'dot',
+    phases: [{ id: '.', completion_signal: 'x.md', agent: { role: 'impl' } }],
+  };
+  const r3 = validate(m3);
+  assert.strictEqual(r3.valid, false);
+});
+
+test('phase id with dots embedded among alphanumerics is still allowed (e.g. "phase.0")', () => {
+  // Defense-in-depth must NOT regress legitimate dotted ids — the
+  // existing prototype/manifest-reference example uses `phase.0`.
+  const m = {
+    name: 'dotted-ok',
+    phases: [{ id: 'phase.0', completion_signal: 'x.md', agent: { role: 'impl' } }],
+  };
+  const result = validate(m);
+  assert.strictEqual(result.valid, true, JSON.stringify(result.errors));
+});
+
 test('VALID_ROLES is exported, frozen, and contains the V1 role set', () => {
   assert.ok(Array.isArray(VALID_ROLES), 'VALID_ROLES must be exported as an array');
   assert.deepStrictEqual([...VALID_ROLES], ['impl', 'qa', 'coord']);

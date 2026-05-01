@@ -288,6 +288,17 @@ function validate(manifest) {
         `phase id "${p.id}" is a reserved JavaScript property name — ` +
           `avoid __proto__ / prototype / constructor`
       );
+    else if (/^\.+$/.test(p.id))
+      // Defense-in-depth: VALID_ID_RE allows `.` in the character
+      // class so timestamp-prefixed ids like `2026-04-29.morning`
+      // round-trip cleanly. But a bare `..` (or `...`, etc.) would
+      // resolve `<manifestDir>/docs/orchestration/phases/..` to the
+      // protocol root one level up, redirecting heartbeat reads and
+      // checkpoint scans. Reject ids made entirely of dots.
+      push(
+        `${p_}.id`,
+        `phase id "${p.id}" must not be only dots (path-traversal hazard)`
+      );
     else if (seenIds.has(p.id)) push(`${p_}.id`, `duplicate phase id "${p.id}"`);
     else seenIds.add(p.id);
 

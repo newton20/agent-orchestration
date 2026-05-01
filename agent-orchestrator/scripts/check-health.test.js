@@ -1779,6 +1779,23 @@ test('checkHealth: invalid heartbeatStaleMs throws', () => {
     }),
     /heartbeatStaleMs/
   );
+  // ce:review round 1: lib must match CLI (integer-only). Pre-fix
+  // accepted 1.5 silently, diverging from the documented contract.
+  assert.throws(
+    () => checkHealth({
+      phaseId: 'phase-1', role: 'impl', manifestPath: '/x', heartbeatStaleMs: 1.5,
+    }),
+    /heartbeatStaleMs.*non-negative integer/
+  );
+});
+
+test('checkHealth: invalid startupGraceMs (non-integer) throws (ce:review round 1)', () => {
+  assert.throws(
+    () => checkHealth({
+      phaseId: 'phase-1', role: 'impl', manifestPath: '/x', startupGraceMs: 30000.5,
+    }),
+    /startupGraceMs.*non-negative integer/
+  );
 });
 
 // =========================================================================
