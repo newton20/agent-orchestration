@@ -1983,6 +1983,59 @@ test('readHeartbeatRecord: latest role-matching record beyond max window → nul
   }
 });
 
+test('readHeartbeatRecord: window starts exactly at a record boundary — first line is NOT dropped (codex round 1)', () => {
+  // Edge case codex caught on round 1: when the byte just before
+  // `startOffset` is `\n`, the read aligns exactly with a record
+  // boundary and the first line is complete. The pre-fix code
+  // unconditionally dropped the leading line, silently discarding a
+  // matching record that fit perfectly inside the window. Use
+  // injected seams so we can describe the exact byte layout.
+  const window = HEARTBEAT_TAIL_WINDOW_BYTES[0]; // 64 KiB
+  // Synthetic file: an unrelated leading region + a `\n` at exactly
+  // (size - window - 1) so the read at offset (size - window) lands
+  // immediately after a record terminator. The first byte of the
+  // window is the start of a complete impl record we want preserved.
+  const ts = '2026-04-29T05:00:00Z';
+  const implLine = JSON.stringify({ ts, pid: 4242, role: 'impl' }) + '\n';
+  const padding = 'x'.repeat(window - implLine.length); // pad inside the window
+  const tailContent = implLine + padding;
+  // Pretend file is `<prefix>\n` + tailContent. size = prefixLength + 1 + tailContent.length.
+  // Make prefix exactly 100 bytes; size = 101 + tailContent.length. window length = tailContent.length.
+  const prefixLength = 100;
+  const totalSize = prefixLength + 1 + tailContent.length;
+  const startOffset = totalSize - window; // == prefixLength + 1
+  // Sanity: tailContent.length == window
+  assert.strictEqual(tailContent.length, window, 'fixture: tail content size matches window');
+  // Sanity: byte at (startOffset - 1) is the `\n` separator.
+  // We assert this implicitly via the seam below.
+  let peeks = 0;
+  let dataReads = 0;
+  const opts = {
+    _openSync: () => 99,
+    _fstatSync: () => ({ size: totalSize }),
+    _readSync: (_fd, buf, _o, length, offset) => {
+      if (length === 1 && offset === startOffset - 1) {
+        peeks++;
+        buf[0] = 0x0a; // '\n'
+        return 1;
+      }
+      // Otherwise we're reading the window itself.
+      dataReads++;
+      assert.strictEqual(offset, startOffset, `unexpected read offset ${offset}`);
+      assert.strictEqual(length, window, `unexpected read length ${length}`);
+      Buffer.from(tailContent, 'utf8').copy(buf, 0);
+      return tailContent.length;
+    },
+    _closeSync: () => {},
+  };
+  const r = readHeartbeatRecord('/fake', 'impl', opts);
+  assert.ok(r, 'boundary-aligned record must NOT be discarded');
+  assert.strictEqual(r.tsMs, Date.parse(ts), 'recovered impl record at boundary');
+  assert.strictEqual(r.pid, 4242);
+  assert.strictEqual(peeks, 1, 'the peek-before-startOffset path must run');
+  assert.strictEqual(dataReads, 1, 'no re-expansion needed when boundary alignment is honored');
+});
+
 test('readHeartbeatRecord: empty file → null', () => {
   const dir = mkTmp('hb-tail-empty');
   const filePath = path.join(dir, 'heartbeat.jsonl');

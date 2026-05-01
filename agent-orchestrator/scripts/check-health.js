@@ -356,16 +356,33 @@ function readHeartbeatRecord(filePath, role, opts = {}) {
       }
       let text = buffer.slice(0, bytesRead).toString('utf8');
       if (startOffset > 0) {
-        // We started mid-file — the first line is almost certainly a
-        // partial. Drop everything up to and including the first
-        // newline so parseHeartbeatTail sees only complete records.
-        const nl = text.indexOf('\n');
-        if (nl < 0) {
-          // No newline at all in this window — every byte is a single
-          // (possibly partial) line that we can't trust. Re-expand.
-          continue;
+        // We started mid-file. Usually the first line is partial — but
+        // not always: when the byte just before `startOffset` is `\n`,
+        // the read aligns exactly with a record boundary and the
+        // first line is complete. Peek that byte before unconditionally
+        // dropping (codex round 1 of PR #17 — without this peek, a
+        // matching record at the largest window's exact tail boundary
+        // would be silently discarded).
+        let alignedAtBoundary = false;
+        try {
+          const peek = Buffer.alloc(1);
+          const peekN = readSync(fd, peek, 0, 1, startOffset - 1);
+          if (peekN === 1 && peek[0] === 0x0a /* \n */) {
+            alignedAtBoundary = true;
+          }
+        } catch (_) {
+          // Couldn't peek — fall through to the safe (drop) branch.
         }
-        text = text.slice(nl + 1);
+        if (!alignedAtBoundary) {
+          const nl = text.indexOf('\n');
+          if (nl < 0) {
+            // No newline at all in this window — every byte is a
+            // single (possibly partial) line that we can't trust.
+            // Re-expand.
+            continue;
+          }
+          text = text.slice(nl + 1);
+        }
       }
       const parsed = parseHeartbeatTail(text, { role });
       if (parsed && Number.isFinite(parsed.tsMs)) {
