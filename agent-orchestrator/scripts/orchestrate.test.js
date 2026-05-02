@@ -4201,6 +4201,131 @@ test('AD3 [codex round 13 P2] truly stale signal (older than pre-spawn) IS clean
   }
 });
 
+// =========================================================================
+// AE — codex round 14 regression tests
+// =========================================================================
+
+test('AE1 [codex round 14 P2] aborted run reports ok=false', async () => {
+  const dir = mkTmp('orch-AE1');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    const ac = new AbortController();
+    ac.abort(); // pre-aborted
+    const result = await O.runOrchestrator({
+      manifestPath: mp,
+      signal: ac.signal,
+      _spawnSession: makeFakeSpawnSession(),
+      _generatePrompt: makeFakeGenerate(),
+      _checkHealth: () => makeStubHealth(),
+      _pidRunner: () => '[]',
+      _sleep: () => Promise.resolve(),
+      logger: silentLogger(),
+      projectName: 't',
+      maxTicks: 5,
+    });
+    assert.strictEqual(result.ok, false, 'aborted run must report ok=false');
+    assert.strictEqual(result.summary, 'aborted');
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AE2 [codex round 14 P2] --once does not sleep after the requested tick', async () => {
+  const dir = mkTmp('orch-AE2');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    let sleepInvocations = 0;
+    await O.runOrchestrator({
+      manifestPath: mp,
+      _spawnSession: makeFakeSpawnSession(),
+      _generatePrompt: makeFakeGenerate(),
+      _checkHealth: () => makeStubHealth({ pidAlive: true }),
+      _pidRunner: () => '[]',
+      _sleep: () => {
+        sleepInvocations += 1;
+        return Promise.resolve();
+      },
+      logger: silentLogger(),
+      projectName: 't',
+      maxTicks: 1,
+    });
+    assert.strictEqual(
+      sleepInvocations,
+      0,
+      `--once should never sleep, got ${sleepInvocations} sleep call(s)`
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AE3 [codex round 14 P2] quoted max_iterations: "5" is honored', () => {
+  const dir = mkTmp('orch-AE3');
+  try {
+    const mp = writeManifest(
+      dir,
+      makeBaseManifest({
+        phases: [
+          {
+            id: 'p',
+            completion_signal: 'docs/orchestration/phases/p/impl-complete.md',
+            review_loop: { enabled: true, max_iterations: '5' }, // quoted
+            agents: [{ role: 'impl' }, { role: 'qa' }],
+          },
+        ],
+      })
+    );
+    writeStatus(mp, {
+      phases: {
+        p: { status: 'running', review_stage: 'qa', review_iteration: 4 },
+      },
+    });
+    const phaseDir = makePhaseDir(mp, 'p');
+    writeCompletionSignal(phaseDir, 'qa', 'blocked'); // FAIL on iter 4
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {}
+    );
+    // With max_iterations: "5" honored, iter 4 < 5 → respawn impl
+    // (review_retry). Pre-fix the quoted value was rejected and the
+    // CLI/built-in default of 3 was used → escalate at iter 4 > 3.
+    assert.ok(
+      actions.some((a) => a.type === 'spawn' && a.mode === 'review_retry'),
+      'quoted max_iterations: "5" must allow respawn at iteration 4'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AE4 [codex round 14 P2] dry-run does not create phase directory', () => {
+  const dir = mkTmp('orch-AE4');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    O.executeActions(
+      [{ type: 'spawn', phaseId: 'phase-1', role: 'impl', mode: 'initial', iteration: 1 }],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: makeFakeSpawnSession(),
+        _generatePrompt: makeFakeGenerate(),
+        _runUpdate: makeFakeRunUpdate(),
+        logger: silentLogger(),
+        projectName: 'p',
+        dryRun: true,
+      }
+    );
+    const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
+    assert.ok(!fs.existsSync(phaseDir), 'dry-run must NOT create the phase directory');
+  } finally {
+    rmrf(dir);
+  }
+});
+
 test('Q2 CLI: missing manifest path exits 1', () => {
   const r = spawnSync(process.execPath, [path.join(__dirname, 'orchestrate.js')], {
     encoding: 'utf8',

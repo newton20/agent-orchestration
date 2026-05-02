@@ -904,12 +904,20 @@ function decideTickActions(tickState, runState, opts) {
       rawPhaseForCap.review_loop && typeof rawPhaseForCap.review_loop === 'object'
         ? rawPhaseForCap.review_loop
         : {};
-    const userPhaseCap = Number.isInteger(rawReviewLoopForCap.max_iterations)
-      ? rawReviewLoopForCap.max_iterations
-      : null;
-    const cliCap = Number.isInteger(opts.reviewLoopMaxIterations)
-      ? opts.reviewLoopMaxIterations
-      : null;
+    // Codex round 14 P2: parse-manifest's `expectPositiveInt`
+    // accepts string-numeric like "5" via Number() coercion. The
+    // user override here must accept the same shapes — otherwise a
+    // valid manifest with `max_iterations: "5"` falls through to
+    // CLI/default cap.
+    const coerceCap = (v) => {
+      if (v === null || v === undefined) return null;
+      if (typeof v === 'string' && v.trim() === '') return null;
+      const n = Number(v);
+      if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) return null;
+      return n;
+    };
+    const userPhaseCap = coerceCap(rawReviewLoopForCap.max_iterations);
+    const cliCap = coerceCap(opts.reviewLoopMaxIterations);
     const reviewMaxIter =
       userPhaseCap ?? cliCap ?? DEFAULT_REVIEW_LOOP_MAX_ITERATIONS;
 
@@ -1784,7 +1792,9 @@ function executeSpawn(action, tickState, runState, opts, deps) {
   // Ensure the phase directory exists. scaffold-protocol creates it
   // upfront, but a recovery/respawn after a crashed orchestrator may
   // hit a missing dir if the operator deleted the protocol root.
-  mkdir(phaseDir, { recursive: true });
+  // Codex round 14 P2: respect dry-run — no FS mutations under
+  // --dry-run, including phase-dir creation.
+  if (!dryRun) mkdir(phaseDir, { recursive: true });
 
   const role = action.role;
   const sessionName = defaultSessionName(phase.id, role);
@@ -2490,6 +2500,10 @@ async function runOrchestrator(opts) {
     for (;;) {
       if (signal && signal.aborted) {
         logger('info', 'aborted via signal');
+        // Codex round 14 P2: aborted = unfinished. Documented exit
+        // contract: 0 = every phase completed. Ctrl+C / SIGTERM
+        // mid-run is by definition NOT every-phase-completed.
+        exitOk = false;
         exitReason = 'aborted';
         break;
       }
@@ -2588,6 +2602,14 @@ async function runOrchestrator(opts) {
         break;
       }
 
+      // Codex round 14 P2: skip the sleep when the next iteration's
+      // top-of-loop maxTicks check is going to break out anyway. A
+      // `--once` / `--max-ticks 1` invocation should return
+      // immediately after the requested tick, not wait active/idle
+      // interval first.
+      if (maxTicks !== null && runState.tickIndex >= maxTicks) {
+        continue;
+      }
       // Pick cadence. Active = at least one phase running this tick.
       // Codex round 10 P2: tickState.status was loaded BEFORE
       // executeActions, so a tick that just spawned a pending phase
