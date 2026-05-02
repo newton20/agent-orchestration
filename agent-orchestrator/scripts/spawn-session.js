@@ -23,6 +23,13 @@
  * titles revert to "PowerShell"/"Claude Code" within seconds otherwise,
  * defeating the `orch-<phase>-<role>` naming scheme the hook depends on.
  *
+ * Role enum: the role token in `orch-<phase>-<role>` comes from
+ * parse-manifest.VALID_ROLES (canonical per todo 077, PR #17). spawn-
+ * session does not validate roles — it accepts any well-formed `name`
+ * string from the orchestrator (which validates against VALID_ROLES
+ * before composing the session name). The V1.5 recovery-role addition
+ * is a one-file edit in parse-manifest.
+ *
  * CLI (thin wrapper around spawnSession):
  *   spawn-session.js --name <name> --workdir <dir>
  *                    [--model <id>] [--title <s>] [--plugin-dir <dir>]
@@ -592,23 +599,33 @@ function parsePidLookupOutput(stdout, name, { excludeWrappers = false } = {}) {
  * tab's title). Injectable runner makes this testable without shelling
  * out.
  *
- * Options:
- *   excludeWrappers — when true, return null if only a shell-wrapper
- *     (cmd /k, powershell -NoExit) match is visible. Used by Unit 8's
- *     health checker to detect "Claude child exited but tab still
- *     open"; the wrapper PID would otherwise mask a crashed agent
- *     until the phase timeout. Default false (preserves backward-compat
- *     for spawn-session's post-spawn lookup, which legitimately needs
- *     the wrapper PID before the inner claude child registers).
+ * Options (BOTH default to `true` per todo 073, PR #17 — safe-by-default
+ * for every external caller; the one internal post-spawn site that
+ * legitimately needs the old behavior overrides explicitly):
  *
- *   throwOnError — when true, propagate runner errors (PowerShell
- *     spawn failure, AV-blocked execution, missing PowerShell on PATH)
- *     to the caller instead of swallowing them as `null`. Used by
- *     Unit 8's health checker so the orchestrator can distinguish
- *     "no matching process" (confirmed crash → recovery) from "lookup
- *     itself errored" (transient → don't recover). Default false
- *     preserves the spawn-session post-spawn-lookup contract: a
- *     transient error during spawn shouldn't tear down the spawn.
+ *   excludeWrappers — when true (default), return null if only a
+ *     shell-wrapper (cmd /k, powershell -NoExit) match is visible.
+ *     Required by Unit 8's health checker (and any future Unit 11 /
+ *     recovery caller) so a crashed agent isn't masked by the
+ *     post-mortem-visibility wrapper that survives Claude's exit.
+ *     The wrapper-mask bug codex caught in PR #15 round 3 is the
+ *     regression anchor — the wrong default was the bug. Pass
+ *     `false` only from spawn-session's own post-spawn lookup, where
+ *     the inner claude child has not yet registered with WMI and the
+ *     wrapper PID is the legitimate target.
+ *
+ *   throwOnError — when true (default), propagate runner errors
+ *     (PowerShell spawn failure, AV-blocked execution, missing
+ *     PowerShell on PATH) to the caller instead of swallowing them
+ *     as `null`. Required by Unit 8's health checker so the
+ *     orchestrator can distinguish "no matching process" (confirmed
+ *     crash → recovery) from "lookup itself errored" (transient →
+ *     don't recover). PR #15 codex round 5 caught the conflation
+ *     when this defaulted false. Loop-survival concerns are addressed
+ *     by callers wrapping the call in try/catch and converting the
+ *     throw into a tri-state null at their layer (check-health does
+ *     this). Pass `false` only from spawn-session's own post-spawn
+ *     lookup, where a one-off WMI hiccup shouldn't fail the spawn.
  *
  * Caveat: if multiple sessions share the same name, the first-returned
  * PID is used. Our session naming scheme (`orch-<phase>-<role>`)
@@ -616,7 +633,7 @@ function parsePidLookupOutput(stdout, name, { excludeWrappers = false } = {}) {
  */
 function getSessionPid(
   name,
-  { _runner, excludeWrappers = false, throwOnError = false } = {}
+  { _runner, excludeWrappers = true, throwOnError = true } = {}
 ) {
   if (!name || typeof name !== 'string') return null;
   // _runner is invoked with (program, argv) so tests can verify both.
@@ -644,6 +661,19 @@ function getSessionPid(
 /**
  * Spawn a visible Claude tab. Returns metadata for the caller (the
  * orchestrator) to record in manifest-status.yaml.
+ *
+ * Return shape:
+ *   { pid, command, argv, sessionName, title, spawnedAt }
+ *
+ * Note: the timestamp field is named `spawnedAt` (camelCase) for
+ * JS-callable ergonomics. **Callers persisting this value to
+ * `manifest-status.yaml` MUST rename it to `started_at`** — manifest-
+ * status fields are snake_case by contract (see
+ * `parse-manifest.KNOWN_UPDATE_FIELDS`), and `check-health.js` reads
+ * only `started_at` (the `spawned_at` fallback was removed in todo
+ * 078, PR #17). A row written with `spawned_at` will be silently
+ * ignored by the health checker, which by design makes a misnamed
+ * write loud rather than masking it.
  *
  * `_runner` is the injection seam for tests — pass a stub that captures
  * the command string instead of shelling out. Production callers omit it.
@@ -687,7 +717,22 @@ function spawnSession({
 
   // PID lookup is best-effort: the tab may not be registered yet when
   // this returns. Orchestrator callers retry via getSessionPid() later.
-  const pid = getSessionPid(sessionName, { _runner: _tasklistRunner });
+  //
+  // Both defaults flipped to `true` in todo 073 (PR #17). The post-spawn
+  // case is the one site that wants the OLD behavior:
+  //   excludeWrappers: false — the inner claude child has not yet
+  //     registered with WMI on the spawn-side; the cmd /k or powershell
+  //     wrapper PID is the legitimate target until the next refresh.
+  //   throwOnError: false — a transient WMI hiccup during the
+  //     immediate-post-spawn window shouldn't fail the whole spawn.
+  //     The orchestrator retries this lookup on its own polling cadence.
+  // Every other caller (check-health, future Unit 11, future recovery
+  // agent) gets the safe-by-default true/true behavior.
+  const pid = getSessionPid(sessionName, {
+    _runner: _tasklistRunner,
+    excludeWrappers: false,
+    throwOnError: false,
+  });
 
   return { pid, command, argv, sessionName, title: resolvedTitle, spawnedAt: now };
 }
