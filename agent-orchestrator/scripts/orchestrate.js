@@ -509,15 +509,15 @@ function depsMet(phase, status) {
 }
 
 function depsBlocked(phase, status) {
-  // A phase whose depends_on includes a `failed` is permanently
-  // blocked. The operator must intervene (rerun the failed phase,
-  // edit the manifest, or accept the partial outcome).
+  // A phase whose depends_on includes a `failed` OR `blocked` upstream
+  // cannot advance. The operator must intervene (rerun the failed
+  // phase, unblock it, or accept the partial outcome).
   if (!Array.isArray(phase.depends_on) || phase.depends_on.length === 0) {
     return false;
   }
   for (const dep of phase.depends_on) {
     const depEntry = getPhaseStatus(status, dep);
-    if (depEntry.status === 'failed') return true;
+    if (depEntry.status === 'failed' || depEntry.status === 'blocked') return true;
   }
   return false;
 }
@@ -648,12 +648,21 @@ function decideTickActions(tickState, runState, opts) {
   } = tickState;
   const actions = [];
   const now = opts._now ? opts._now() : Date.now();
-  const startupGraceMs = opts.startupGraceMs || DEFAULT_STARTUP_GRACE_MS;
+  // `??` not `||`: zero is a legitimate operator override (e.g.,
+  // --startup-grace-ms 0 disables grace, --max-recovery-retries 0
+  // disables recovery). Codex round 1 P2 — without `??`, the explicit
+  // zero falls through to the built-in default and the operator
+  // silently gets the opposite of what they asked for.
+  const startupGraceMs =
+    opts.startupGraceMs != null ? opts.startupGraceMs : DEFAULT_STARTUP_GRACE_MS;
   const convergeN =
-    opts.lookupFailedConvergeN || DEFAULT_LOOKUP_FAILED_CONVERGE_N;
-  const maxRetries = opts.maxRecoveryRetries || DEFAULT_MAX_RECOVERY_RETRIES;
-  const reviewMaxIter =
-    opts.reviewLoopMaxIterations || DEFAULT_REVIEW_LOOP_MAX_ITERATIONS;
+    opts.lookupFailedConvergeN != null
+      ? opts.lookupFailedConvergeN
+      : DEFAULT_LOOKUP_FAILED_CONVERGE_N;
+  const maxRetries =
+    opts.maxRecoveryRetries != null
+      ? opts.maxRecoveryRetries
+      : DEFAULT_MAX_RECOVERY_RETRIES;
   const checkHealthFn = opts._checkHealth || checkHealth;
   const manifestDir = path.dirname(path.resolve(manifestPath));
 
@@ -673,6 +682,17 @@ function decideTickActions(tickState, runState, opts) {
     const reviewIteration = Number.isInteger(phaseEntry.review_iteration)
       ? phaseEntry.review_iteration
       : 1;
+    // Per-phase iteration cap takes precedence over the orchestrator-
+    // wide CLI default (codex round 1 P2). normalizePhases guarantees
+    // `phase.review_loop` exists with `max_iterations` set; we still
+    // guard for safety in case a future schema bump leaves it null.
+    const reviewMaxIter =
+      (phase.review_loop && Number.isInteger(phase.review_loop.max_iterations)
+        ? phase.review_loop.max_iterations
+        : null) ??
+      (opts.reviewLoopMaxIterations != null
+        ? opts.reviewLoopMaxIterations
+        : DEFAULT_REVIEW_LOOP_MAX_ITERATIONS);
 
     const activeRoles = reviewEnabled
       ? [reviewStage]
@@ -692,10 +712,59 @@ function decideTickActions(tickState, runState, opts) {
       }
       const sessionName = defaultSessionName(phase.id, role);
 
-      // Completion signal — the dominant signal. PRIMARY: file presence.
+      // Completion signal — the dominant signal. We parse the
+      // frontmatter and dispatch by `status` (codex round 1 P1).
+      // Special case: for QA on a review-enabled phase, blocked /
+      // partial / complete are ALL legitimate verdicts (the QA
+      // template's Output Contract maps `complete: ALL PASS`,
+      // `blocked: any FAIL`, `partial: unverifiable rows`). The
+      // review-loop branch below routes via parseQaVerdict which
+      // honors that mapping. For every other (role × phase-mode)
+      // combination the dispatch is:
+      //   - 'complete'  → role finished; advance the phase / stage.
+      //   - 'blocked'   → agent wrote a blocker and stopped; mark
+      //                   phase blocked. Downstream phases must not
+      //                   advance.
+      //   - 'partial'   → mark phase blocked (operator decides).
+      //   - other / unknown / unparseable → log + re-poll.
       const signalPath = completionSignalFor(phaseDir, role);
-      const exists = (opts._existsSync || fs.existsSync)(signalPath);
-      if (exists) {
+      const sigParsed = parseCompletionSignal(signalPath, opts);
+      const isQaReviewSignal = reviewEnabled && role === 'qa' && sigParsed !== null;
+      if (sigParsed && !isQaReviewSignal) {
+        if (sigParsed.status === 'blocked' || sigParsed.status === 'partial') {
+          actions.push({
+            type: 'log',
+            level: 'error',
+            message:
+              `phase ${phase.id} role ${role} signaled status: ${sigParsed.status}; ` +
+              `marking phase blocked. Operator decision needed before this phase advances.`,
+            phaseId: phase.id,
+            role,
+          });
+          actions.push({
+            type: 'mark_phase_blocked',
+            phaseId: phase.id,
+            reason: `agent_signal:${sigParsed.status}:${role}`,
+          });
+          continue;
+        }
+        if (sigParsed.status !== 'complete' && sigParsed.status !== 'unknown') {
+          actions.push({
+            type: 'log',
+            level: 'warn',
+            message:
+              `phase ${phase.id} role ${role} signal has unrecognized status=${JSON.stringify(sigParsed.status)}; ` +
+              `treating as not-yet-complete and re-polling`,
+            phaseId: phase.id,
+            role,
+          });
+          continue;
+        }
+      }
+      const isComplete = isQaReviewSignal
+        ? true // QA review path: any parseable signal is a verdict; pass/fail handled in the verdict branch below
+        : sigParsed && sigParsed.status === 'complete';
+      if (isComplete) {
         // Phase or stage completed.
         if (reviewEnabled && role === 'impl') {
           // Impl just completed; advance to QA.
@@ -1338,6 +1407,14 @@ function executeActions(actions, tickState, runState, opts) {
  * generatePrompt — passing role: 'recovery' + recoveryRole triggers
  * the in-generator copy of `<role>-prompt.md` → `<role>-prompt.original.md`
  * before overwrite.
+ *
+ * **Stale-signal cleanup (codex round 1 P1).** Before any respawn (
+ * review-retry, recovery, or review_loop progression from impl→qa
+ * within the same iteration), delete the completion signal AND the
+ * structured qa-verdict.json the prior dispatch wrote. Without this,
+ * the next tick's pollAllPhases would see the old signal still on
+ * disk and immediately advance the phase before the freshly spawned
+ * agent has done any work.
  */
 function executeSpawn(action, tickState, runState, opts, deps) {
   const {
@@ -1355,6 +1432,7 @@ function executeSpawn(action, tickState, runState, opts, deps) {
     dryRun,
     logger,
   } = deps;
+  const unlinkSync = opts._unlinkSync || fs.unlinkSync;
   const { manifest, phases, manifestPath } = tickState;
   const phase = phases.find((p) => p.id === action.phaseId);
   if (!phase) {
@@ -1371,6 +1449,42 @@ function executeSpawn(action, tickState, runState, opts, deps) {
   const sessionName = defaultSessionName(phase.id, role);
   const isRecovery = action.mode === 'recovery';
   const isReviewRetry = action.mode === 'review_retry';
+  const isInitialQa = action.mode === 'initial' && role === 'qa';
+
+  // Stale-signal cleanup. Three respawn cases that need cleanup:
+  //   1. recovery — same role respawned after crash. The prior
+  //      session may have written a completion signal moments before
+  //      crashing; without cleanup the orchestrator would immediately
+  //      mark the phase complete on the next tick.
+  //   2. review_retry — impl respawned after a failed QA verdict. The
+  //      prior iteration's impl-complete.md AND qa-complete.md must
+  //      both be removed so the next tick correctly observes "neither
+  //      stage has emitted yet."
+  //   3. initial QA dispatch on a review-enabled phase — the prior
+  //      iteration's qa-complete.md (if any) must be removed before
+  //      the new QA agent runs. (impl-complete.md stays — that's the
+  //      trigger that brought us here.)
+  // dryRun skips all disk writes including the cleanup.
+  if (!dryRun) {
+    if (isRecovery) {
+      bestEffortUnlink(unlinkSync, completionSignalFor(phaseDir, role));
+      if (role === 'qa') {
+        bestEffortUnlink(unlinkSync, qaVerdictFor(phaseDir));
+      }
+    }
+    if (isReviewRetry) {
+      // role here is 'impl' — but we need to clear the previous
+      // iteration's BOTH signals so the next impl-complete (and the
+      // subsequent qa-complete) are clean.
+      bestEffortUnlink(unlinkSync, completionSignalFor(phaseDir, 'impl'));
+      bestEffortUnlink(unlinkSync, completionSignalFor(phaseDir, 'qa'));
+      bestEffortUnlink(unlinkSync, qaVerdictFor(phaseDir));
+    }
+    if (isInitialQa) {
+      bestEffortUnlink(unlinkSync, completionSignalFor(phaseDir, 'qa'));
+      bestEffortUnlink(unlinkSync, qaVerdictFor(phaseDir));
+    }
+  }
 
   // Build generatePrompt opts. Plan extraction is best-effort: when the
   // manifest declares `plan_path` + `plan_unit_marker` per phase the
@@ -1396,13 +1510,25 @@ function executeSpawn(action, tickState, runState, opts, deps) {
     }
   }
 
+  // Resolve workdir. Per docs/manifest-reference.md §workdir, the
+  // manifest's `workdir` field is allowed to be a path RELATIVE to
+  // the manifest file's directory (e.g. `workdir: ../sibling-repo`).
+  // The orchestrator may be launched from any cwd, so we resolve
+  // against manifestDir explicitly. Codex round 1 P2 caught this:
+  // without explicit resolution, a relative workdir would resolve
+  // against the orchestrator's cwd at launch time and the spawned
+  // session's `wt --startingDirectory` would point at the wrong tree.
+  const resolvedWorkdir = manifest.workdir
+    ? path.resolve(manifestDir, manifest.workdir)
+    : manifestDir;
+
   const genOpts = {
     role: isRecovery ? 'recovery' : role,
     recoveryRole: isRecovery ? role : undefined,
     phaseId: phase.id,
     templatesDir,
     projectName,
-    workdir: manifest.workdir || manifestDir,
+    workdir: resolvedWorkdir,
     phaseDir,
     priorPhaseSignals,
   };
@@ -1451,7 +1577,7 @@ function executeSpawn(action, tickState, runState, opts, deps) {
     // taken from the phase's manifest entry if present.
     genOpts.prOrBranchUnderTest =
       (phase.review_loop && phase.review_loop.pr_or_branch) ||
-      (manifest.workdir ? `HEAD of ${manifest.workdir}` : 'HEAD');
+      `HEAD of ${resolvedWorkdir}`;
     genOpts.qaScopeRows =
       (phase.review_loop && phase.review_loop.qa_scope_rows) ||
       `1. Implementation matches plan excerpt for phase ${phase.id} — PASS/FAIL`;
@@ -1528,7 +1654,7 @@ function executeSpawn(action, tickState, runState, opts, deps) {
   } else {
     spawnResult = spawnFn({
       name: sessionName,
-      workdir: manifest.workdir || manifestDir,
+      workdir: resolvedWorkdir,
       model: agent.model || null,
       title: `${sessionName} — ${phase.title || phase.id}`,
       pluginDir: opts.pluginDir || null,
@@ -1768,6 +1894,21 @@ async function runOrchestrator(opts) {
     history: runState.history,
     lockPath,
   };
+}
+
+/**
+ * Best-effort unlink. ENOENT (file doesn't exist) is the common-case
+ * non-error — the prior dispatch may not have produced the artifact
+ * we're trying to clean up. Other errors are silently swallowed; the
+ * orchestrator survives a failed cleanup, and a stale signal will
+ * surface as a noisy log next tick rather than crashing the loop.
+ */
+function bestEffortUnlink(unlinkSync, p) {
+  try {
+    unlinkSync(p);
+  } catch (_) {
+    /* ENOENT is the common case; we don't differentiate */
+  }
 }
 
 function isActiveTick(tickState) {

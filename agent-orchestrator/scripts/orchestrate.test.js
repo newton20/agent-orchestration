@@ -2190,6 +2190,278 @@ test('Q1 CLI: --help exits 0 with usage text', () => {
   assert.match(r.stdout, /--resume/);
 });
 
+// =========================================================================
+// R — codex round 1 regression tests (P1 + P2 fixes)
+// =========================================================================
+
+test('R1 [codex round 1 P1] non-review phase + status: blocked → mark_phase_blocked, NOT mark_phase_completed', () => {
+  const dir = mkTmp('orch-R1');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, { phases: { 'phase-1': { status: 'running' } } });
+    const phaseDir = makePhaseDir(mp, 'phase-1');
+    // Agent wrote impl-complete.md with status: blocked (legitimate
+    // per protocol-header.md). Pre-fix, the orchestrator marked the
+    // phase complete because the file existed.
+    writeCompletionSignal(phaseDir, 'impl', 'blocked');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      { _checkHealth: () => makeStubHealth() }
+    );
+    assert.ok(
+      !actions.some((a) => a.type === 'mark_phase_completed'),
+      'must NOT mark complete when agent reported blocked'
+    );
+    assert.ok(actions.some((a) => a.type === 'mark_phase_blocked'));
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('R2 [codex round 1 P1] non-review phase + status: partial → mark_phase_blocked', () => {
+  const dir = mkTmp('orch-R2');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, { phases: { 'phase-1': { status: 'running' } } });
+    const phaseDir = makePhaseDir(mp, 'phase-1');
+    writeCompletionSignal(phaseDir, 'impl', 'partial');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      { _checkHealth: () => makeStubHealth() }
+    );
+    assert.ok(actions.some((a) => a.type === 'mark_phase_blocked'));
+    assert.ok(!actions.some((a) => a.type === 'mark_phase_completed'));
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('R3 [codex round 1 P1] downstream phase blocked when upstream is `blocked` (not just `failed`)', () => {
+  const dir = mkTmp('orch-R3');
+  try {
+    const mp = writeManifest(
+      dir,
+      makeBaseManifest({
+        phases: [
+          { id: 'a', completion_signal: 'docs/orchestration/phases/a/impl-complete.md', agents: [{ role: 'impl' }] },
+          { id: 'b', completion_signal: 'docs/orchestration/phases/b/impl-complete.md', depends_on: ['a'], agents: [{ role: 'impl' }] },
+        ],
+      })
+    );
+    writeStatus(mp, { phases: { a: { status: 'blocked', error: 'agent_signal:blocked:impl' } } });
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {}
+    );
+    assert.ok(
+      actions.some((a) => a.type === 'mark_phase_blocked' && a.phaseId === 'b'),
+      'phase b must be blocked when its dep is blocked, not just when failed'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('R4 [codex round 1 P1] review_retry spawn deletes stale impl-complete + qa-complete + qa-verdict', () => {
+  const dir = mkTmp('orch-R4');
+  try {
+    const mp = writeManifest(
+      dir,
+      makeBaseManifest({
+        phases: [
+          {
+            id: 'p',
+            completion_signal: 'docs/orchestration/phases/p/impl-complete.md',
+            review_loop: { enabled: true, max_iterations: 3 },
+            agents: [{ role: 'impl' }, { role: 'qa' }],
+          },
+        ],
+      })
+    );
+    const phaseDir = makePhaseDir(mp, 'p');
+    // Stale signals from iteration 1.
+    writeCompletionSignal(phaseDir, 'impl', 'complete');
+    writeCompletionSignal(phaseDir, 'qa', 'blocked');
+    fs.writeFileSync(
+      path.join(phaseDir, 'qa-verdict.json'),
+      JSON.stringify({ pass: false, failures: [] })
+    );
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const tickState = { ...tickRes, manifestPath: mp };
+    const fakeSpawn = makeFakeSpawnSession();
+    const fakeGen = makeFakeGenerate();
+    const fakeUpdate = makeFakeRunUpdate();
+    O.executeActions(
+      [
+        {
+          type: 'spawn',
+          phaseId: 'p',
+          role: 'impl',
+          mode: 'review_retry',
+          iteration: 2,
+          verdict: { pass: false, failures: [], source: 'qa-complete.md', signalStatus: 'blocked' },
+        },
+      ],
+      tickState,
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: fakeSpawn,
+        _generatePrompt: fakeGen,
+        _runUpdate: fakeUpdate,
+        logger: silentLogger(),
+        projectName: 'p',
+      }
+    );
+    assert.ok(!fs.existsSync(path.join(phaseDir, 'impl-complete.md')), 'impl-complete.md should be deleted');
+    assert.ok(!fs.existsSync(path.join(phaseDir, 'qa-complete.md')), 'qa-complete.md should be deleted');
+    assert.ok(!fs.existsSync(path.join(phaseDir, 'qa-verdict.json')), 'qa-verdict.json should be deleted');
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('R5 [codex round 1 P1] recovery spawn deletes stale completion signal for the same role', () => {
+  const dir = mkTmp('orch-R5');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    const phaseDir = makePhaseDir(mp, 'phase-1');
+    writeCompletionSignal(phaseDir, 'impl', 'complete'); // pretend prior agent wrote this just before crashing
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    O.executeActions(
+      [{ type: 'spawn', phaseId: 'phase-1', role: 'impl', mode: 'recovery', iteration: 2 }],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: makeFakeSpawnSession(),
+        _generatePrompt: makeFakeGenerate(),
+        _runUpdate: makeFakeRunUpdate(),
+        logger: silentLogger(),
+        projectName: 'p',
+      }
+    );
+    assert.ok(!fs.existsSync(path.join(phaseDir, 'impl-complete.md')));
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('R6 [codex round 1 P2] relative manifest workdir resolves against manifestDir', () => {
+  const dir = mkTmp('orch-R6');
+  try {
+    const mp = writeManifest(
+      dir,
+      makeBaseManifest({
+        workdir: 'subdir/inner',
+      })
+    );
+    fs.mkdirSync(path.join(dir, 'subdir', 'inner'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const fakeSpawn = makeFakeSpawnSession();
+    const fakeGen = makeFakeGenerate();
+    O.executeActions(
+      [{ type: 'spawn', phaseId: 'phase-1', role: 'impl', mode: 'initial', iteration: 1 }],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: fakeSpawn,
+        _generatePrompt: fakeGen,
+        _runUpdate: makeFakeRunUpdate(),
+        logger: silentLogger(),
+        projectName: 'p',
+      }
+    );
+    const expected = path.resolve(dir, 'subdir', 'inner');
+    assert.strictEqual(
+      path.normalize(fakeSpawn.calls[0].workdir),
+      path.normalize(expected),
+      'spawnSession should receive an absolute workdir resolved against manifestDir'
+    );
+    // generate-prompt should also see the resolved path.
+    assert.strictEqual(
+      path.normalize(fakeGen.calls[0].workdir),
+      path.normalize(expected)
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('R7 [codex round 1 P2] per-phase review_loop.max_iterations overrides the CLI default', () => {
+  const dir = mkTmp('orch-R7');
+  try {
+    const mp = writeManifest(
+      dir,
+      makeBaseManifest({
+        phases: [
+          {
+            id: 'p',
+            completion_signal: 'docs/orchestration/phases/p/impl-complete.md',
+            review_loop: { enabled: true, max_iterations: 1 }, // tight cap
+            agents: [{ role: 'impl' }, { role: 'qa' }],
+          },
+        ],
+      })
+    );
+    writeStatus(mp, {
+      phases: {
+        p: { status: 'running', review_stage: 'qa', review_iteration: 1 },
+      },
+    });
+    const phaseDir = makePhaseDir(mp, 'p');
+    writeCompletionSignal(phaseDir, 'qa', 'blocked'); // FAIL on iteration 1
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      // CLI default would be 3 — per-phase 1 should win and escalate immediately.
+      { reviewLoopMaxIterations: 5 }
+    );
+    assert.ok(
+      actions.some((a) => a.type === 'mark_phase_failed' && /review_loop_exceeded/.test(a.reason)),
+      'per-phase max_iterations: 1 must escalate even though CLI default is higher'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('R8 [codex round 1 P2] explicit zero CLI overrides are respected (?? not ||)', () => {
+  const dir = mkTmp('orch-R8');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, { phases: { 'phase-1': { status: 'running', retry_count: 0 } } });
+    makePhaseDir(mp, 'phase-1');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    // maxRecoveryRetries: 0 means "don't recover at all". Pre-fix, the
+    // `||` default replaced the explicit 0 with DEFAULT_MAX_RECOVERY_RETRIES = 3
+    // and the orchestrator would silently retry up to 3 times instead.
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _checkHealth: () => makeStubHealth({ pidAlive: false }),
+        maxRecoveryRetries: 0,
+      }
+    );
+    assert.ok(
+      actions.some((a) => a.type === 'mark_phase_failed'),
+      'maxRecoveryRetries: 0 must mark failed immediately, not retry'
+    );
+    assert.ok(!actions.some((a) => a.type === 'spawn' && a.mode === 'recovery'));
+  } finally {
+    rmrf(dir);
+  }
+});
+
 test('Q2 CLI: missing manifest path exits 1', () => {
   const r = spawnSync(process.execPath, [path.join(__dirname, 'orchestrate.js')], {
     encoding: 'utf8',
