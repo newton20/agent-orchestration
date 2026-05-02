@@ -1,5 +1,5 @@
 ---
-status: ready
+status: complete
 priority: p2
 issue_id: "067"
 tags: [code-review, unit-8, check-health, performance, security, dos]

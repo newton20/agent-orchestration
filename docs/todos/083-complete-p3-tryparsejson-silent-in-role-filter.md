@@ -1,5 +1,5 @@
 ---
-status: ready
+status: complete
 priority: p3
 issue_id: "083"
 tags: [code-review, unit-8, check-health, observability, diagnostics]

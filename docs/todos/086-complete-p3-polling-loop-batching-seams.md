@@ -1,5 +1,5 @@
 ---
-status: ready
+status: complete
 priority: p3
 issue_id: "086"
 tags: [code-review, unit-8, check-health, performance, unit-11-prep, batching]

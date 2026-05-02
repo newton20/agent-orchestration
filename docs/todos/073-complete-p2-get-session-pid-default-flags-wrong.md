@@ -1,5 +1,5 @@
 ---
-status: ready
+status: complete
 priority: p2
 issue_id: "073"
 tags: [code-review, unit-8, spawn-session, api-defaults, footgun]
