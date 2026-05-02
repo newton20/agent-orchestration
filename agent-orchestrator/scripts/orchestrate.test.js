@@ -2462,6 +2462,177 @@ test('R8 [codex round 1 P2] explicit zero CLI overrides are respected (?? not ||
   }
 });
 
+test('S1 [codex round 2 P2] spawn failure → matching persist is skipped (phase stays pending)', () => {
+  const dir = mkTmp('orch-S1');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const tickState = { ...tickRes, manifestPath: mp };
+    const fakeUpdate = makeFakeRunUpdate();
+    const failingSpawn = () => {
+      throw new Error('wt not on PATH');
+    };
+    O.executeActions(
+      [
+        { type: 'spawn', phaseId: 'phase-1', role: 'impl', mode: 'initial', iteration: 1 },
+        { type: 'persist', phaseId: 'phase-1', updates: { status: 'running' } },
+      ],
+      tickState,
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: failingSpawn,
+        _generatePrompt: makeFakeGenerate(),
+        _runUpdate: fakeUpdate,
+        logger: silentLogger(),
+        projectName: 'p',
+      }
+    );
+    // No persist call should have fired — the matching spawn failed.
+    const runningPersists = fakeUpdate.calls.filter(
+      (c) => c.updates && c.updates.status === 'running'
+    );
+    assert.strictEqual(
+      runningPersists.length,
+      0,
+      'phase-1 must NOT be persisted as running when its spawn failed'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('S2 [codex round 2 P2] runOneTick resets spawnFailedThisTick between ticks', async () => {
+  const dir = mkTmp('orch-S2');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    let spawnAttempts = 0;
+    let spawnFailedFirstTick = false;
+    const result = await O.runOrchestrator({
+      manifestPath: mp,
+      _spawnSession: () => {
+        spawnAttempts += 1;
+        if (spawnAttempts === 1) {
+          spawnFailedFirstTick = true;
+          throw new Error('first attempt failed');
+        }
+        // Second attempt succeeds.
+        return {
+          pid: 4242,
+          command: 'fake',
+          argv: [],
+          sessionName: `orch-phase-1-impl`,
+          title: 'fake',
+          spawnedAt: '2026-05-02T01:00:00Z',
+        };
+      },
+      _generatePrompt: makeFakeGenerate(),
+      _checkHealth: () => makeStubHealth({ pidAlive: true }),
+      _pidRunner: () => '[]',
+      _sleep: () => Promise.resolve(),
+      logger: silentLogger(),
+      projectName: 't',
+      maxTicks: 3,
+    });
+    // Should have retried on tick 2 (phase-1 still pending after tick 1's spawn failure).
+    assert.ok(spawnFailedFirstTick);
+    assert.ok(spawnAttempts >= 2, `expected at least 2 spawn attempts, got ${spawnAttempts}`);
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('S3 [codex round 2 P2] per-agent plugin_dir overrides CLI --plugin-dir', () => {
+  const dir = mkTmp('orch-S3');
+  try {
+    const mp = writeManifest(
+      dir,
+      makeBaseManifest({
+        phases: [
+          {
+            id: 'p',
+            completion_signal: 'docs/orchestration/phases/p/impl-complete.md',
+            agents: [{ role: 'impl', plugin_dir: '/per/agent/plugin' }],
+          },
+        ],
+      })
+    );
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const fakeSpawn = makeFakeSpawnSession();
+    O.executeActions(
+      [{ type: 'spawn', phaseId: 'p', role: 'impl', mode: 'initial', iteration: 1 }],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: fakeSpawn,
+        _generatePrompt: makeFakeGenerate(),
+        _runUpdate: makeFakeRunUpdate(),
+        logger: silentLogger(),
+        projectName: 'p',
+        pluginDir: '/cli/plugin', // CLI flag — should be overridden
+      }
+    );
+    assert.strictEqual(fakeSpawn.calls[0].pluginDir, '/per/agent/plugin');
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('S4 [codex round 2 P2] CLI --plugin-dir is the fallback when agent has no plugin_dir', () => {
+  const dir = mkTmp('orch-S4');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const fakeSpawn = makeFakeSpawnSession();
+    O.executeActions(
+      [{ type: 'spawn', phaseId: 'phase-1', role: 'impl', mode: 'initial', iteration: 1 }],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: fakeSpawn,
+        _generatePrompt: makeFakeGenerate(),
+        _runUpdate: makeFakeRunUpdate(),
+        logger: silentLogger(),
+        projectName: 'p',
+        pluginDir: '/cli/plugin',
+      }
+    );
+    assert.strictEqual(fakeSpawn.calls[0].pluginDir, '/cli/plugin');
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('S5 [codex round 2 P2] --max-ticks reflects same-tick failure in exitOk', async () => {
+  const dir = mkTmp('orch-S5');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, { phases: { 'phase-1': { status: 'running', retry_count: 3 } } });
+    makePhaseDir(mp, 'phase-1');
+    // The single tick will mark phase-1 failed (retry_count >= max).
+    // Pre-fix: maxTicks=1 exited with exitOk=true because the post-action
+    // status mark hadn't propagated to tickState.status before the
+    // next loop iteration's terminal check.
+    const result = await O.runOrchestrator({
+      manifestPath: mp,
+      resume: true,
+      _spawnSession: makeFakeSpawnSession(),
+      _generatePrompt: makeFakeGenerate(),
+      _checkHealth: () => makeStubHealth({ pidAlive: false }),
+      _pidRunner: () => '[]',
+      _sleep: () => Promise.resolve(),
+      logger: silentLogger(),
+      projectName: 't',
+      maxTicks: 1,
+    });
+    assert.strictEqual(result.ok, false, '--max-ticks 1 with same-tick failure must report ok=false');
+  } finally {
+    rmrf(dir);
+  }
+});
+
 test('Q2 CLI: missing manifest path exits 1', () => {
   const r = spawnSync(process.execPath, [path.join(__dirname, 'orchestrate.js')], {
     encoding: 'utf8',

@@ -1301,11 +1301,38 @@ function executeActions(actions, tickState, runState, opts) {
             phaseId: action.phaseId,
             role: action.role,
           });
+          // Codex round 2 P2: track which phases had a spawn failure
+          // this tick so subsequent `persist` actions targeting the
+          // same phase (which would otherwise mark it `running`) can
+          // skip — leaving the phase `pending` so the next tick
+          // re-attempts the dispatch instead of polling/recovering a
+          // session that never started.
+          if (!runState.spawnFailedThisTick) {
+            runState.spawnFailedThisTick = new Set();
+          }
+          runState.spawnFailedThisTick.add(action.phaseId);
         }
         break;
       }
       case 'persist': {
         if (dryRun) break;
+        // Codex round 2 P2: skip the post-spawn persist when its
+        // sibling spawn for this phase failed. The persist would have
+        // transitioned the phase to `running`; without a real session,
+        // that lies to checkHealth and the recovery path. Other
+        // persist updates (review_stage, retry_count) ride on the
+        // same action and are intentionally also skipped — the phase
+        // stays in its prior state and the next tick re-decides
+        // cleanly.
+        if (
+          runState.spawnFailedThisTick &&
+          runState.spawnFailedThisTick.has(action.phaseId)
+        ) {
+          out.warnings.push(
+            `persist skipped for phase=${action.phaseId}: spawn failed this tick`
+          );
+          break;
+        }
         const r = runUpdateFn(manifestPath, action.phaseId, action.updates);
         if (!r.ok) {
           out.warnings.push(
@@ -1652,12 +1679,19 @@ function executeSpawn(action, tickState, runState, opts, deps) {
       spawnedAt: new Date(opts._now ? opts._now() : Date.now()).toISOString(),
     };
   } else {
+    // Per-agent plugin_dir overrides the orchestrator-wide --plugin-dir
+    // (codex round 2 P2). The manifest's `agents[].plugin_dir` is
+    // documented in docs/manifest-reference.md as "extra plugin
+    // directory for this agent"; it must reach spawnSession's
+    // pluginDir field for the per-agent plugin to load.
+    const effectivePluginDir =
+      (agent && agent.plugin_dir) || opts.pluginDir || null;
     spawnResult = spawnFn({
       name: sessionName,
       workdir: resolvedWorkdir,
       model: agent.model || null,
       title: `${sessionName} — ${phase.title || phase.id}`,
-      pluginDir: opts.pluginDir || null,
+      pluginDir: effectivePluginDir,
       launcher: manifest.launcher || null,
     });
   }
@@ -1704,6 +1738,10 @@ function executeSpawn(action, tickState, runState, opts, deps) {
  * callers can introspect or test.
  */
 function runOneTick(runState, opts) {
+  // Reset per-tick state. spawnFailedThisTick is the cross-action
+  // signal letting subsequent `persist` actions know the matching
+  // spawn failed — see executeActions's persist handler.
+  runState.spawnFailedThisTick = new Set();
   const tickResult = pollAllPhases(opts);
   if (!tickResult.ok) {
     const logger = opts.logger || makeDefaultLogger();
@@ -1818,6 +1856,13 @@ async function runOrchestrator(opts) {
   };
 
   let exitOk = true;
+  // Cumulative failure tracker across the whole run. Codex round 2
+  // P2: tickState.status loaded at START-of-tick does NOT reflect the
+  // mark_phase_failed actions executeActions just dispatched, so the
+  // single end-of-tick allTerminal check could miss a phase that just
+  // failed this tick under --once / --max-ticks 1. We OR in
+  // `tickRes.failed.length > 0` per-tick so exit code stays correct.
+  let sawFailureOrBlocked = false;
   try {
     for (;;) {
       if (signal && signal.aborted) {
@@ -1826,6 +1871,7 @@ async function runOrchestrator(opts) {
       }
       if (maxTicks !== null && runState.tickIndex >= maxTicks) {
         logger('info', `max ticks reached (${maxTicks}); exiting`);
+        if (sawFailureOrBlocked) exitOk = false;
         break;
       }
       runState.tickIndex += 1;
@@ -1837,6 +1883,9 @@ async function runOrchestrator(opts) {
         failed: tickRes.failed.length,
         blocked: tickRes.blocked.length,
       });
+      if (tickRes.failed.length > 0 || tickRes.blocked.length > 0) {
+        sawFailureOrBlocked = true;
+      }
       if (tickRes.fatal) {
         logger('error', `fatal: ${tickRes.fatal}`);
         exitOk = false;
