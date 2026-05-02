@@ -4081,6 +4081,126 @@ test('AC3 [codex round 12 P2] mark_phase_blocked filters out queued spawn for th
   }
 });
 
+// =========================================================================
+// AD — codex round 13 regression tests
+// =========================================================================
+
+test('AD1 [codex round 13 P2] custom completion_signal parent dir created before spawn', () => {
+  const dir = mkTmp('orch-AD1');
+  try {
+    const mp = writeManifest(
+      dir,
+      makeBaseManifest({
+        phases: [
+          {
+            id: 'p',
+            // Custom path with a parent dir that does NOT exist yet.
+            completion_signal: 'signals/sub/phase-0-done.md',
+            agents: [{ role: 'impl' }],
+          },
+        ],
+      })
+    );
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    O.executeActions(
+      [{ type: 'spawn', phaseId: 'p', role: 'impl', mode: 'initial', iteration: 1 }],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: makeFakeSpawnSession(),
+        _generatePrompt: makeFakeGenerate(),
+        _runUpdate: makeFakeRunUpdate(),
+        logger: silentLogger(),
+        projectName: 'p',
+      }
+    );
+    assert.ok(
+      fs.existsSync(path.join(dir, 'signals', 'sub')),
+      'parent of custom completion path must be created before spawn'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AD2 [codex round 13 P2] fresh post-spawn signal NOT clobbered by cleanup', () => {
+  const dir = mkTmp('orch-AD2');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    const phaseDir = makePhaseDir(mp, 'phase-1');
+    // Plant a stale signal with an OLD mtime.
+    const sigPath = path.join(phaseDir, 'impl-complete.md');
+    fs.writeFileSync(sigPath, '---\nstatus: complete\n---\n# old');
+    const oldTime = Date.now() / 1000 - 3600; // 1 hour ago
+    fs.utimesSync(sigPath, oldTime, oldTime);
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    // Custom spawn fake that writes a FRESH signal during the spawn
+    // (simulates a fast agent that consumes the prompt + writes
+    // before the cleanup loop runs).
+    const freshSpawn = (opts) => {
+      // Write a fresh signal with a NEW mtime.
+      fs.writeFileSync(sigPath, '---\nstatus: complete\n---\n# fresh');
+      // bumping mtime to "now" via a fresh write
+      return {
+        pid: 4242,
+        command: 'fake',
+        argv: [],
+        sessionName: opts.name,
+        title: opts.name,
+        spawnedAt: '2026-05-02T01:00:00Z',
+      };
+    };
+    O.executeActions(
+      [{ type: 'spawn', phaseId: 'phase-1', role: 'impl', mode: 'initial', iteration: 1 }],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: freshSpawn,
+        _generatePrompt: makeFakeGenerate(),
+        _runUpdate: makeFakeRunUpdate(),
+        logger: silentLogger(),
+        projectName: 'p',
+      }
+    );
+    // The fresh signal must SURVIVE the post-spawn cleanup.
+    assert.ok(fs.existsSync(sigPath), 'fresh signal must NOT be clobbered');
+    assert.match(fs.readFileSync(sigPath, 'utf8'), /# fresh/);
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AD3 [codex round 13 P2] truly stale signal (older than pre-spawn) IS cleaned', () => {
+  const dir = mkTmp('orch-AD3');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    const phaseDir = makePhaseDir(mp, 'phase-1');
+    const sigPath = path.join(phaseDir, 'impl-complete.md');
+    fs.writeFileSync(sigPath, '---\nstatus: complete\n---\n# stale');
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    // Spawn fake does NOT touch the signal — it remains stale
+    // (mtime <= pre-spawn snapshot). Cleanup should unlink it.
+    O.executeActions(
+      [{ type: 'spawn', phaseId: 'phase-1', role: 'impl', mode: 'initial', iteration: 1 }],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: makeFakeSpawnSession(),
+        _generatePrompt: makeFakeGenerate(),
+        _runUpdate: makeFakeRunUpdate(),
+        logger: silentLogger(),
+        projectName: 'p',
+      }
+    );
+    assert.ok(!fs.existsSync(sigPath), 'truly stale signal must be cleaned');
+  } finally {
+    rmrf(dir);
+  }
+});
+
 test('Q2 CLI: missing manifest path exits 1', () => {
   const r = spawnSync(process.execPath, [path.join(__dirname, 'orchestrate.js')], {
     encoding: 'utf8',

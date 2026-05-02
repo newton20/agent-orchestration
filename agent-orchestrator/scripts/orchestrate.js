@@ -1830,12 +1830,24 @@ function executeSpawn(action, tickState, runState, opts, deps) {
   // executeActions error path skips the matching `persist` action,
   // so the phase remains in its prior `review_stage: qa` (or
   // equivalent) state — the verdict isn't lost.
+  // Codex round 5 P2 + round 13 P2: stale-signal cleanup pattern.
+  // The cleanup unlinks completion signals from a PRIOR dispatch so
+  // the next tick doesn't immediately mark the phase complete on
+  // the stale signal. Two competing constraints:
+  //   - Round 5: don't unlink BEFORE spawn — if spawn fails, the
+  //     prior verdict signals would be lost and the phase stuck.
+  //   - Round 13: don't unlink AFTER spawn unconditionally — a fast
+  //     agent could have already written its NEW signal between
+  //     spawn-return and our cleanup; we'd delete the fresh signal
+  //     and the phase would hang until timeout.
+  // Resolution: snapshot pre-spawn mtimes, run cleanup AFTER spawn
+  // succeeds, but only unlink files whose current mtime <= the
+  // pre-spawn snapshot. If the file's mtime is newer, the agent has
+  // overwritten it — leave it alone.
   const staleUnlinks = [];
+  // staleSnapshot: Map<absPath, { existed: bool, mtimeMs: number | null }>
+  const staleSnapshot = new Map();
   if (!dryRun) {
-    // Use resolveCompletionSignal so a manifest-declared custom path
-    // is also unlinked (covers both the manifest's path AND the
-    // conventional default; the dual-unlink is harmless via
-    // bestEffortUnlink's ENOENT-tolerant semantics).
     const sigFor = (r) =>
       resolveCompletionSignal(manifest, manifestDir, phase.id, r);
     if (isRecovery) {
@@ -1853,16 +1865,26 @@ function executeSpawn(action, tickState, runState, opts, deps) {
       staleUnlinks.push(qaVerdictFor(phaseDir));
     }
     if (isInitial) {
-      // Codex round 12 P2: clean every initial dispatch's prior
-      // completion signal, not just QA. A reused phase dir from a
-      // prior run can carry a stale impl-complete.md (or
-      // coord-complete.md) that the next poll would treat as
-      // current, advancing the phase without waiting for the freshly
-      // spawned agent.
       staleUnlinks.push(sigFor(role));
       staleUnlinks.push(completionSignalFor(phaseDir, role));
       if (role === 'qa') {
         staleUnlinks.push(qaVerdictFor(phaseDir));
+      }
+    }
+    // Snapshot pre-spawn mtimes. Files that don't exist now are
+    // recorded as `existed: false`; the post-spawn cleanup skips
+    // anything that wasn't there before (any post-spawn write is a
+    // fresh signal).
+    const statSync = opts._statSync || fs.statSync;
+    for (const p of staleUnlinks) {
+      try {
+        const st = statSync(p);
+        staleSnapshot.set(p, {
+          existed: true,
+          mtimeMs: typeof st.mtimeMs === 'number' ? st.mtimeMs : 0,
+        });
+      } catch (_) {
+        staleSnapshot.set(p, { existed: false, mtimeMs: null });
       }
     }
   }
@@ -1914,6 +1936,16 @@ function executeSpawn(action, tickState, runState, opts, deps) {
     phase.id,
     effectiveRoleForSignal
   );
+  // Codex round 13 P2: ensure the parent directory of the custom
+  // completion path exists before the agent runs. If the manifest
+  // declares `signals/phase-0-done.md`, the agent's `mkdir -p`
+  // semantics are not guaranteed (template instructions don't
+  // promise directory creation, and an agent dispatched with auto-
+  // mode permissions might not have FS-create privileges in
+  // arbitrary paths). Create the parent now so the write succeeds.
+  if (!dryRun) {
+    mkdir(path.dirname(dispatchCompletionSignal), { recursive: true });
+  }
 
   const genOpts = {
     role: isRecovery ? 'recovery' : role,
@@ -2258,12 +2290,29 @@ function executeSpawn(action, tickState, runState, opts, deps) {
   }
 
   // Stale-signal cleanup runs ONLY after the spawn succeeds (codex
-  // round 5 P2). If the spawn threw, this code is unreachable and the
-  // prior signals stay on disk — the next tick re-decides cleanly
-  // without losing the QA verdict (which would otherwise leave the
-  // phase in `review_stage: qa` with deleted signals, unrecoverable).
+  // round 5 P2). Codex round 13 P2: only unlink files whose
+  // current mtime is ≤ the pre-spawn snapshot. A newer mtime means
+  // the agent already wrote a fresh signal — leave it alone.
+  // Files that didn't exist pre-spawn are also skipped (any
+  // present file is fresh).
   if (!dryRun) {
-    for (const p of staleUnlinks) bestEffortUnlink(unlinkSync, p);
+    const statSync = opts._statSync || fs.statSync;
+    for (const p of staleUnlinks) {
+      const snap = staleSnapshot.get(p);
+      if (!snap || !snap.existed) continue; // wasn't there pre-spawn
+      let curMtime = null;
+      try {
+        const st = statSync(p);
+        curMtime = typeof st.mtimeMs === 'number' ? st.mtimeMs : 0;
+      } catch (_) {
+        continue; // file gone (already cleaned by some other path)
+      }
+      if (curMtime > snap.mtimeMs) {
+        // Fresh write since spawn. Leave it.
+        continue;
+      }
+      bestEffortUnlink(unlinkSync, p);
+    }
   }
 
   // Persist spawn metadata. CRITICAL — design decision #7 / todo 087:
