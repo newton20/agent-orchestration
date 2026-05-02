@@ -7,9 +7,12 @@ tabs, polls a file-drop protocol for completion signals, and advances
 phases. Review loops, crash recovery, prompt injection, and email
 notifications are planned for later units.
 
-**Current shipped scope:** Unit 0 prototype only. You still paste the first
-prompt into each spawned Claude tab by hand. See the status table below for
-what's done and what's pending.
+**Current shipped scope:** V1 feature-complete (Units 0-8 + Unit 11). The
+`/orchestrate` skill validates a manifest, scaffolds the protocol, and
+starts the Node.js orchestrator process — which spawns sessions,
+injects prompts via the SessionStart hook, runs review loops, and
+recovers from crashes. The orchestrator runs zero Claude context. See
+the status table below for unit-by-unit detail.
 
 ## Current status
 
@@ -26,7 +29,7 @@ what's done and what's pending.
 | 6 | Protocol header + prompt templates | **Done (pending Unit 7 integration)** — see [`templates/`](./templates/) |
 | 7 | Template-based prompt generator | **Done** — see [`scripts/generate-prompt.js`](./scripts/generate-prompt.js) |
 | 8 | Health checker (PID + timeout + heartbeat) | **Done** — see [`scripts/check-health.js`](./scripts/check-health.js) |
-| 11 | Main orchestrator (Node.js process, `/orchestrate` skill) | Pending |
+| 11 | Main orchestrator (Node.js process, `/orchestrate` skill) | **Done** — see [`scripts/orchestrate.js`](./scripts/orchestrate.js) and [`skills/orchestrate/SKILL.md`](./skills/orchestrate/SKILL.md) |
 | 9, 10, 12 | Recovery analyst, email, `--init` | V1.5 (deferred) |
 
 Full plan: [`../docs/plans/2026-04-15-001-feat-agent-orchestration-plugin-plan.md`](../docs/plans/2026-04-15-001-feat-agent-orchestration-plugin-plan.md).
