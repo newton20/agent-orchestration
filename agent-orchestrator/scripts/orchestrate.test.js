@@ -2542,7 +2542,13 @@ test('S2 [codex round 2 P2] runOneTick resets spawnFailedThisTick between ticks'
   }
 });
 
-test('S3 [codex round 2 P2] per-agent plugin_dir overrides CLI --plugin-dir', () => {
+test('S3 [codex round 15 P2] per-agent plugin_dir is V1.5 deferred — CLI --plugin-dir wins', () => {
+  // Round 2 P2 enabled agents[].plugin_dir, but round 15 P2
+  // identified that doing so breaks the SessionStart hook (single-
+  // valued --plugin-dir on spawn-session means agent.plugin_dir
+  // would replace the orchestrator plugin, where the hook lives).
+  // V1 contract: the orchestrator plugin (or operator's CLI
+  // override) wins; agents[].plugin_dir is logged as V1.5 deferred.
   const dir = mkTmp('orch-S3');
   try {
     const mp = writeManifest(
@@ -2560,6 +2566,7 @@ test('S3 [codex round 2 P2] per-agent plugin_dir overrides CLI --plugin-dir', ()
     fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
     const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
     const fakeSpawn = makeFakeSpawnSession();
+    const log = recordingLogger();
     O.executeActions(
       [{ type: 'spawn', phaseId: 'p', role: 'impl', mode: 'initial', iteration: 1 }],
       { ...tickRes, manifestPath: mp },
@@ -2568,12 +2575,18 @@ test('S3 [codex round 2 P2] per-agent plugin_dir overrides CLI --plugin-dir', ()
         _spawnSession: fakeSpawn,
         _generatePrompt: makeFakeGenerate(),
         _runUpdate: makeFakeRunUpdate(),
-        logger: silentLogger(),
+        logger: log,
         projectName: 'p',
-        pluginDir: '/cli/plugin', // CLI flag — should be overridden
+        pluginDir: '/cli/plugin',
       }
     );
-    assert.strictEqual(fakeSpawn.calls[0].pluginDir, '/per/agent/plugin');
+    // CLI --plugin-dir wins, NOT agents[].plugin_dir.
+    assert.strictEqual(fakeSpawn.calls[0].pluginDir, '/cli/plugin');
+    // Operator must see a warning explaining why agent.plugin_dir was ignored.
+    assert.ok(
+      log.records.some((r) => /V1\.5 deferred/.test(r.message)),
+      'orchestrator must warn when ignoring agents[].plugin_dir'
+    );
   } finally {
     rmrf(dir);
   }
@@ -3571,7 +3584,13 @@ test('Y2 [codex round 8 P2] multi-role + qa-named manifest signal → impl falls
   }
 });
 
-test('Y3 [codex round 8 P2] relative agent.plugin_dir resolved against manifestDir', () => {
+test('Y3 [codex round 15 P2] agents[].plugin_dir ignored; orchestrator plugin wins', () => {
+  // Round 8 P2 wired agent.plugin_dir → spawnSession; round 15 P2
+  // reverted that because spawn-session's --plugin-dir is single-
+  // valued and agent.plugin_dir would silently replace the
+  // orchestrator plugin (the only place the SessionStart hook
+  // lives). V1 always passes the orchestrator plugin (or CLI
+  // override) and logs a warning when agents[].plugin_dir is set.
   const dir = mkTmp('orch-Y3');
   try {
     fs.mkdirSync(path.join(dir, 'plugins', 'my-plugin'), { recursive: true });
@@ -3602,10 +3621,11 @@ test('Y3 [codex round 8 P2] relative agent.plugin_dir resolved against manifestD
         projectName: 'p',
       }
     );
-    const expected = path.resolve(dir, 'plugins', 'my-plugin');
+    // No CLI --plugin-dir → defaults to orchestrator plugin root.
+    const orchestratorPlugin = path.resolve(__dirname, '..');
     assert.strictEqual(
       path.normalize(fakeSpawn.calls[0].pluginDir),
-      path.normalize(expected)
+      path.normalize(orchestratorPlugin)
     );
   } finally {
     rmrf(dir);
@@ -4321,6 +4341,106 @@ test('AE4 [codex round 14 P2] dry-run does not create phase directory', () => {
     );
     const phaseDir = path.join(dir, 'docs', 'orchestration', 'phases', 'phase-1');
     assert.ok(!fs.existsSync(phaseDir), 'dry-run must NOT create the phase directory');
+  } finally {
+    rmrf(dir);
+  }
+});
+
+// =========================================================================
+// AF — codex round 15 regression tests
+// =========================================================================
+
+test('AF1 [codex round 15 P2] manifest defaults.permission_mode → launcher auto_mode_flag', () => {
+  const dir = mkTmp('orch-AF1');
+  try {
+    const mp = writeManifest(
+      dir,
+      Object.assign(makeBaseManifest(), {
+        defaults: { permission_mode: 'default' },
+      })
+    );
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const fakeSpawn = makeFakeSpawnSession();
+    O.executeActions(
+      [{ type: 'spawn', phaseId: 'phase-1', role: 'impl', mode: 'initial', iteration: 1 }],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: fakeSpawn,
+        _generatePrompt: makeFakeGenerate(),
+        _runUpdate: makeFakeRunUpdate(),
+        logger: silentLogger(),
+        projectName: 'p',
+      }
+    );
+    const launcherArg = fakeSpawn.calls[0].launcher;
+    assert.ok(launcherArg, 'launcher must be set when permission_mode is configured');
+    assert.strictEqual(
+      launcherArg.auto_mode_flag,
+      '--permission-mode default',
+      `expected --permission-mode default, got ${launcherArg.auto_mode_flag}`
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AF2 [codex round 15 P2] manifest without permission_mode → launcher unchanged (uses spawn-session default)', () => {
+  const dir = mkTmp('orch-AF2');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const fakeSpawn = makeFakeSpawnSession();
+    O.executeActions(
+      [{ type: 'spawn', phaseId: 'phase-1', role: 'impl', mode: 'initial', iteration: 1 }],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: fakeSpawn,
+        _generatePrompt: makeFakeGenerate(),
+        _runUpdate: makeFakeRunUpdate(),
+        logger: silentLogger(),
+        projectName: 'p',
+      }
+    );
+    // launcher is null → spawn-session uses DEFAULT_LAUNCHER.
+    assert.strictEqual(fakeSpawn.calls[0].launcher, null);
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AF3 [codex round 15 P2] permission_mode merges with manifest launcher block', () => {
+  const dir = mkTmp('orch-AF3');
+  try {
+    const mp = writeManifest(
+      dir,
+      Object.assign(makeBaseManifest(), {
+        launcher: { shell: 'powershell', binary: 'agency claude' },
+        defaults: { permission_mode: 'bypass' },
+      })
+    );
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const fakeSpawn = makeFakeSpawnSession();
+    O.executeActions(
+      [{ type: 'spawn', phaseId: 'phase-1', role: 'impl', mode: 'initial', iteration: 1 }],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: fakeSpawn,
+        _generatePrompt: makeFakeGenerate(),
+        _runUpdate: makeFakeRunUpdate(),
+        logger: silentLogger(),
+        projectName: 'p',
+      }
+    );
+    const launcherArg = fakeSpawn.calls[0].launcher;
+    assert.strictEqual(launcherArg.shell, 'powershell');
+    assert.strictEqual(launcherArg.binary, 'agency claude');
+    assert.strictEqual(launcherArg.auto_mode_flag, '--permission-mode bypass');
   } finally {
     rmrf(dir);
   }

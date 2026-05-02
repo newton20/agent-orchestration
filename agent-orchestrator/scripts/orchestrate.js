@@ -2170,45 +2170,71 @@ function executeSpawn(action, tickState, runState, opts, deps) {
       spawnedAt: new Date(opts._now ? opts._now() : Date.now()).toISOString(),
     };
   } else {
-    // Per-agent plugin_dir overrides the orchestrator-wide --plugin-dir
-    // (codex round 2 P2). The manifest's `agents[].plugin_dir` is
-    // documented in docs/manifest-reference.md as "extra plugin
-    // directory for this agent"; it must reach spawnSession's
-    // pluginDir field for the per-agent plugin to load.
-    //
-    // Codex round 8 P2: resolve relative paths against manifestDir.
-    // Without this, a manifest-relative path like `./my-plugin`
-    // would be passed verbatim to wt's child shell which interprets
-    // it relative to the spawned tab's cwd (workdir, possibly
-    // different from manifestDir).
-    let effectivePluginDir = null;
+    // Plugin-dir resolution. The orchestrator plugin (this repo)
+    // ships the SessionStart hook that consumes the .pending-*
+    // flag and injects the prompt — every spawned tab MUST load
+    // it, otherwise the agent never receives its dispatch.
+    // spawn-session's --plugin-dir is single-valued, so we cannot
+    // pass two paths in V1 (modifying Unit 4 to support multi-
+    // plugin is V1.5 deferred). Resolution order:
+    //   1. CLI --plugin-dir (path explicitly chosen by operator —
+    //      assumed to either BE the orchestrator plugin or a
+    //      compatible plugin that includes the SessionStart hook).
+    //   2. Default to this plugin's root.
+    // agents[].plugin_dir is V1.5 (deferred). Codex round 2 P2
+    // briefly enabled it; round 15 P2 caught that doing so without
+    // multi-plugin support breaks prompt injection. We log a
+    // warning when agent.plugin_dir is set so the operator knows
+    // why their per-agent plugin isn't loading.
     if (agent && typeof agent.plugin_dir === 'string' && agent.plugin_dir !== '') {
-      effectivePluginDir = path.isAbsolute(agent.plugin_dir)
-        ? agent.plugin_dir
-        : path.resolve(manifestDir, agent.plugin_dir);
-    } else if (typeof opts.pluginDir === 'string' && opts.pluginDir !== '') {
+      logger(
+        'warn',
+        `phase ${phase.id} role ${role}: manifest sets agents[].plugin_dir=${JSON.stringify(agent.plugin_dir)}, ` +
+          `but agent-orchestrator V1 requires the orchestrator plugin to be the ONLY --plugin-dir ` +
+          `(the SessionStart hook lives in this plugin and must load to deliver prompts). ` +
+          `Per-agent plugin support is V1.5 deferred. Ignoring agents[].plugin_dir for this dispatch.`,
+        { phaseId: phase.id, role }
+      );
+    }
+    let effectivePluginDir;
+    if (typeof opts.pluginDir === 'string' && opts.pluginDir !== '') {
       effectivePluginDir = path.isAbsolute(opts.pluginDir)
         ? opts.pluginDir
         : path.resolve(opts.pluginDir);
     } else {
-      // Codex round 9 P2: default to THIS plugin's root so the
-      // spawned tabs load the SessionStart hook + skills that ship
-      // with agent-orchestrator. Without this, a `/orchestrate`
-      // invocation that doesn't pass `--plugin-dir` (the documented
-      // default) spawns Claude tabs without the hook, the
-      // `.pending-*` flags are never read, and phases hang until
-      // timeout. `__dirname` is `agent-orchestrator/scripts/`;
+      // Codex round 9 P2: default to THIS plugin's root.
+      // `__dirname` is `agent-orchestrator/scripts/`;
       // `path.resolve(__dirname, '..')` is the plugin root.
       effectivePluginDir = path.resolve(__dirname, '..');
     }
     try {
-      spawnResult = spawnFn({
+      // Codex round 15 P2: translate manifest.defaults.permission_mode
+    // into the launcher's auto_mode_flag. spawn-session's default
+    // launcher uses `--permission-mode auto`; if the manifest sets
+    // `defaults.permission_mode: default` (or any other valid
+    // permission mode), we override the launcher's flag so the
+    // spawned Claude session honors the operator's choice. The
+    // override merges with whatever launcher the manifest specifies
+    // (or with DEFAULT_LAUNCHER when unspecified).
+    let effectiveLauncher = manifest.launcher || null;
+    const permissionMode =
+      manifest.defaults && typeof manifest.defaults.permission_mode === 'string'
+        ? manifest.defaults.permission_mode.trim()
+        : '';
+    if (permissionMode !== '') {
+      const baseLauncher = effectiveLauncher || {};
+      effectiveLauncher = {
+        ...baseLauncher,
+        auto_mode_flag: `--permission-mode ${permissionMode}`,
+      };
+    }
+    spawnResult = spawnFn({
         name: sessionName,
         workdir: resolvedWorkdir,
         model: agent.model || null,
         title: `${sessionName} — ${phase.title || phase.id}`,
         pluginDir: effectivePluginDir,
-        launcher: manifest.launcher || null,
+        launcher: effectiveLauncher,
       });
     } catch (e) {
       // Spawn failed AFTER the flag was written. Clean up the flag
