@@ -1873,6 +1873,7 @@ test('N5 runOrchestrator: terminal failure produces ok=false summary', async () 
     makePhaseDir(mp, 'phase-1');
     const result = await O.runOrchestrator({
       manifestPath: mp,
+      resume: true, // codex round 21 P2: required when status has running phases
       _spawnSession: makeFakeSpawnSession(),
       _generatePrompt: makeFakeGenerate(),
       _checkHealth: () => makeStubHealth({ pidAlive: false }),
@@ -4820,6 +4821,139 @@ test('AK2 [codex round 20 P2] flag for THIS dispatch is not deleted by the sweep
     );
     // The flag must be the NEW prompt (rename overwrote the same-name flag).
     assert.strictEqual(fs.readFileSync(samePath, 'utf8'), '# new prompt');
+  } finally {
+    rmrf(dir);
+  }
+});
+
+// =========================================================================
+// AL — codex round 21 regression tests
+// =========================================================================
+
+test('AL1 [codex round 21 P2] tmp flag basename does NOT match the hook FLAG_NAME_RE', () => {
+  // The hook's FLAG_NAME_RE is /^\.pending-[A-Za-z0-9._-]+$/.
+  // Our tmp prefix is `.flagtmp-` which must NOT match.
+  const FLAG_NAME_RE = /^\.pending-[A-Za-z0-9._-]+$/;
+  const goodTmp = '.flagtmp-orch-phase-1-impl-1234-5678';
+  const badLegacyTmp = '.pending-orch-phase-1-impl.tmp-1234-5678';
+  assert.strictEqual(FLAG_NAME_RE.test(goodTmp), false);
+  assert.strictEqual(
+    FLAG_NAME_RE.test(badLegacyTmp),
+    true,
+    'sanity check: legacy `.pending-*.tmp-*` form WOULD have matched (pre-fix)'
+  );
+});
+
+test('AL2 [codex round 21 P2] mid-write tmp file does not get scooped by the hook', () => {
+  // Verify the actual tmp path the orchestrator writes uses
+  // .flagtmp- prefix (so it cannot be confused for a real flag).
+  const dir = mkTmp('orch-AL2');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    let tmpObserved = null;
+    // Override fs.writeFileSync indirectly by spying via _writeFileSync.
+    // We DON'T actually write — capture the tmp path.
+    const writeSpy = (p, content, _opts) => {
+      tmpObserved = p;
+    };
+    const renameSpy = () => {}; // no-op
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    O.executeActions(
+      [{ type: 'spawn', phaseId: 'phase-1', role: 'impl', mode: 'initial', iteration: 1 }],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: makeFakeSpawnSession(),
+        _generatePrompt: makeFakeGenerate(),
+        _runUpdate: makeFakeRunUpdate(),
+        _writeFileSync: writeSpy,
+        _renameSync: renameSpy,
+        logger: silentLogger(),
+        projectName: 'p',
+      }
+    );
+    assert.ok(tmpObserved, 'tmp path was used during the rename');
+    const tmpName = path.basename(tmpObserved);
+    assert.match(tmpName, /^\.flagtmp-/, `tmp prefix must be .flagtmp-, got ${tmpName}`);
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AL3 [codex round 21 P2] bare run with non-completed manifest-status refuses to start', async () => {
+  const dir = mkTmp('orch-AL3');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, { phases: { 'phase-1': { status: 'running' } } });
+    const result = await O.runOrchestrator({
+      manifestPath: mp,
+      // resume: NOT set
+      _spawnSession: makeFakeSpawnSession(),
+      _generatePrompt: makeFakeGenerate(),
+      _checkHealth: () => makeStubHealth(),
+      _pidRunner: () => '[]',
+      _sleep: () => Promise.resolve(),
+      logger: silentLogger(),
+      projectName: 't',
+      skipScaffold: true,
+      maxTicks: 5,
+    });
+    assert.strictEqual(result.ok, false);
+    assert.strictEqual(result.summary, 'resume_required');
+    assert.match(result.error, /--resume/);
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AL4 [codex round 21 P2] --resume run honors existing manifest-status', async () => {
+  const dir = mkTmp('orch-AL4');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, { phases: { 'phase-1': { status: 'running' } } });
+    makePhaseDir(mp, 'phase-1');
+    let tick = 0;
+    const result = await O.runOrchestrator({
+      manifestPath: mp,
+      resume: true,
+      _spawnSession: makeFakeSpawnSession(),
+      _generatePrompt: makeFakeGenerate(),
+      _checkHealth: () => {
+        tick += 1;
+        if (tick === 2) writeCompletionSignal(makePhaseDir(mp, 'phase-1'), 'impl', 'complete');
+        return makeStubHealth({ pidAlive: true });
+      },
+      _pidRunner: () => '[]',
+      _sleep: () => Promise.resolve(),
+      logger: silentLogger(),
+      projectName: 't',
+      maxTicks: 5,
+    });
+    assert.strictEqual(result.ok, true);
+    assert.strictEqual(result.summary, 'completed');
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AL5 [codex round 21 P2] bare run with all-completed manifest-status proceeds (no resume needed)', async () => {
+  const dir = mkTmp('orch-AL5');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, { phases: { 'phase-1': { status: 'completed' } } });
+    const result = await O.runOrchestrator({
+      manifestPath: mp,
+      _spawnSession: makeFakeSpawnSession(),
+      _generatePrompt: makeFakeGenerate(),
+      _checkHealth: () => makeStubHealth(),
+      _pidRunner: () => '[]',
+      _sleep: () => Promise.resolve(),
+      logger: silentLogger(),
+      projectName: 't',
+      maxTicks: 3,
+    });
+    assert.strictEqual(result.summary, 'completed', `expected completed, got ${result.summary}`);
   } finally {
     rmrf(dir);
   }

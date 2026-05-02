@@ -2257,14 +2257,24 @@ function executeSpawn(action, tickState, runState, opts, deps) {
       if (typeof name !== 'string') continue;
       if (!name.startsWith('.pending-')) continue;
       if (name === ourFlagBasename) continue; // we'll rename over it
-      if (name.includes('.tmp-')) continue; // mid-write tmp; let it finish
+      // The new `.flagtmp-` prefix doesn't start with `.pending-`,
+      // so it's already excluded. Legacy `.pending-*.tmp-*` from
+      // older orchestrator versions: skip via substring check.
+      if (name.includes('.tmp-')) continue;
       bestEffortUnlink(unlinkSync, path.join(hookOrchDir, name));
     }
     flagPath = flagFilePath(hookOrchDir, sessionName);
     // Atomic write per todo 029: tmp + rename (same filesystem).
+    // Codex round 21 P2: the tmp basename MUST NOT match the hook's
+    // FLAG_NAME_RE (`/^\.pending-[A-Za-z0-9._-]+$/`). The prior
+    // shape `.pending-${sessionName}.tmp-...` matched (the regex
+    // accepts dots and hyphens), so a hook firing during the rename
+    // window or a crashed orchestrator's leftover tmp could be
+    // consumed as a real prompt. Use a `.flagtmp-` prefix that the
+    // hook explicitly does not match.
     const tmpPath = path.join(
       hookOrchDir,
-      `.pending-${sessionName}.tmp-${process.pid}-${Date.now()}`
+      `.flagtmp-${sessionName}-${process.pid}-${Date.now()}`
     );
     writeFile(tmpPath, promptText, { encoding: 'utf8' });
     renameFile(tmpPath, flagPath);
@@ -2589,6 +2599,38 @@ async function runOrchestrator(opts) {
   // re-render initial prompts via scaffold's templates copy.
   const manifestDir = path.dirname(path.resolve(opts.manifestPath));
   const orchDir = orchDirFor(manifestDir);
+
+  // Codex round 21 P2: honor --resume vs bare-run distinction.
+  // Bare run (no --resume) refuses to start when manifest-status
+  // exists with non-completed phases — otherwise the operator
+  // would silently re-attach to a half-finished prior run, which
+  // could re-spawn already-running agents or treat completed
+  // phases as terminal without verification. Force the operator
+  // to either pass --resume or delete the status file.
+  if (!opts.resume && !dryRun) {
+    const statusFn = opts._loadStatus || loadStatus;
+    const sr = statusFn(opts.manifestPath);
+    if (sr.ok && sr.status && sr.status.phases) {
+      const nonCompleted = Object.entries(sr.status.phases).filter(
+        ([, v]) =>
+          v && typeof v === 'object' && v.status && v.status !== 'completed'
+      );
+      if (nonCompleted.length > 0) {
+        const ids = nonCompleted.map(([id]) => id).join(', ');
+        const msg =
+          `manifest-status.yaml has non-completed phase(s): ${ids}. ` +
+          `Pass --resume to continue from existing state, or delete ` +
+          `the status file to start fresh.`;
+        logger('error', msg);
+        return {
+          ok: false,
+          summary: 'resume_required',
+          history: [],
+          error: msg,
+        };
+      }
+    }
+  }
 
   // Scaffold protocol (idempotent — never clobbers existing artifacts).
   if (!opts.skipScaffold) {
