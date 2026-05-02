@@ -268,6 +268,51 @@ function completionSignalFor(phaseDir, role) {
   return path.join(phaseDir, `${role}-complete.md`);
 }
 
+/**
+ * Resolve the actual completion-signal path for a (manifest, phase,
+ * role) tuple, honoring the manifest's `completion_signal` field when
+ * appropriate (codex round 5 P2).
+ *
+ * Per docs/manifest-reference.md, each phase's `completion_signal` is
+ * a path relative to the manifest's directory pointing at the
+ * phase-level completion artifact. For single-role phases it's
+ * unambiguous: that path IS the role's completion signal. For multi-
+ * role phases the manifest's single field can describe at most one
+ * role's signal — V1 convention assigns it to `impl` (the role
+ * named in the default `<phaseDir>/impl-complete.md`); other roles
+ * fall back to per-role naming.
+ *
+ * Returns an absolute path. The fallback (when `manifest.phase
+ * .completion_signal` is absent / non-default for this role) is the
+ * conventional `<phaseDir>/<role>-complete.md`.
+ */
+function resolveCompletionSignal(manifest, manifestDir, phaseId, role) {
+  const phaseEntry =
+    Array.isArray(manifest.phases)
+      ? manifest.phases.find((p) => p && p.id === phaseId)
+      : null;
+  if (
+    phaseEntry &&
+    typeof phaseEntry.completion_signal === 'string' &&
+    phaseEntry.completion_signal !== ''
+  ) {
+    // The manifest's path applies to the role whose default file name
+    // is in the path's basename. e.g. `.../impl-complete.md` is the
+    // impl role's signal; for QA we still default to <phaseDir>/qa-complete.md.
+    const declared = path.isAbsolute(phaseEntry.completion_signal)
+      ? phaseEntry.completion_signal
+      : path.resolve(manifestDir, phaseEntry.completion_signal);
+    const baseName = path.basename(declared);
+    if (baseName === `${role}-complete.md`) return declared;
+    // Different role's path declared at the manifest level. Fall back
+    // to convention so QA / coord roles get their own files.
+  }
+  return completionSignalFor(
+    phaseDirFor(manifestDir, phaseId),
+    role
+  );
+}
+
 function qaVerdictFor(phaseDir) {
   return path.join(phaseDir, 'qa-verdict.json');
 }
@@ -824,7 +869,13 @@ function decideTickActions(tickState, runState, opts) {
       //                   advance.
       //   - 'partial'   → mark phase blocked (operator decides).
       //   - other / unknown / unparseable → log + re-poll.
-      const signalPath = completionSignalFor(phaseDir, role);
+      // Codex round 5 P2: honor manifest's completion_signal when set.
+      const signalPath = resolveCompletionSignal(
+        manifest,
+        manifestDir,
+        phase.id,
+        role
+      );
       const sigParsed = parseCompletionSignal(signalPath, opts);
       const isQaReviewSignal = reviewEnabled && role === 'qa' && sigParsed !== null;
       if (sigParsed && !isQaReviewSignal) {
@@ -990,7 +1041,7 @@ function decideTickActions(tickState, runState, opts) {
         for (const a of phase.agents) {
           if (a.role === role) continue; // current role is complete
           const sig = parseCompletionSignal(
-            completionSignalFor(phaseDir, a.role),
+            resolveCompletionSignal(manifest, manifestDir, phase.id, a.role),
             opts
           );
           if (!sig || sig.status !== 'complete') {
@@ -1608,7 +1659,7 @@ function executeSpawn(action, tickState, runState, opts, deps) {
       ? rawPhase.review_loop
       : {};
 
-  // Stale-signal cleanup. Three respawn cases that need cleanup:
+  // Stale-signal cleanup queue. Three respawn cases that need cleanup:
   //   1. recovery — same role respawned after crash. The prior
   //      session may have written a completion signal moments before
   //      crashing; without cleanup the orchestrator would immediately
@@ -1621,25 +1672,39 @@ function executeSpawn(action, tickState, runState, opts, deps) {
   //      iteration's qa-complete.md (if any) must be removed before
   //      the new QA agent runs. (impl-complete.md stays — that's the
   //      trigger that brought us here.)
-  // dryRun skips all disk writes including the cleanup.
+  //
+  // Codex round 5 P2: defer the unlinks until AFTER the spawn
+  // succeeds. If the spawn fails first, the QA verdict / completion
+  // signals stay on disk so the next tick can re-decide cleanly. The
+  // executeActions error path skips the matching `persist` action,
+  // so the phase remains in its prior `review_stage: qa` (or
+  // equivalent) state — the verdict isn't lost.
+  const staleUnlinks = [];
   if (!dryRun) {
+    // Use resolveCompletionSignal so a manifest-declared custom path
+    // is also unlinked (covers both the manifest's path AND the
+    // conventional default; the dual-unlink is harmless via
+    // bestEffortUnlink's ENOENT-tolerant semantics).
+    const sigFor = (r) =>
+      resolveCompletionSignal(manifest, manifestDir, phase.id, r);
     if (isRecovery) {
-      bestEffortUnlink(unlinkSync, completionSignalFor(phaseDir, role));
+      staleUnlinks.push(sigFor(role));
+      staleUnlinks.push(completionSignalFor(phaseDir, role));
       if (role === 'qa') {
-        bestEffortUnlink(unlinkSync, qaVerdictFor(phaseDir));
+        staleUnlinks.push(qaVerdictFor(phaseDir));
       }
     }
     if (isReviewRetry) {
-      // role here is 'impl' — but we need to clear the previous
-      // iteration's BOTH signals so the next impl-complete (and the
-      // subsequent qa-complete) are clean.
-      bestEffortUnlink(unlinkSync, completionSignalFor(phaseDir, 'impl'));
-      bestEffortUnlink(unlinkSync, completionSignalFor(phaseDir, 'qa'));
-      bestEffortUnlink(unlinkSync, qaVerdictFor(phaseDir));
+      staleUnlinks.push(sigFor('impl'));
+      staleUnlinks.push(sigFor('qa'));
+      staleUnlinks.push(completionSignalFor(phaseDir, 'impl'));
+      staleUnlinks.push(completionSignalFor(phaseDir, 'qa'));
+      staleUnlinks.push(qaVerdictFor(phaseDir));
     }
     if (isInitialQa) {
-      bestEffortUnlink(unlinkSync, completionSignalFor(phaseDir, 'qa'));
-      bestEffortUnlink(unlinkSync, qaVerdictFor(phaseDir));
+      staleUnlinks.push(sigFor('qa'));
+      staleUnlinks.push(completionSignalFor(phaseDir, 'qa'));
+      staleUnlinks.push(qaVerdictFor(phaseDir));
     }
   }
 
@@ -1654,15 +1719,13 @@ function executeSpawn(action, tickState, runState, opts, deps) {
 
   // Previous-phase signals: enumerate completion signals from upstream
   // phases — generate-prompt builds the briefing from those.
+  // Codex round 5 P2: honor manifest's completion_signal when set.
   const priorPhaseSignals = [];
   for (const dep of phase.depends_on || []) {
     const depPhase = phases.find((p) => p.id === dep);
     if (!depPhase) continue;
     for (const a of depPhase.agents) {
-      const sigPath = completionSignalFor(
-        phaseDirFor(manifestDir, dep),
-        a.role
-      );
+      const sigPath = resolveCompletionSignal(manifest, manifestDir, dep, a.role);
       if (existsSync(sigPath)) priorPhaseSignals.push(sigPath);
     }
   }
@@ -1679,6 +1742,20 @@ function executeSpawn(action, tickState, runState, opts, deps) {
     ? path.resolve(manifestDir, manifest.workdir)
     : manifestDir;
 
+  // Resolve the completion-signal path for this role's dispatch. This
+  // is the path the AGENT writes to (rendered into the prompt's
+  // {{completion_signal_path}}) — same path the orchestrator polls.
+  // Manifest-declared custom paths flow through resolveCompletionSignal
+  // (codex round 5 P2). For non-impl roles whose role doesn't match
+  // the manifest's basename, the convention default applies.
+  const effectiveRoleForSignal = isRecovery ? role : role;
+  const dispatchCompletionSignal = resolveCompletionSignal(
+    manifest,
+    manifestDir,
+    phase.id,
+    effectiveRoleForSignal
+  );
+
   const genOpts = {
     role: isRecovery ? 'recovery' : role,
     recoveryRole: isRecovery ? role : undefined,
@@ -1688,6 +1765,7 @@ function executeSpawn(action, tickState, runState, opts, deps) {
     workdir: resolvedWorkdir,
     phaseDir,
     priorPhaseSignals,
+    completionSignalPath: dispatchCompletionSignal,
   };
 
   // plan_units (codex round 3 P1). impl-prompt.md, qa-prompt.md, and
@@ -1822,6 +1900,17 @@ function executeSpawn(action, tickState, runState, opts, deps) {
 
   // Read the rendered prompt and write the flag file. On dry-run, skip
   // the flag write — there's no agent to consume it.
+  //
+  // Codex round 5 P1: the SessionStart hook reads
+  // `$CLAUDE_PROJECT_DIR/docs/orchestration/.pending-<id>`. Claude Code
+  // sets `CLAUDE_PROJECT_DIR` from the spawned tab's
+  // `--startingDirectory` (i.e., `resolvedWorkdir`). When manifest's
+  // `workdir` differs from manifestDir, the hook's read path is under
+  // resolvedWorkdir, NOT manifestDir. We must write the flag to the
+  // path the hook will actually read. Other protocol artifacts
+  // (heartbeats, prompts, completion signals) stay under manifestDir
+  // per scaffold-protocol's contract.
+  const hookOrchDir = orchDirFor(resolvedWorkdir);
   if (!dryRun) {
     let promptText;
     try {
@@ -1838,11 +1927,11 @@ function executeSpawn(action, tickState, runState, opts, deps) {
           `Trim the prompt or split the phase.`
       );
     }
-    mkdir(orchDir, { recursive: true });
-    const flagPath = flagFilePath(orchDir, sessionName);
+    mkdir(hookOrchDir, { recursive: true });
+    const flagPath = flagFilePath(hookOrchDir, sessionName);
     // Atomic write per todo 029: tmp + rename (same filesystem).
     const tmpPath = path.join(
-      orchDir,
+      hookOrchDir,
       `.pending-${sessionName}.tmp-${process.pid}-${Date.now()}`
     );
     writeFile(tmpPath, promptText, { encoding: 'utf8' });
@@ -1876,6 +1965,15 @@ function executeSpawn(action, tickState, runState, opts, deps) {
       pluginDir: effectivePluginDir,
       launcher: manifest.launcher || null,
     });
+  }
+
+  // Stale-signal cleanup runs ONLY after the spawn succeeds (codex
+  // round 5 P2). If the spawn threw, this code is unreachable and the
+  // prior signals stay on disk — the next tick re-decides cleanly
+  // without losing the QA verdict (which would otherwise leave the
+  // phase in `review_stage: qa` with deleted signals, unrecoverable).
+  if (!dryRun) {
+    for (const p of staleUnlinks) bestEffortUnlink(unlinkSync, p);
   }
 
   // Persist spawn metadata. CRITICAL — design decision #7 / todo 087:
@@ -2427,6 +2525,7 @@ module.exports = {
   orchDirFor,
   templatesDirFor,
   completionSignalFor,
+  resolveCompletionSignal,
   qaVerdictFor,
   // CLI helpers (exported for tests)
   parseCliArgs,

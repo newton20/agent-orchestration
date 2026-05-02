@@ -3043,6 +3043,214 @@ test('U5 [codex round 4 P2] lockfile uses exclusive create — second concurrent
   }
 });
 
+// =========================================================================
+// V — codex round 5 regression tests
+// =========================================================================
+
+test('V1 [codex round 5 P1] flag file written under workdir/docs/orchestration when workdir != manifestDir', () => {
+  const dir = mkTmp('orch-V1');
+  try {
+    const wd = path.join(dir, 'subworkdir');
+    fs.mkdirSync(wd, { recursive: true });
+    const mp = writeManifest(dir, makeBaseManifest({ workdir: 'subworkdir' }));
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    O.executeActions(
+      [{ type: 'spawn', phaseId: 'phase-1', role: 'impl', mode: 'initial', iteration: 1 }],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: makeFakeSpawnSession(),
+        _generatePrompt: makeFakeGenerate({ promptText: '# v1' }),
+        _runUpdate: makeFakeRunUpdate(),
+        logger: silentLogger(),
+        projectName: 'p',
+      }
+    );
+    // Flag file lives where the hook reads — under workdir, not manifestDir.
+    const wdFlag = path.join(wd, 'docs', 'orchestration', '.pending-orch-phase-1-impl');
+    assert.ok(fs.existsSync(wdFlag), `expected flag at ${wdFlag}`);
+    // The OLD path (under manifestDir) should NOT have the flag.
+    const oldFlag = path.join(dir, 'docs', 'orchestration', '.pending-orch-phase-1-impl');
+    assert.ok(!fs.existsSync(oldFlag), 'flag must NOT be at manifestDir path when workdir differs');
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('V2 [codex round 5 P2] manifest completion_signal honored — orchestrator polls custom path', () => {
+  const dir = mkTmp('orch-V2');
+  try {
+    const mp = writeManifest(
+      dir,
+      makeBaseManifest({
+        phases: [
+          {
+            id: 'p',
+            // Custom path
+            completion_signal: 'docs/custom/p/impl-complete.md',
+            agents: [{ role: 'impl' }],
+          },
+        ],
+      })
+    );
+    writeStatus(mp, { phases: { p: { status: 'running' } } });
+    // Write the signal at the custom path the manifest declared.
+    const customDir = path.join(dir, 'docs', 'custom', 'p');
+    fs.mkdirSync(customDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(customDir, 'impl-complete.md'),
+      '---\nstatus: complete\n---\n# done'
+    );
+    // Also create the conventional phase dir (used for heartbeats etc).
+    makePhaseDir(mp, 'p');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {}
+    );
+    assert.ok(
+      actions.some((a) => a.type === 'mark_phase_completed' && a.phaseId === 'p'),
+      'orchestrator should poll the manifest-declared completion_signal path'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('V3 [codex round 5 P2] resolveCompletionSignal returns manifest path for matching role basename', () => {
+  const manifest = {
+    phases: [
+      {
+        id: 'p',
+        completion_signal: 'docs/custom/p/impl-complete.md',
+        agents: [{ role: 'impl' }],
+      },
+    ],
+  };
+  const dir = mkTmp('orch-V3');
+  try {
+    const got = O.resolveCompletionSignal(manifest, dir, 'p', 'impl');
+    assert.strictEqual(
+      path.normalize(got),
+      path.normalize(path.join(dir, 'docs', 'custom', 'p', 'impl-complete.md'))
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('V4 [codex round 5 P2] resolveCompletionSignal falls back to convention for non-matching role', () => {
+  const manifest = {
+    phases: [
+      {
+        id: 'p',
+        completion_signal: 'docs/custom/p/impl-complete.md',
+        agents: [{ role: 'impl' }, { role: 'qa' }],
+      },
+    ],
+  };
+  // Asking for 'qa' should fall back to convention (not pull the impl-complete.md path).
+  const got = O.resolveCompletionSignal(manifest, '/manifestDir', 'p', 'qa');
+  assert.match(path.normalize(got), /qa-complete\.md$/);
+});
+
+test('V5 [codex round 5 P2] review_retry: spawn failure preserves QA verdict signals on disk', () => {
+  const dir = mkTmp('orch-V5');
+  try {
+    const mp = writeManifest(
+      dir,
+      makeBaseManifest({
+        phases: [
+          {
+            id: 'p',
+            completion_signal: 'docs/orchestration/phases/p/impl-complete.md',
+            review_loop: { enabled: true, max_iterations: 3 },
+            agents: [{ role: 'impl' }, { role: 'qa' }],
+          },
+        ],
+      })
+    );
+    const phaseDir = makePhaseDir(mp, 'p');
+    writeCompletionSignal(phaseDir, 'impl', 'complete');
+    writeCompletionSignal(phaseDir, 'qa', 'blocked');
+    fs.writeFileSync(
+      path.join(phaseDir, 'qa-verdict.json'),
+      JSON.stringify({ pass: false, failures: [] })
+    );
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const failingSpawn = () => {
+      throw new Error('wt unavailable');
+    };
+    O.executeActions(
+      [
+        {
+          type: 'spawn',
+          phaseId: 'p',
+          role: 'impl',
+          mode: 'review_retry',
+          iteration: 2,
+          verdict: { pass: false, failures: [], source: 'qa-complete.md', signalStatus: 'blocked' },
+        },
+      ],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: failingSpawn,
+        _generatePrompt: makeFakeGenerate(),
+        _runUpdate: makeFakeRunUpdate(),
+        logger: silentLogger(),
+        projectName: 'p',
+      }
+    );
+    // Spawn failed — the prior verdict signals MUST still be on disk.
+    assert.ok(fs.existsSync(path.join(phaseDir, 'qa-complete.md')), 'qa-complete.md must survive failed retry spawn');
+    assert.ok(fs.existsSync(path.join(phaseDir, 'qa-verdict.json')), 'qa-verdict.json must survive failed retry spawn');
+    assert.ok(fs.existsSync(path.join(phaseDir, 'impl-complete.md')), 'impl-complete.md must survive failed retry spawn');
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('V6 [codex round 5 P2] generate-prompt receives manifest completion_signal as completionSignalPath', () => {
+  const dir = mkTmp('orch-V6');
+  try {
+    const mp = writeManifest(
+      dir,
+      makeBaseManifest({
+        phases: [
+          {
+            id: 'p',
+            completion_signal: 'docs/custom/p/impl-complete.md',
+            agents: [{ role: 'impl' }],
+          },
+        ],
+      })
+    );
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const fakeGen = makeFakeGenerate();
+    O.executeActions(
+      [{ type: 'spawn', phaseId: 'p', role: 'impl', mode: 'initial', iteration: 1 }],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: makeFakeSpawnSession(),
+        _generatePrompt: fakeGen,
+        _runUpdate: makeFakeRunUpdate(),
+        logger: silentLogger(),
+        projectName: 'p',
+      }
+    );
+    const passedPath = fakeGen.calls[0].completionSignalPath;
+    assert.match(path.normalize(passedPath), /docs[\\/]custom[\\/]p[\\/]impl-complete\.md$/);
+  } finally {
+    rmrf(dir);
+  }
+});
+
 test('Q2 CLI: missing manifest path exits 1', () => {
   const r = spawnSync(process.execPath, [path.join(__dirname, 'orchestrate.js')], {
     encoding: 'utf8',
