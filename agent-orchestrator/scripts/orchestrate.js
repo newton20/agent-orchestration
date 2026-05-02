@@ -1478,6 +1478,24 @@ function executeSpawn(action, tickState, runState, opts, deps) {
   const isReviewRetry = action.mode === 'review_retry';
   const isInitialQa = action.mode === 'initial' && role === 'qa';
 
+  // Codex round 3 P2: normalizePhases keeps only `enabled` and
+  // `max_iterations` from the manifest's review_loop block; the
+  // user-provided `pr_or_branch` and `qa_scope_rows` are silently
+  // dropped from the normalized phase. Recover them by reading the
+  // raw phase entry off the manifest's untouched `phases` array.
+  // Same pattern for `plan_path` / `plan_unit_marker` (codex round 3
+  // P1) — these are NOT in parse-manifest's KNOWN_PHASE today; the
+  // manifest validator warns on them but accepts the manifest, so
+  // the orchestrator reads them from the raw phase.
+  const rawPhase =
+    (Array.isArray(manifest.phases)
+      ? manifest.phases.find((p) => p && p.id === phase.id)
+      : null) || {};
+  const rawReviewLoop =
+    rawPhase.review_loop && typeof rawPhase.review_loop === 'object'
+      ? rawPhase.review_loop
+      : {};
+
   // Stale-signal cleanup. Three respawn cases that need cleanup:
   //   1. recovery — same role respawned after crash. The prior
   //      session may have written a completion signal moments before
@@ -1559,6 +1577,52 @@ function executeSpawn(action, tickState, runState, opts, deps) {
     phaseDir,
     priorPhaseSignals,
   };
+
+  // plan_units (codex round 3 P1). impl-prompt.md, qa-prompt.md, and
+  // recovery-prompt.md all declare it as required. Resolution order:
+  //   1. raw phase's `plan_path` + `plan_unit_marker` → generate-prompt
+  //      extracts the marked unit's text from the plan file.
+  //   2. raw phase's `plan_units` literal string → use verbatim.
+  //   3. opts.planUnitsFor(phase) callback → orchestrator-wide
+  //      programmatic resolution (test seam).
+  //   4. Fallback stub. impl-prompt.md fails on empty plan_units, so
+  //      we render a minimal phase descriptor that satisfies the
+  //      "non-empty string" gate while making the absence visible to
+  //      the agent.
+  if (
+    typeof rawPhase.plan_path === 'string' &&
+    typeof rawPhase.plan_unit_marker === 'string' &&
+    rawPhase.plan_path !== '' &&
+    rawPhase.plan_unit_marker !== ''
+  ) {
+    genOpts.planPath = path.isAbsolute(rawPhase.plan_path)
+      ? rawPhase.plan_path
+      : path.resolve(manifestDir, rawPhase.plan_path);
+    genOpts.planUnitMarker = rawPhase.plan_unit_marker;
+  } else if (typeof rawPhase.plan_units === 'string' && rawPhase.plan_units !== '') {
+    genOpts.planUnits = rawPhase.plan_units;
+  } else if (typeof opts.planUnitsFor === 'function') {
+    const v = opts.planUnitsFor(phase);
+    if (typeof v === 'string' && v !== '') genOpts.planUnits = v;
+  }
+  if (
+    !genOpts.planUnits &&
+    !(genOpts.planPath && genOpts.planUnitMarker)
+  ) {
+    // Last-resort stub. The impl prompt's `plan_units` is REQUIRED;
+    // without something here, generatePrompt throws. Render a minimal
+    // descriptor from the phase metadata so the agent at least knows
+    // which phase it's running.
+    const rolesList = phase.agents.map((a) => a.role).join(', ') || 'impl';
+    genOpts.planUnits =
+      `(No plan excerpt configured for phase ${phase.id}. Set ` +
+      `\`phases[].plan_path\` + \`plan_unit_marker\` in the manifest, or ` +
+      `\`phases[].plan_units\` for a literal block, to wire one.)\n\n` +
+      `**Phase:** ${phase.id}\n` +
+      `**Title:** ${phase.title || '(untitled)'}\n` +
+      `**Completion signal:** ${phase.completion_signal}\n` +
+      `**Agent roles:** ${rolesList}\n`;
+  }
   if (isRecovery) {
     genOpts.crashTimestamp = new Date(
       opts._now ? opts._now() : Date.now()
@@ -1602,11 +1666,17 @@ function executeSpawn(action, tickState, runState, opts, deps) {
     // current branch HEAD; the orchestrator does not run git commands
     // — it leaves that to the QA agent itself). The qa_scope_rows are
     // taken from the phase's manifest entry if present.
+    // Codex round 3 P2: pr_or_branch and qa_scope_rows live on the
+    // raw manifest's review_loop block — normalizePhases drops them.
     genOpts.prOrBranchUnderTest =
-      (phase.review_loop && phase.review_loop.pr_or_branch) ||
+      (rawReviewLoop && typeof rawReviewLoop.pr_or_branch === 'string'
+        ? rawReviewLoop.pr_or_branch
+        : null) ||
       `HEAD of ${resolvedWorkdir}`;
     genOpts.qaScopeRows =
-      (phase.review_loop && phase.review_loop.qa_scope_rows) ||
+      (rawReviewLoop && typeof rawReviewLoop.qa_scope_rows === 'string'
+        ? rawReviewLoop.qa_scope_rows
+        : null) ||
       `1. Implementation matches plan excerpt for phase ${phase.id} — PASS/FAIL`;
   }
   if (role === 'coord') {

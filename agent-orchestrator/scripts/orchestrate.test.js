@@ -2633,6 +2633,197 @@ test('S5 [codex round 2 P2] --max-ticks reflects same-tick failure in exitOk', a
   }
 });
 
+// =========================================================================
+// T — codex round 3 regression tests
+// =========================================================================
+
+function copyTemplatesTo(destDir) {
+  const src = path.join(__dirname, '..', 'templates');
+  fs.mkdirSync(destDir, { recursive: true });
+  for (const name of fs.readdirSync(src)) {
+    if (name.endsWith('.md')) {
+      fs.copyFileSync(path.join(src, name), path.join(destDir, name));
+    }
+  }
+}
+
+test('T1 [codex round 3 P1] impl spawn with REAL generatePrompt + no plan_path → fallback stub satisfies required plan_units', () => {
+  const dir = mkTmp('orch-T1');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    const tmpl = path.join(dir, 'docs', 'orchestration', 'templates');
+    copyTemplatesTo(tmpl);
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const fakeSpawn = makeFakeSpawnSession();
+    const fakeUpdate = makeFakeRunUpdate();
+    const out = O.executeActions(
+      [{ type: 'spawn', phaseId: 'phase-1', role: 'impl', mode: 'initial', iteration: 1 }],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: fakeSpawn,
+        // _generatePrompt: NOT injected — uses the real generate-prompt.
+        _runUpdate: fakeUpdate,
+        templatesDir: tmpl,
+        logger: silentLogger(),
+        projectName: 't',
+      }
+    );
+    assert.strictEqual(out.warnings.filter((w) => /spawn failed/.test(w)).length, 0,
+      `spawn must succeed even without plan_path; warnings=${JSON.stringify(out.warnings)}`);
+    // The rendered prompt should contain the fallback stub.
+    const promptPath = path.join(
+      dir, 'docs', 'orchestration', 'phases', 'phase-1', 'impl-prompt.md'
+    );
+    assert.ok(fs.existsSync(promptPath));
+    const text = fs.readFileSync(promptPath, 'utf8');
+    assert.match(text, /No plan excerpt configured for phase phase-1/);
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('T2 [codex round 3 P1] impl spawn with manifest plan_path + plan_unit_marker extracts the marked unit', () => {
+  const dir = mkTmp('orch-T2');
+  try {
+    const planPath = path.join(dir, 'plan.md');
+    fs.writeFileSync(
+      planPath,
+      [
+        '# Plan',
+        '',
+        '- [ ] **Unit alpha: First unit**',
+        '  This is unit alpha\'s body. Ship X.',
+        '',
+        '- [ ] **Unit beta: Second unit**',
+        '  This is unit beta\'s body. Ship Y.',
+      ].join('\n')
+    );
+    const mp = writeManifest(
+      dir,
+      makeBaseManifest({
+        phases: [
+          {
+            id: 'p',
+            completion_signal: 'docs/orchestration/phases/p/impl-complete.md',
+            agents: [{ role: 'impl' }],
+            plan_path: 'plan.md',
+            plan_unit_marker: 'alpha',
+          },
+        ],
+      })
+    );
+    const tmpl = path.join(dir, 'docs', 'orchestration', 'templates');
+    copyTemplatesTo(tmpl);
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    O.executeActions(
+      [{ type: 'spawn', phaseId: 'p', role: 'impl', mode: 'initial', iteration: 1 }],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: makeFakeSpawnSession(),
+        _runUpdate: makeFakeRunUpdate(),
+        templatesDir: tmpl,
+        logger: silentLogger(),
+        projectName: 't',
+      }
+    );
+    const text = fs.readFileSync(
+      path.join(dir, 'docs', 'orchestration', 'phases', 'p', 'impl-prompt.md'),
+      'utf8'
+    );
+    assert.match(text, /This is unit alpha/);
+    assert.ok(!/This is unit beta/.test(text), 'beta should NOT leak into alpha\'s prompt');
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('T3 [codex round 3 P2] manifest review_loop.pr_or_branch reaches QA prompt', () => {
+  const dir = mkTmp('orch-T3');
+  try {
+    const mp = writeManifest(
+      dir,
+      makeBaseManifest({
+        phases: [
+          {
+            id: 'p',
+            completion_signal: 'docs/orchestration/phases/p/impl-complete.md',
+            review_loop: {
+              enabled: true,
+              max_iterations: 3,
+              pr_or_branch: 'feat/my-branch',
+              qa_scope_rows: '1. Custom scope row.\n2. Another row.',
+            },
+            agents: [{ role: 'impl' }, { role: 'qa' }],
+          },
+        ],
+      })
+    );
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const fakeGen = makeFakeGenerate();
+    O.executeActions(
+      [{ type: 'spawn', phaseId: 'p', role: 'qa', mode: 'initial', iteration: 1 }],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: makeFakeSpawnSession(),
+        _generatePrompt: fakeGen,
+        _runUpdate: makeFakeRunUpdate(),
+        logger: silentLogger(),
+        projectName: 't',
+      }
+    );
+    assert.strictEqual(fakeGen.calls[0].prOrBranchUnderTest, 'feat/my-branch');
+    assert.strictEqual(
+      fakeGen.calls[0].qaScopeRows,
+      '1. Custom scope row.\n2. Another row.'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('T4 [codex round 3 P1] phase plan_units literal string overrides plan_path', () => {
+  const dir = mkTmp('orch-T4');
+  try {
+    const mp = writeManifest(
+      dir,
+      makeBaseManifest({
+        phases: [
+          {
+            id: 'p',
+            completion_signal: 'docs/orchestration/phases/p/impl-complete.md',
+            agents: [{ role: 'impl' }],
+            plan_units: '## Inline excerpt\n\nDo the thing.',
+          },
+        ],
+      })
+    );
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const fakeGen = makeFakeGenerate();
+    O.executeActions(
+      [{ type: 'spawn', phaseId: 'p', role: 'impl', mode: 'initial', iteration: 1 }],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: makeFakeSpawnSession(),
+        _generatePrompt: fakeGen,
+        _runUpdate: makeFakeRunUpdate(),
+        logger: silentLogger(),
+        projectName: 't',
+      }
+    );
+    assert.strictEqual(fakeGen.calls[0].planUnits, '## Inline excerpt\n\nDo the thing.');
+    // planPath / planUnitMarker should NOT also be set when literal is present.
+    assert.strictEqual(fakeGen.calls[0].planPath, undefined);
+  } finally {
+    rmrf(dir);
+  }
+});
+
 test('Q2 CLI: missing manifest path exits 1', () => {
   const r = spawnSync(process.execPath, [path.join(__dirname, 'orchestrate.js')], {
     encoding: 'utf8',
