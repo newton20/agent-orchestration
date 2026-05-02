@@ -30,16 +30,34 @@ When the user invokes this skill with a manifest path:
    `js-yaml` at module-load time and will throw a `Cannot find module`
    error on a fresh checkout if `node_modules/` is missing.
 
+   PowerShell (Windows default):
+
+   ```powershell
+   Push-Location "$env:CLAUDE_PLUGIN_ROOT/scripts"
+   if (-not (Test-Path node_modules)) { npm install }
+   Pop-Location
+   ```
+
+   Bash (non-Windows or git-bash):
+
    ```bash
-   cd ${CLAUDE_PLUGIN_ROOT}/scripts && (test -d node_modules || npm install)
+   cd "$CLAUDE_PLUGIN_ROOT/scripts" && (test -d node_modules || npm install)
    ```
 
    The first run on a fresh checkout installs; subsequent runs skip.
 
 2. **Validate the manifest.**
 
+   PowerShell:
+
+   ```powershell
+   node "$env:CLAUDE_PLUGIN_ROOT/scripts/parse-manifest.js" <manifest.yaml>
+   ```
+
+   Bash:
+
    ```bash
-   node ${CLAUDE_PLUGIN_ROOT}/scripts/parse-manifest.js <manifest.yaml>
+   node "$CLAUDE_PLUGIN_ROOT/scripts/parse-manifest.js" <manifest.yaml>
    ```
 
    If the JSON output's `valid` field is `false`, surface every error
@@ -49,14 +67,20 @@ When the user invokes this skill with a manifest path:
 
 3. **Start the orchestrator process.**
 
-   ```bash
-   node ${CLAUDE_PLUGIN_ROOT}/scripts/orchestrate.js <manifest.yaml>
+   PowerShell:
+
+   ```powershell
+   node "$env:CLAUDE_PLUGIN_ROOT/scripts/orchestrate.js" <manifest.yaml>
+   # or for a resumed run after a crash / machine restart:
+   node "$env:CLAUDE_PLUGIN_ROOT/scripts/orchestrate.js" --resume <manifest.yaml>
    ```
 
-   Or for a resumed run after a crash / machine restart:
+   Bash:
 
    ```bash
-   node ${CLAUDE_PLUGIN_ROOT}/scripts/orchestrate.js --resume <manifest.yaml>
+   node "$CLAUDE_PLUGIN_ROOT/scripts/orchestrate.js" <manifest.yaml>
+   # or for a resumed run after a crash / machine restart:
+   node "$CLAUDE_PLUGIN_ROOT/scripts/orchestrate.js" --resume <manifest.yaml>
    ```
 
    Tell the user:

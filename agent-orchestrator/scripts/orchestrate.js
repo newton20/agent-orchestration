@@ -2666,6 +2666,24 @@ async function runOrchestrator(opts) {
         error: errs,
       };
     }
+    // Codex round 23 P2: scaffold returns ok: true with a warning
+    // when the source `templates/` directory is missing (templates_dir
+    // null). Without this guard, every spawn fails in generatePrompt
+    // because docs/orchestration/templates doesn't exist, the phase
+    // stays pending, and the orchestrator retries forever. Fail
+    // preflight loudly with the warning text so the operator fixes
+    // the --plugin-dir path.
+    if (!dryRun && scaffoldResult.templates_dir === null) {
+      const warnings = (scaffoldResult.warnings || []).join('; ');
+      const msg = `scaffold completed but no templates directory was copied${warnings ? ` (${warnings})` : ''} — orchestrator cannot render prompts`;
+      logger('error', msg);
+      return {
+        ok: false,
+        summary: 'scaffold_no_templates',
+        history: [],
+        error: msg,
+      };
+    }
   }
 
   // Lockfile. Acquired per orchestrator instance; released on exit.
@@ -2708,7 +2726,21 @@ async function runOrchestrator(opts) {
           ? preLoad.manifest.workdir
           : path.resolve(manifestDir, preLoad.manifest.workdir);
         const wdOrch = orchDirFor(wd);
-        if (path.normalize(wdOrch) !== path.normalize(orchDir)) {
+        // Codex round 23 P2: case-insensitive comparison on Windows.
+        // path.normalize preserves casing, so absolute paths like
+        // C:\Repo and c:\repo compare unequal even though Windows
+        // treats them as the same directory. The orchestrator would
+        // then try to acquire its own lock a second time (filesystem
+        // sees the same file) and report contention against its own
+        // PID. Use a platform-aware compare.
+        const samePath = (a, b) => {
+          const na = path.normalize(a);
+          const nb = path.normalize(b);
+          return process.platform === 'win32'
+            ? na.toLowerCase() === nb.toLowerCase()
+            : na === nb;
+        };
+        if (!samePath(wdOrch, orchDir)) {
           try {
             workdirLockPath = acquireLock(wdOrch, opts);
           } catch (e) {

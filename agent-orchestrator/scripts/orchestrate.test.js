@@ -5029,6 +5029,48 @@ test('AM1 [codex round 22 P2] shared-workdir secondary lock refuses second concu
   }
 });
 
+// =========================================================================
+// AN — codex round 23 regression tests
+// =========================================================================
+
+test('AN1 [codex round 23 P2] scaffold without templates → preflight fails fast', async () => {
+  const dir = mkTmp('orch-AN1');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    // Inject a scaffold fake that returns ok but with templates_dir: null
+    // (matches scaffold-protocol's behavior when the source templates/ dir
+    // is missing under --plugin-dir).
+    const fakeScaffold = () => ({
+      ok: true,
+      protoDir: path.join(dir, 'docs', 'orchestration'),
+      phases_created: ['phase-1'],
+      events_log: '/x',
+      events_log_preserved: false,
+      templates_dir: null,
+      templates_copied: 0,
+      templates_skipped: 0,
+      warnings: ['templates directory not found at /nonexistent/templates'],
+    });
+    const result = await O.runOrchestrator({
+      manifestPath: mp,
+      _spawnSession: makeFakeSpawnSession(),
+      _generatePrompt: makeFakeGenerate(),
+      _checkHealth: () => makeStubHealth(),
+      _pidRunner: () => '[]',
+      _sleep: () => Promise.resolve(),
+      _scaffoldProtocol: fakeScaffold,
+      logger: silentLogger(),
+      projectName: 't',
+      maxTicks: 5,
+    });
+    assert.strictEqual(result.ok, false);
+    assert.strictEqual(result.summary, 'scaffold_no_templates');
+    assert.match(result.error, /templates/);
+  } finally {
+    rmrf(dir);
+  }
+});
+
 test('Q2 CLI: missing manifest path exits 1', () => {
   const r = spawnSync(process.execPath, [path.join(__dirname, 'orchestrate.js')], {
     encoding: 'utf8',
