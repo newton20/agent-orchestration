@@ -1939,11 +1939,19 @@ function executeSpawn(action, tickState, runState, opts, deps) {
   // sets `CLAUDE_PROJECT_DIR` from the spawned tab's
   // `--startingDirectory` (i.e., `resolvedWorkdir`). When manifest's
   // `workdir` differs from manifestDir, the hook's read path is under
-  // resolvedWorkdir, NOT manifestDir. We must write the flag to the
-  // path the hook will actually read. Other protocol artifacts
-  // (heartbeats, prompts, completion signals) stay under manifestDir
-  // per scaffold-protocol's contract.
+  // resolvedWorkdir, NOT manifestDir.
+  //
+  // Codex round 7 P1: the hook does NOT match `.pending-*` files by
+  // sessionName; it picks the oldest fresh flag and returns its
+  // content. With multiple flags written + multiple parallel
+  // wt new-tab spawns, the hook of one tab can consume another
+  // tab's prompt. The orchestrator MUST serialize: write flag,
+  // spawn tab, wait for the hook to consume the flag (atomic
+  // rename converts it to `.consuming-*`, then unlink), THEN
+  // proceed to the next spawn. If the wait times out, log and
+  // continue — a slow tab is a recovery candidate, not a fatal.
   const hookOrchDir = orchDirFor(resolvedWorkdir);
+  let flagPath = null;
   if (!dryRun) {
     let promptText;
     try {
@@ -1961,7 +1969,7 @@ function executeSpawn(action, tickState, runState, opts, deps) {
       );
     }
     mkdir(hookOrchDir, { recursive: true });
-    const flagPath = flagFilePath(hookOrchDir, sessionName);
+    flagPath = flagFilePath(hookOrchDir, sessionName);
     // Atomic write per todo 029: tmp + rename (same filesystem).
     const tmpPath = path.join(
       hookOrchDir,
@@ -1972,6 +1980,10 @@ function executeSpawn(action, tickState, runState, opts, deps) {
   }
 
   // Spawn (or fake spawn on dry-run).
+  // Codex round 7 P1: wrap in try so we can unlink the flag if spawn
+  // throws. A leaked flag would otherwise be visible to the NEXT
+  // spawn's hook (oldest-flag-wins) and the second tab would receive
+  // this dead session's prompt.
   let spawnResult;
   if (dryRun) {
     spawnResult = {
@@ -1990,14 +2002,85 @@ function executeSpawn(action, tickState, runState, opts, deps) {
     // pluginDir field for the per-agent plugin to load.
     const effectivePluginDir =
       (agent && agent.plugin_dir) || opts.pluginDir || null;
-    spawnResult = spawnFn({
-      name: sessionName,
-      workdir: resolvedWorkdir,
-      model: agent.model || null,
-      title: `${sessionName} — ${phase.title || phase.id}`,
-      pluginDir: effectivePluginDir,
-      launcher: manifest.launcher || null,
-    });
+    try {
+      spawnResult = spawnFn({
+        name: sessionName,
+        workdir: resolvedWorkdir,
+        model: agent.model || null,
+        title: `${sessionName} — ${phase.title || phase.id}`,
+        pluginDir: effectivePluginDir,
+        launcher: manifest.launcher || null,
+      });
+    } catch (e) {
+      // Spawn failed AFTER the flag was written. Clean up the flag
+      // so the next spawn this tick (or any spawn before the hook's
+      // soft-TTL elapses) doesn't pick up this dead session's prompt
+      // (codex round 7 P1).
+      if (flagPath) bestEffortUnlink(unlinkSync, flagPath);
+      throw e;
+    }
+  }
+
+  // Codex round 7 P1: serialize flag consumption. After the spawn
+  // returns, wait for the hook to atomically rename the flag away
+  // (the hook moves it to `.consuming-*` then unlinks). Bounded
+  // wait — default 10s, configurable via opts.flagConsumeTimeoutMs
+  // for tests. If the timeout elapses, log + continue — the tab
+  // may legitimately take longer (cold launch, JIT) and the
+  // orchestrator's recovery path will still detect a never-spawning
+  // session.
+  if (!dryRun && flagPath) {
+    // Default timeout: 10s for production, 0 for tests that inject a
+    // fake spawn (the test fake doesn't consume the flag, so a real
+    // poll would always time out and slow the suite to a crawl).
+    // Production callers (which pass no `_spawnSession` seam) get the
+    // real serialization. The CLI / runOrchestrator path always
+    // exercises the production default.
+    const usingFakeSpawn = typeof opts._spawnSession === 'function';
+    const consumeTimeoutMs =
+      typeof opts.flagConsumeTimeoutMs === 'number' && opts.flagConsumeTimeoutMs >= 0
+        ? opts.flagConsumeTimeoutMs
+        : usingFakeSpawn
+          ? 0
+          : 10_000;
+    const pollMs =
+      typeof opts.flagConsumePollMs === 'number' && opts.flagConsumePollMs > 0
+        ? opts.flagConsumePollMs
+        : 250;
+    if (consumeTimeoutMs > 0) {
+      // Busy-wait via existsSync. The wait IS the serialization —
+      // executeSpawn is synchronous inside executeActions, so polling
+      // the disk here pauses the next spawn until this one's flag is
+      // consumed.
+      //
+      // Bounded loop: max consumeTimeoutMs / pollMs iterations. Each
+      // iteration sleeps via a synchronous Atomics-free pollMs delay
+      // built from a tight setTimeout-based equivalent. We can't use
+      // setTimeout directly inside a sync function, but we can use a
+      // pseudo-sleep by busy-checking Date.now until deadline. That
+      // burns CPU for the wait window — acceptable because:
+      //   1. The wait is short (seconds), bounded by timeout.
+      //   2. Tests opt out via the fake-spawn detection.
+      //   3. The orchestrator process is single-threaded; nothing
+      //      else useful happens on this thread during a spawn.
+      const startNow = Date.now();
+      while (Date.now() < startNow + consumeTimeoutMs) {
+        if (!existsSync(flagPath)) break;
+        const until = Date.now() + pollMs;
+        while (Date.now() < until) {
+          /* busy-spin */
+        }
+      }
+      if (existsSync(flagPath)) {
+        logger(
+          'warn',
+          `flag ${path.basename(flagPath)} not consumed within ` +
+            `${consumeTimeoutMs}ms — proceeding; recovery path will detect ` +
+            `if the session never starts`,
+          { phaseId: phase.id, role, sessionName }
+        );
+      }
+    }
   }
 
   // Stale-signal cleanup runs ONLY after the spawn succeeds (codex
@@ -2237,21 +2320,36 @@ async function runOrchestrator(opts) {
 
       // Check terminal completion. The terminal condition: every phase
       // is in a terminal status (completed / failed / blocked).
+      //
+      // Codex round 7 P2: tickState.status was loaded BEFORE
+      // executeActions ran, so mark_phase_completed / failed / blocked
+      // updates aren't visible to the original status object. Re-read
+      // manifest-status once here so the terminal check sees the
+      // post-action truth. Without this, --once on a manifest whose
+      // last phase completes this tick would exit as
+      // max_ticks_unfinished, and even normal runs would burn an
+      // extra polling interval before noticing all-done.
+      const loadStatusFn = opts._loadStatus || loadStatus;
+      const postStatusResult = loadStatusFn(opts.manifestPath);
+      const postStatus =
+        postStatusResult.ok && postStatusResult.status
+          ? postStatusResult.status
+          : tickRes.tickState.status;
       const allTerminal = (() => {
         if (!tickRes.tickState || !tickRes.tickState.phases) return false;
         for (const p of tickRes.tickState.phases) {
-          const e = getPhaseStatus(tickRes.tickState.status, p.id);
+          const e = getPhaseStatus(postStatus, p.id);
           if (!isTerminalStatus(e.status)) return false;
         }
         return true;
       })();
       if (allTerminal) {
         const anyFailed = tickRes.tickState.phases.some((p) => {
-          const e = getPhaseStatus(tickRes.tickState.status, p.id);
+          const e = getPhaseStatus(postStatus, p.id);
           return e.status === 'failed';
         });
         const anyBlocked = tickRes.tickState.phases.some((p) => {
-          const e = getPhaseStatus(tickRes.tickState.status, p.id);
+          const e = getPhaseStatus(postStatus, p.id);
           return e.status === 'blocked';
         });
         if (anyFailed || anyBlocked) {
