@@ -628,14 +628,25 @@ function pollAllPhases(opts) {
     for (const role of declaredRoles) {
       sessionNames.push(defaultSessionName(phase.id, role));
     }
-    // Synthesized review-loop roles. Today's only synthesized case is
-    // QA on a review-enabled phase whose agents[] declares only impl.
-    if (
-      phase.review_loop &&
-      phase.review_loop.enabled &&
-      !declaredRoles.has('qa')
-    ) {
-      sessionNames.push(defaultSessionName(phase.id, 'qa'));
+    // Synthesized review-loop roles. Two cases need pre-emptive
+    // session-name pre-fetching:
+    //   - QA on a review-enabled phase whose agents[] declares only
+    //     impl (the planner synthesizes a QA dispatch on impl
+    //     completion).
+    //   - impl on a review-enabled phase whose agents[] declares
+    //     only qa (the planner synthesizes an impl dispatch on
+    //     initial run; codex round 10 P2).
+    // Without these, checkHealth's batched _pidSnapshot path treats
+    // the missing entry as authoritative `session_not_found` after
+    // startup grace, triggering duplicate recovery spawns for a
+    // healthy synthesized session.
+    if (phase.review_loop && phase.review_loop.enabled) {
+      if (!declaredRoles.has('qa')) {
+        sessionNames.push(defaultSessionName(phase.id, 'qa'));
+      }
+      if (!declaredRoles.has('impl')) {
+        sessionNames.push(defaultSessionName(phase.id, 'impl'));
+      }
     }
   }
   const pidSnapshot = buildPidSnapshot(sessionNames, opts);
@@ -934,7 +945,16 @@ function decideTickActions(tickState, runState, opts) {
             phaseId: phase.id,
             reason: `agent_signal:${sigParsed.status}:${role}`,
           });
-          continue;
+          // Codex round 10 P2: stop polling sibling roles for this
+          // phase once we've queued mark_phase_blocked. Otherwise a
+          // sibling role's timeout / convergence could emit a
+          // recovery spawn AFTER the block action, and executeActions
+          // would dispatch the spawn before applying the block —
+          // marking the phase blocked AND starting another agent. The
+          // operator's intervention is required for this phase; no
+          // role on it should continue to be monitored or recovered
+          // this tick.
+          break;
         }
         if (sigParsed.status !== 'complete' && sigParsed.status !== 'unknown') {
           actions.push({
@@ -2449,7 +2469,15 @@ async function runOrchestrator(opts) {
       }
 
       // Pick cadence. Active = at least one phase running this tick.
-      const isActive = isActiveTick(tickRes.tickState);
+      // Codex round 10 P2: tickState.status was loaded BEFORE
+      // executeActions, so a tick that just spawned a pending phase
+      // still sees it as `pending` here — the loop would idle 120s
+      // before ever polling the freshly spawned session. Treat
+      // `tickRes.spawned > 0` as an active signal in addition to
+      // the phase-status check, so the very next tick after a
+      // dispatch runs at active cadence.
+      const isActive =
+        isActiveTick(tickRes.tickState) || tickRes.spawned > 0;
       const sleepMs = isActive ? activeMs : idleMs;
       await sleep(sleepMs);
     }

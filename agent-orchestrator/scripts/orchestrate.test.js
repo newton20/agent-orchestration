@@ -3756,6 +3756,124 @@ test('Z3 [codex round 9 P2] unsupported agent role → mark_phase_blocked, no in
   }
 });
 
+// =========================================================================
+// AA — codex round 10 regression tests
+// =========================================================================
+
+test('AA1 [codex round 10 P2] review-enabled phase with only qa declared → snapshot includes synthesized impl', () => {
+  const dir = mkTmp('orch-AA1');
+  try {
+    const mp = writeManifest(
+      dir,
+      makeBaseManifest({
+        phases: [
+          {
+            id: 'p',
+            completion_signal: 'docs/orchestration/phases/p/impl-complete.md',
+            review_loop: { enabled: true, max_iterations: 3 },
+            agents: [{ role: 'qa' }], // ONLY qa — planner synthesizes impl
+          },
+        ],
+      })
+    );
+    const tickRes = O.pollAllPhases({
+      manifestPath: mp,
+      _pidRunner: () =>
+        JSON.stringify([
+          { ProcessId: 100, CommandLine: 'claude --name orch-p-impl' },
+          { ProcessId: 200, CommandLine: 'claude --name orch-p-qa' },
+        ]),
+    });
+    assert.ok(tickRes.pidSnapshot.has('orch-p-impl'), 'synthesized impl session must be in snapshot');
+    assert.ok(tickRes.pidSnapshot.has('orch-p-qa'), 'declared qa session must be in snapshot');
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AA2 [codex round 10 P2] mark_phase_blocked stops emitting recovery spawns for sibling roles', () => {
+  const dir = mkTmp('orch-AA2');
+  try {
+    const mp = writeManifest(
+      dir,
+      makeBaseManifest({
+        phases: [
+          {
+            id: 'p',
+            completion_signal: 'docs/orchestration/phases/p/impl-complete.md',
+            agents: [{ role: 'impl' }, { role: 'qa' }],
+          },
+        ],
+      })
+    );
+    writeStatus(mp, { phases: { p: { status: 'running' } } });
+    const phaseDir = makePhaseDir(mp, 'p');
+    // impl writes blocked → phase should be marked blocked.
+    writeCompletionSignal(phaseDir, 'impl', 'blocked');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    // qa is "missing" — pidAlive: false would otherwise drive a recovery spawn.
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      { _checkHealth: () => makeStubHealth({ pidAlive: false }) }
+    );
+    assert.ok(
+      actions.some((a) => a.type === 'mark_phase_blocked'),
+      'mark_phase_blocked must be emitted for the impl-blocked role'
+    );
+    assert.ok(
+      !actions.some((a) => a.type === 'spawn' && a.mode === 'recovery'),
+      'no recovery spawn should be emitted for sibling roles after a phase block'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AA3 [codex round 10 P2] spawn-only tick uses active cadence (does NOT sleep idleMs after dispatch)', async () => {
+  const dir = mkTmp('orch-AA3');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const sleepCalls = [];
+    let tick = 0;
+    const result = await O.runOrchestrator({
+      manifestPath: mp,
+      _spawnSession: makeFakeSpawnSession(),
+      _generatePrompt: makeFakeGenerate(),
+      _checkHealth: () => {
+        tick += 1;
+        if (tick === 2) {
+          // On tick 2, the just-spawned phase reports complete.
+          writeCompletionSignal(makePhaseDir(mp, 'phase-1'), 'impl', 'complete');
+        }
+        return makeStubHealth({ pidAlive: true });
+      },
+      _pidRunner: () => '[]',
+      _sleep: (ms) => {
+        sleepCalls.push(ms);
+        return Promise.resolve();
+      },
+      logger: silentLogger(),
+      projectName: 't',
+      activeIntervalMs: 100,
+      idleIntervalMs: 99999, // huge — would visibly delay if used
+      maxTicks: 5,
+    });
+    assert.strictEqual(result.ok, true);
+    // The first sleep (after tick 1's dispatch) MUST be the active
+    // interval, not the idle one. Pre-fix, tickState.status loaded
+    // at start-of-tick still showed phase-1 as pending → idle.
+    assert.strictEqual(
+      sleepCalls[0],
+      100,
+      `first sleep must use active cadence, got ${sleepCalls[0]}`
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
 test('Q2 CLI: missing manifest path exits 1', () => {
   const r = spawnSync(process.execPath, [path.join(__dirname, 'orchestrate.js')], {
     encoding: 'utf8',
