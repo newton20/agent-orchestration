@@ -4528,6 +4528,96 @@ test('AG2 [codex round 16 P2] abort during sleep exits without waiting full inte
   }
 });
 
+// =========================================================================
+// AH — codex round 17 regression tests
+// =========================================================================
+
+test('AH1 [codex round 17 P1] flag-consume timeout stops further spawns this tick', () => {
+  const dir = mkTmp('orch-AH1');
+  try {
+    const mp = writeManifest(
+      dir,
+      makeBaseManifest({
+        phases: [
+          {
+            id: 'a',
+            completion_signal: 'docs/orchestration/phases/a/impl-complete.md',
+            agents: [{ role: 'impl' }],
+          },
+          {
+            id: 'b',
+            completion_signal: 'docs/orchestration/phases/b/impl-complete.md',
+            agents: [{ role: 'impl' }],
+          },
+        ],
+      })
+    );
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const fakeSpawn = makeFakeSpawnSession();
+    O.executeActions(
+      [
+        { type: 'spawn', phaseId: 'a', role: 'impl', mode: 'initial', iteration: 1 },
+        { type: 'spawn', phaseId: 'b', role: 'impl', mode: 'initial', iteration: 1 },
+        { type: 'persist', phaseId: 'a', updates: { status: 'running' } },
+        { type: 'persist', phaseId: 'b', updates: { status: 'running' } },
+      ],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: fakeSpawn,
+        _generatePrompt: makeFakeGenerate(),
+        _runUpdate: makeFakeRunUpdate(),
+        logger: silentLogger(),
+        projectName: 'p',
+        flagConsumeTimeoutMs: 30, // tiny — first spawn's flag wait fires
+        flagConsumePollMs: 10,
+      }
+    );
+    // First spawn: attempted (the throw happens inside; spawnFn was
+    // called). Second spawn: skipped because flagTimeoutThisTick.
+    assert.strictEqual(
+      fakeSpawn.calls.length,
+      1,
+      `only the first spawn should attempt; second must be deferred. Got ${fakeSpawn.calls.length}.`
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AH2 [codex round 17 P2] --dry-run defaults to maxTicks=1 (no infinite loop)', () => {
+  const a = O.parseCliArgs(['node', 's.js', '--dry-run', 'manifest.yaml']);
+  assert.strictEqual(a.dryRun, true);
+  assert.strictEqual(a.maxTicks, 1, '--dry-run alone should default to 1 tick');
+});
+
+test('AH3 [codex round 17 P2] --dry-run + explicit --max-ticks honors operator override', () => {
+  const a = O.parseCliArgs([
+    'node',
+    's.js',
+    '--max-ticks',
+    '5',
+    '--dry-run',
+    'm.yaml',
+  ]);
+  assert.strictEqual(a.dryRun, true);
+  assert.strictEqual(a.maxTicks, 5, 'explicit --max-ticks must NOT be clobbered by --dry-run');
+});
+
+test('AH4 [codex round 17 P2] --dry-run after --max-ticks (different argv order) honors operator override', () => {
+  const a = O.parseCliArgs([
+    'node',
+    's.js',
+    '--dry-run',
+    '--max-ticks',
+    '3',
+    'm.yaml',
+  ]);
+  assert.strictEqual(a.dryRun, true);
+  assert.strictEqual(a.maxTicks, 3);
+});
+
 test('Q2 CLI: missing manifest path exits 1', () => {
   const r = spawnSync(process.execPath, [path.join(__dirname, 'orchestrate.js')], {
     encoding: 'utf8',

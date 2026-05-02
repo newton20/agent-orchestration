@@ -1601,6 +1601,28 @@ function executeActions(actions, tickState, runState, opts) {
         break;
       }
       case 'spawn': {
+        // Codex round 17 P1: if an earlier spawn this tick hit a
+        // flag-consume timeout (EFLAGTIMEOUT), STOP scheduling
+        // further spawns. The timed-out tab is still alive without
+        // having consumed its prompt; the SessionStart hook in that
+        // tab may eventually fire and pick up the next .pending-*
+        // we'd write — delivering the WRONG prompt to the wrong
+        // agent. Skipping subsequent spawns this tick lets the next
+        // tick re-evaluate (the flag was already unlinked, so the
+        // late hook reads {} and the orphan tab gets nothing —
+        // recovery handles the orphan via session_not_found
+        // convergence).
+        if (runState.flagTimeoutThisTick) {
+          out.warnings.push(
+            `spawn skipped for phase=${action.phaseId} role=${action.role}: ` +
+              `prior spawn this tick hit a flag-consume timeout; deferring to next tick`
+          );
+          if (!runState.spawnFailedThisTick) {
+            runState.spawnFailedThisTick = new Set();
+          }
+          runState.spawnFailedThisTick.add(action.phaseId);
+          break;
+        }
         try {
           executeSpawn(action, tickState, runState, opts, {
             spawnFn,
@@ -1637,6 +1659,12 @@ function executeActions(actions, tickState, runState, opts) {
             runState.spawnFailedThisTick = new Set();
           }
           runState.spawnFailedThisTick.add(action.phaseId);
+          // Codex round 17 P1: flag-timeout is special — the slow
+          // tab can still steal subsequent flags from THIS tick.
+          // Set a tick-wide poison-pill flag.
+          if (e && e.code === 'EFLAGTIMEOUT') {
+            runState.flagTimeoutThisTick = true;
+          }
         }
         break;
       }
@@ -2407,9 +2435,13 @@ function runOneTick(runState, opts) {
   // are the cross-action signals letting subsequent `persist` actions
   // decide whether to apply the status: running update — see
   // executeActions's persist handler for the all-failed-vs-partial
-  // policy (codex round 6 P2).
+  // policy (codex round 6 P2). flagTimeoutThisTick is the poison-
+  // pill that stops further spawns once a prior spawn's flag-consume
+  // timeout left a slow tab that could steal subsequent prompts
+  // (codex round 17 P1).
   runState.spawnFailedThisTick = new Set();
   runState.spawnSucceededThisTick = new Set();
+  runState.flagTimeoutThisTick = false;
   const tickResult = pollAllPhases(opts);
   if (!tickResult.ok) {
     const logger = opts.logger || makeDefaultLogger();
@@ -2851,6 +2883,12 @@ function parseCliArgs(argv) {
         break;
       case '--dry-run':
         out.dryRun = true;
+        // Codex round 17 P2: dry-run never persists, so phase
+        // status can never advance. Without a tick cap, the CLI
+        // would loop forever re-rendering the same pending actions.
+        // Default to a single tick unless the operator explicitly
+        // overrode with --max-ticks.
+        if (out.maxTicks === null) out.maxTicks = 1;
         break;
       case '--skip-scaffold':
         out.skipScaffold = true;
