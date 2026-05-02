@@ -1341,6 +1341,34 @@ function decideTickActions(tickState, runState, opts) {
     }
     if (!depsMet(phase, status)) continue;
 
+    // Codex round 9 P2: validate roles BEFORE scheduling. parse-
+    // manifest accepts arbitrary `agent.role` strings (validates only
+    // non-empty), but generate-prompt's ROLE_TEMPLATES only knows
+    // 'impl', 'qa', 'coord', and 'recovery' (the last is reserved
+    // for V1.5). A manifest with role: 'coordinator' would otherwise
+    // hit generatePrompt → throw → spawn failure → phase stays
+    // pending → infinite loop.
+    const validRoleSet = new Set(VALID_ROLES);
+    const invalidRoles = phase.agents
+      .map((a) => a.role)
+      .filter((r) => !validRoleSet.has(r));
+    if (invalidRoles.length > 0) {
+      actions.push({
+        type: 'log',
+        level: 'error',
+        message:
+          `phase ${phase.id} declares unsupported role(s) ${JSON.stringify(invalidRoles)}; ` +
+          `valid roles are ${JSON.stringify([...VALID_ROLES])}. ` +
+          `Marking phase blocked.`,
+        phaseId: phase.id,
+      });
+      actions.push({
+        type: 'mark_phase_blocked',
+        phaseId: phase.id,
+        reason: `unsupported_role:${invalidRoles.join(',')}`,
+      });
+      continue;
+    }
     // Spawn each declared role for the phase. Review-loop phases
     // dispatch only impl on first run — qa fires on impl completion.
     const reviewEnabled = phase.review_loop && phase.review_loop.enabled;
@@ -2026,14 +2054,19 @@ function executeSpawn(action, tickState, runState, opts, deps) {
         ? agent.plugin_dir
         : path.resolve(manifestDir, agent.plugin_dir);
     } else if (typeof opts.pluginDir === 'string' && opts.pluginDir !== '') {
-      // CLI --plugin-dir: resolve against process cwd (the operator
-      // typed it on the command line; standard CLI conventions
-      // resolve relative paths against process.cwd()). Already done
-      // by main()'s path.resolve, but defended here too in case a
-      // programmatic caller passes a raw relative path.
       effectivePluginDir = path.isAbsolute(opts.pluginDir)
         ? opts.pluginDir
         : path.resolve(opts.pluginDir);
+    } else {
+      // Codex round 9 P2: default to THIS plugin's root so the
+      // spawned tabs load the SessionStart hook + skills that ship
+      // with agent-orchestrator. Without this, a `/orchestrate`
+      // invocation that doesn't pass `--plugin-dir` (the documented
+      // default) spawns Claude tabs without the hook, the
+      // `.pending-*` flags are never read, and phases hang until
+      // timeout. `__dirname` is `agent-orchestrator/scripts/`;
+      // `path.resolve(__dirname, '..')` is the plugin root.
+      effectivePluginDir = path.resolve(__dirname, '..');
     }
     try {
       spawnResult = spawnFn({
@@ -2105,20 +2138,30 @@ function executeSpawn(action, tickState, runState, opts, deps) {
         }
       }
       if (existsSync(flagPath)) {
-        // Codex round 8 P1: a timed-out flag is still a fresh
-        // `.pending-*` file. Without removal, the NEXT spawn's hook
-        // (oldest-flag-wins) can consume it, delivering this dead
-        // session's prompt to the next agent. Unlink before we
-        // proceed to subsequent spawns. Recovery still kicks in for
-        // this session via session_not_found convergence.
+        // Codex round 8 P1 + round 9 P2: trade-off between two
+        // failure modes:
+        //   a. Leave flag → next spawn's hook consumes it (oldest-
+        //      first), delivering THIS session's prompt to a
+        //      different agent. CRITICAL bug; must avoid.
+        //   b. Unlink flag → if THIS session's hook is just slow
+        //      (>10s), it gets no prompt when it eventually starts.
+        //      Visible bug, but recoverable via the recovery path.
+        // We pick (b) and treat the timeout AS A SPAWN FAILURE — the
+        // flag is unlinked, the spawn is logged as failed, and the
+        // matching persist for this role is skipped (per the
+        // partial-failure policy). Recovery on the next tick
+        // re-dispatches the role with a fresh prompt + flag, so the
+        // slow agent still gets work — just with one tick of delay.
+        // (a) would lose the trust chain entirely; (b) loses one
+        // tick.
         bestEffortUnlink(unlinkSync, flagPath);
-        logger(
-          'warn',
+        const err = new Error(
           `flag ${path.basename(flagPath)} not consumed within ` +
-            `${consumeTimeoutMs}ms — flag unlinked to prevent cross-session ` +
-            `delivery; recovery path will detect if the session never starts`,
-          { phaseId: phase.id, role, sessionName }
+            `${consumeTimeoutMs}ms; treating as spawn failure (cross-session ` +
+            `flag delivery would otherwise corrupt the prompt protocol)`
         );
+        err.code = 'EFLAGTIMEOUT';
+        throw err;
       }
     }
   }

@@ -3649,6 +3649,113 @@ test('Y4 [codex round 8 P1] timed-out flag is unlinked so the next spawn does no
   }
 });
 
+// =========================================================================
+// Z — codex round 9 regression tests
+// =========================================================================
+
+test('Z1 [codex round 9 P2] no --plugin-dir → defaults to plugin root', () => {
+  const dir = mkTmp('orch-Z1');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const fakeSpawn = makeFakeSpawnSession();
+    O.executeActions(
+      [{ type: 'spawn', phaseId: 'phase-1', role: 'impl', mode: 'initial', iteration: 1 }],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: fakeSpawn,
+        _generatePrompt: makeFakeGenerate(),
+        _runUpdate: makeFakeRunUpdate(),
+        logger: silentLogger(),
+        projectName: 'p',
+        // No pluginDir, no agent.plugin_dir → must default to
+        // agent-orchestrator/ (one level up from scripts/).
+      }
+    );
+    const expected = path.resolve(__dirname, '..');
+    assert.strictEqual(
+      path.normalize(fakeSpawn.calls[0].pluginDir),
+      path.normalize(expected),
+      'absent --plugin-dir should default to this plugin root so the SessionStart hook loads'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('Z2 [codex round 9 P2] flag-timeout treated as spawn failure (does not falsely mark phase running)', () => {
+  const dir = mkTmp('orch-Z2');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const fakeUpdate = makeFakeRunUpdate();
+    const out = O.executeActions(
+      [
+        { type: 'spawn', phaseId: 'phase-1', role: 'impl', mode: 'initial', iteration: 1 },
+        { type: 'persist', phaseId: 'phase-1', updates: { status: 'running' } },
+      ],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: makeFakeSpawnSession(),
+        _generatePrompt: makeFakeGenerate(),
+        _runUpdate: fakeUpdate,
+        logger: silentLogger(),
+        projectName: 'p',
+        flagConsumeTimeoutMs: 30, // fires fast
+        flagConsumePollMs: 10,
+      }
+    );
+    // The status: running persist must NOT have fired (single-role
+    // spawn whose flag delivery timed out → all-failed → skip).
+    const runningPersist = fakeUpdate.calls.find(
+      (c) => c.updates && c.updates.status === 'running'
+    );
+    assert.ok(!runningPersist, 'flag-timeout must not falsely mark phase running');
+    assert.ok(out.warnings.some((w) => /spawn failed/.test(w)));
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('Z3 [codex round 9 P2] unsupported agent role → mark_phase_blocked, no infinite spawn loop', () => {
+  const dir = mkTmp('orch-Z3');
+  try {
+    const mp = writeManifest(
+      dir,
+      makeBaseManifest({
+        phases: [
+          {
+            id: 'p',
+            completion_signal: 'docs/orchestration/phases/p/impl-complete.md',
+            // 'coordinator' is not in VALID_ROLES (which is impl/qa/coord)
+            agents: [{ role: 'coordinator' }],
+          },
+        ],
+      })
+    );
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {}
+    );
+    assert.ok(
+      actions.some((a) => a.type === 'mark_phase_blocked' && /unsupported_role/.test(a.reason)),
+      'unsupported role should mark phase blocked'
+    );
+    assert.ok(
+      !actions.some((a) => a.type === 'spawn'),
+      'no spawn should be scheduled for unsupported roles'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
 test('Q2 CLI: missing manifest path exits 1', () => {
   const r = spawnSync(process.execPath, [path.join(__dirname, 'orchestrate.js')], {
     encoding: 'utf8',
