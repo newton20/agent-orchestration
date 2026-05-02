@@ -5071,6 +5071,75 @@ test('AN1 [codex round 23 P2] scaffold without templates → preflight fails fas
   }
 });
 
+// =========================================================================
+// AO — codex round 24 regression tests
+// =========================================================================
+
+test('AO1 [codex round 24 P2] missing manifest.workdir → workdir_not_found preflight failure', async () => {
+  const dir = mkTmp('orch-AO1');
+  try {
+    const mp = writeManifest(
+      dir,
+      makeBaseManifest({ workdir: 'nonexistent-typo-dir' })
+    );
+    const result = await O.runOrchestrator({
+      manifestPath: mp,
+      _spawnSession: makeFakeSpawnSession(),
+      _generatePrompt: makeFakeGenerate(),
+      _checkHealth: () => makeStubHealth(),
+      _pidRunner: () => '[]',
+      _sleep: () => Promise.resolve(),
+      logger: silentLogger(),
+      projectName: 't',
+      maxTicks: 5,
+    });
+    assert.strictEqual(result.ok, false);
+    assert.strictEqual(result.summary, 'workdir_not_found');
+    assert.match(result.error, /workdir/);
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AO2 [codex round 24 P2] incomplete templates dir → scaffold_no_templates preflight failure', async () => {
+  const dir = mkTmp('orch-AO2');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    // Inject scaffold that returns non-null templates_dir but the
+    // dir is empty (missing required template files).
+    const emptyTmplDir = path.join(dir, 'docs', 'orchestration', 'templates');
+    fs.mkdirSync(emptyTmplDir, { recursive: true });
+    const fakeScaffold = () => ({
+      ok: true,
+      protoDir: path.join(dir, 'docs', 'orchestration'),
+      phases_created: ['phase-1'],
+      events_log: '/x',
+      events_log_preserved: false,
+      templates_dir: emptyTmplDir,
+      templates_copied: 0,
+      templates_skipped: 0,
+      warnings: [],
+    });
+    const result = await O.runOrchestrator({
+      manifestPath: mp,
+      _spawnSession: makeFakeSpawnSession(),
+      _generatePrompt: makeFakeGenerate(),
+      _checkHealth: () => makeStubHealth(),
+      _pidRunner: () => '[]',
+      _sleep: () => Promise.resolve(),
+      _scaffoldProtocol: fakeScaffold,
+      logger: silentLogger(),
+      projectName: 't',
+      maxTicks: 5,
+    });
+    assert.strictEqual(result.ok, false);
+    assert.strictEqual(result.summary, 'scaffold_no_templates');
+    assert.match(result.error, /protocol-header\.md/);
+  } finally {
+    rmrf(dir);
+  }
+});
+
 test('Q2 CLI: missing manifest path exits 1', () => {
   const r = spawnSync(process.execPath, [path.join(__dirname, 'orchestrate.js')], {
     encoding: 'utf8',

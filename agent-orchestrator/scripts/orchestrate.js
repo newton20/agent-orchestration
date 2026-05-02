@@ -2666,23 +2666,44 @@ async function runOrchestrator(opts) {
         error: errs,
       };
     }
-    // Codex round 23 P2: scaffold returns ok: true with a warning
-    // when the source `templates/` directory is missing (templates_dir
-    // null). Without this guard, every spawn fails in generatePrompt
-    // because docs/orchestration/templates doesn't exist, the phase
-    // stays pending, and the orchestrator retries forever. Fail
-    // preflight loudly with the warning text so the operator fixes
-    // the --plugin-dir path.
-    if (!dryRun && scaffoldResult.templates_dir === null) {
-      const warnings = (scaffoldResult.warnings || []).join('; ');
-      const msg = `scaffold completed but no templates directory was copied${warnings ? ` (${warnings})` : ''} — orchestrator cannot render prompts`;
-      logger('error', msg);
-      return {
-        ok: false,
-        summary: 'scaffold_no_templates',
-        history: [],
-        error: msg,
-      };
+    // Codex round 23 P2 + round 24 P2: scaffold returns ok: true
+    // with a warning when the source `templates/` directory is
+    // missing (templates_dir null) AND ALSO returns ok with
+    // templates_dir set when the dir exists but is empty/
+    // incomplete. Either case dooms every spawn to a "cannot read
+    // template" error and an infinite phase-pending retry loop.
+    // Verify ALL required templates are present before starting.
+    if (!dryRun) {
+      const REQUIRED_TEMPLATES = [
+        'protocol-header.md',
+        'impl-prompt.md',
+        'qa-prompt.md',
+        'qa-playbook-prompt.md',
+        'coordinator-briefing.md',
+        'recovery-prompt.md',
+      ];
+      const tmplDir = scaffoldResult.templates_dir;
+      const existsSync = opts._existsSync || fs.existsSync;
+      const missing =
+        !tmplDir
+          ? REQUIRED_TEMPLATES
+          : REQUIRED_TEMPLATES.filter(
+              (n) => !existsSync(path.join(tmplDir, n))
+            );
+      if (missing.length > 0) {
+        const warnings = (scaffoldResult.warnings || []).join('; ');
+        const msg =
+          `scaffold completed but required template(s) ${JSON.stringify(missing)} ` +
+          `are missing from ${tmplDir || '(no templates dir)'}${warnings ? ` (${warnings})` : ''} ` +
+          `— orchestrator cannot render prompts`;
+        logger('error', msg);
+        return {
+          ok: false,
+          summary: 'scaffold_no_templates',
+          history: [],
+          error: msg,
+        };
+      }
     }
   }
 
@@ -2741,6 +2762,24 @@ async function runOrchestrator(opts) {
             : na === nb;
         };
         if (!samePath(wdOrch, orchDir)) {
+          // Codex round 24 P2: validate workdir EXISTS before
+          // acquiring its lock. acquireLock's recursive mkdir would
+          // otherwise silently create a typoed/missing workdir
+          // (e.g. `workdir: ../sibling-repo-typo`), masking the
+          // config error and starting agents in an empty
+          // directory.
+          const wdExists = (opts._existsSync || fs.existsSync)(wd);
+          if (!wdExists) {
+            const msg = `manifest.workdir does not exist: ${wd}`;
+            logger('error', msg);
+            releaseLock(lockPath, opts);
+            return {
+              ok: false,
+              summary: 'workdir_not_found',
+              history: [],
+              error: msg,
+            };
+          }
           try {
             workdirLockPath = acquireLock(wdOrch, opts);
           } catch (e) {
