@@ -420,14 +420,38 @@ function acquireLock(orchDir, opts = {}) {
         throw err;
       }
     }
-    // Stale lock — unlink so the exclusive create below has room.
-    // Race-safe: if another orchestrator unlinks first, the next
-    // create-with-O_EXCL claims the lock and we lose the race
-    // (handled by the EEXIST branch below).
+    // Stale lock detected. Race-safe reclaim (codex round 12 P2):
+    // unlinkSync alone has a TOCTOU window — two orchestrators both
+    // see the stale lock, both unlink, the second unlink could
+    // remove the first's just-acquired-exclusive-lock. Use rename
+    // with a unique target instead. renameSync on POSIX errors with
+    // ENOENT when the source has already been renamed away by
+    // another process; on Windows likewise. Only ONE rename
+    // succeeds, deterministically resolving the reclaim race.
+    const staleSidecar = path.join(
+      orchDir,
+      `${LOCKFILE_NAME}.stale-${ourPid}-${Date.now()}`
+    );
     try {
-      unlinkSync(lockPath);
-    } catch (_) {
-      /* fall through; the exclusive create will surface contention */
+      const renameSync = opts._renameSync || fs.renameSync;
+      renameSync(lockPath, staleSidecar);
+      // Best-effort cleanup of the sidecar; failure is harmless
+      // (orphaned `.stale-*` files are easy to spot + remove
+      // manually, and bestEffortUnlink avoids throwing).
+      bestEffortUnlink(unlinkSync, staleSidecar);
+    } catch (e) {
+      if (e && e.code === 'ENOENT') {
+        // Another orchestrator just won the rename race. Fall
+        // through to the exclusive create below — we'll get EEXIST
+        // and surface contention cleanly.
+      } else {
+        // Any other rename error (EACCES, ENOSPC, etc.) — surface
+        // as a hard refusal rather than risk overwriting the
+        // contender's lock.
+        throw new Error(
+          `cannot reclaim stale lock at ${lockPath}: ${e.message}`
+        );
+      }
     }
   }
 
@@ -1438,7 +1462,35 @@ function decideTickActions(tickState, runState, opts) {
     });
   }
 
-  return actions;
+  // Codex round 12 P2: post-process the action stream. If a phase
+  // has a terminal mark_phase_blocked / mark_phase_failed action,
+  // drop ANY spawn or persist actions targeting that same phase.
+  // This guards the case where role 1's recovery spawn was emitted
+  // before role 2's `blocked` signal triggered the phase block.
+  // executeActions runs actions in order, so without this filter the
+  // recovery spawn would fire before the block — defeating the
+  // operator-intervention contract.
+  const terminalPhases = new Set();
+  for (const a of actions) {
+    if (
+      a.type === 'mark_phase_blocked' ||
+      a.type === 'mark_phase_failed' ||
+      a.type === 'mark_phase_completed'
+    ) {
+      terminalPhases.add(a.phaseId);
+    }
+  }
+  if (terminalPhases.size === 0) return actions;
+  return actions.filter((a) => {
+    if (a.type !== 'spawn' && a.type !== 'persist') return true;
+    if (!terminalPhases.has(a.phaseId)) return true;
+    // Allow persist updates that target a phase being marked
+    // completed/failed/blocked (e.g. completed_at) — these are the
+    // mark_phase_* actions themselves, which are NOT 'persist' type
+    // here. Bare 'persist' actions bound to a now-terminal phase
+    // were emitted assuming the phase was still running; drop them.
+    return false;
+  });
 }
 
 function decideRecoveryAction(actions, runState, opts, ctx) {
@@ -1738,7 +1790,7 @@ function executeSpawn(action, tickState, runState, opts, deps) {
   const sessionName = defaultSessionName(phase.id, role);
   const isRecovery = action.mode === 'recovery';
   const isReviewRetry = action.mode === 'review_retry';
-  const isInitialQa = action.mode === 'initial' && role === 'qa';
+  const isInitial = action.mode === 'initial';
 
   // Codex round 3 P2: normalizePhases keeps only `enabled` and
   // `max_iterations` from the manifest's review_loop block; the
@@ -1800,10 +1852,18 @@ function executeSpawn(action, tickState, runState, opts, deps) {
       staleUnlinks.push(completionSignalFor(phaseDir, 'qa'));
       staleUnlinks.push(qaVerdictFor(phaseDir));
     }
-    if (isInitialQa) {
-      staleUnlinks.push(sigFor('qa'));
-      staleUnlinks.push(completionSignalFor(phaseDir, 'qa'));
-      staleUnlinks.push(qaVerdictFor(phaseDir));
+    if (isInitial) {
+      // Codex round 12 P2: clean every initial dispatch's prior
+      // completion signal, not just QA. A reused phase dir from a
+      // prior run can carry a stale impl-complete.md (or
+      // coord-complete.md) that the next poll would treat as
+      // current, advancing the phase without waiting for the freshly
+      // spawned agent.
+      staleUnlinks.push(sigFor(role));
+      staleUnlinks.push(completionSignalFor(phaseDir, role));
+      if (role === 'qa') {
+        staleUnlinks.push(qaVerdictFor(phaseDir));
+      }
     }
   }
 

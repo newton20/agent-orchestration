@@ -3971,6 +3971,116 @@ test('AB3 [codex round 11 P3] generate-prompt receives heartbeatPath in genOpts'
   }
 });
 
+// =========================================================================
+// AC — codex round 12 regression tests
+// =========================================================================
+
+test('AC1 [codex round 12 P2] stale lock reclaim uses rename so two starters cannot both succeed', () => {
+  const dir = mkTmp('orch-AC1');
+  try {
+    // Plant a stale lock. The first orchestrator will reclaim it.
+    fs.writeFileSync(
+      path.join(dir, '.orchestrator.lock'),
+      JSON.stringify({ pid: 999, startedAt: 'old', hostname: 'h' })
+    );
+    const lockedPath = O.acquireLock(dir, {
+      _pid: 1,
+      _killer: () => {
+        const e = new Error('no such');
+        e.code = 'ESRCH';
+        throw e;
+      },
+    });
+    // Second orchestrator (also fresh start) should now SEE our
+    // freshly-claimed lock as live, not as stale.
+    assert.throws(
+      () =>
+        O.acquireLock(dir, {
+          _pid: 2,
+          _killer: () => {}, // alive — pid 1 is "live"
+        }),
+      (err) => err.code === 'ELOCKED'
+    );
+    O.releaseLock(lockedPath);
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AC2 [codex round 12 P2] initial impl dispatch unlinks stale impl-complete.md', () => {
+  const dir = mkTmp('orch-AC2');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    const phaseDir = makePhaseDir(mp, 'phase-1');
+    // Stale completion signal from a prior run.
+    writeCompletionSignal(phaseDir, 'impl', 'complete');
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    O.executeActions(
+      [{ type: 'spawn', phaseId: 'phase-1', role: 'impl', mode: 'initial', iteration: 1 }],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: makeFakeSpawnSession(),
+        _generatePrompt: makeFakeGenerate(),
+        _runUpdate: makeFakeRunUpdate(),
+        logger: silentLogger(),
+        projectName: 'p',
+      }
+    );
+    assert.ok(
+      !fs.existsSync(path.join(phaseDir, 'impl-complete.md')),
+      'stale impl-complete.md must be unlinked on initial dispatch'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AC3 [codex round 12 P2] mark_phase_blocked filters out queued spawn for the same phase', () => {
+  const dir = mkTmp('orch-AC3');
+  try {
+    const mp = writeManifest(
+      dir,
+      makeBaseManifest({
+        phases: [
+          {
+            id: 'p',
+            completion_signal: 'docs/orchestration/phases/p/impl-complete.md',
+            agents: [{ role: 'impl' }, { role: 'qa' }],
+          },
+        ],
+      })
+    );
+    writeStatus(mp, { phases: { p: { status: 'running', retry_count: 0 } } });
+    const phaseDir = makePhaseDir(mp, 'p');
+    // qa role's signal: blocked → triggers mark_phase_blocked.
+    writeCompletionSignal(phaseDir, 'qa', 'blocked');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    // impl role's checkHealth returns pidAlive: false → would
+    // normally emit a recovery spawn. We assert that the post-
+    // process filter drops it because the phase is going to be
+    // blocked.
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _checkHealth: ({ role }) =>
+          role === 'qa'
+            ? makeStubHealth({ pidAlive: true })
+            : makeStubHealth({ pidAlive: false }),
+      }
+    );
+    assert.ok(actions.some((a) => a.type === 'mark_phase_blocked'));
+    assert.ok(
+      !actions.some((a) => a.type === 'spawn' && a.phaseId === 'p'),
+      'no spawn must remain for a phase being marked blocked'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
 test('Q2 CLI: missing manifest path exits 1', () => {
   const r = spawnSync(process.execPath, [path.join(__dirname, 'orchestrate.js')], {
     encoding: 'utf8',
