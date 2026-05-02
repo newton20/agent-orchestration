@@ -3505,6 +3505,150 @@ test('X3 [codex round 7 P1] flag-consume serialization defaults to 0ms when test
   assert.ok(true);
 });
 
+// =========================================================================
+// Y — codex round 8 regression tests
+// =========================================================================
+
+test('Y1 [codex round 8 P2] multi-role phase + custom impl signal basename → impl signal honored', () => {
+  const dir = mkTmp('orch-Y1');
+  try {
+    const mp = writeManifest(
+      dir,
+      makeBaseManifest({
+        phases: [
+          {
+            id: 'p',
+            // Custom name with no role-prefix
+            completion_signal: 'signals/phase-0-impl-complete.md',
+            agents: [{ role: 'impl' }, { role: 'qa' }],
+          },
+        ],
+      })
+    );
+    writeStatus(mp, { phases: { p: { status: 'running' } } });
+    fs.mkdirSync(path.join(dir, 'signals'), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'signals', 'phase-0-impl-complete.md'),
+      '---\nstatus: complete\n---\n# done'
+    );
+    const phaseDir = makePhaseDir(mp, 'p');
+    writeCompletionSignal(phaseDir, 'qa', 'complete');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {}
+    );
+    // The orchestrator should poll the manifest's custom path for
+    // impl AND the conventional path for qa, and mark the phase
+    // completed once both are present.
+    assert.ok(actions.some((a) => a.type === 'mark_phase_completed'));
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('Y2 [codex round 8 P2] multi-role + qa-named manifest signal → impl falls back to convention', () => {
+  const manifest = {
+    phases: [
+      {
+        id: 'p',
+        completion_signal: 'docs/x/qa-complete.md',
+        agents: [{ role: 'impl' }, { role: 'qa' }],
+      },
+    ],
+  };
+  const dir = mkTmp('orch-Y2');
+  try {
+    const implSig = O.resolveCompletionSignal(manifest, dir, 'p', 'impl');
+    const qaSig = O.resolveCompletionSignal(manifest, dir, 'p', 'qa');
+    // qa gets the manifest's path; impl falls back to convention.
+    assert.match(path.normalize(qaSig), /docs[\\/]x[\\/]qa-complete\.md$/);
+    assert.match(path.normalize(implSig), /impl-complete\.md$/);
+    assert.ok(!implSig.includes('docs/x'), 'impl should NOT use the qa-named path');
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('Y3 [codex round 8 P2] relative agent.plugin_dir resolved against manifestDir', () => {
+  const dir = mkTmp('orch-Y3');
+  try {
+    fs.mkdirSync(path.join(dir, 'plugins', 'my-plugin'), { recursive: true });
+    const mp = writeManifest(
+      dir,
+      makeBaseManifest({
+        phases: [
+          {
+            id: 'p',
+            completion_signal: 'docs/orchestration/phases/p/impl-complete.md',
+            agents: [{ role: 'impl', plugin_dir: 'plugins/my-plugin' }],
+          },
+        ],
+      })
+    );
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const fakeSpawn = makeFakeSpawnSession();
+    O.executeActions(
+      [{ type: 'spawn', phaseId: 'p', role: 'impl', mode: 'initial', iteration: 1 }],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: fakeSpawn,
+        _generatePrompt: makeFakeGenerate(),
+        _runUpdate: makeFakeRunUpdate(),
+        logger: silentLogger(),
+        projectName: 'p',
+      }
+    );
+    const expected = path.resolve(dir, 'plugins', 'my-plugin');
+    assert.strictEqual(
+      path.normalize(fakeSpawn.calls[0].pluginDir),
+      path.normalize(expected)
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('Y4 [codex round 8 P1] timed-out flag is unlinked so the next spawn does not consume it', () => {
+  const dir = mkTmp('orch-Y4');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    // Force the wait to fire (default-skip is when _spawnSession is
+    // a fake; we DO pass a fake here but explicitly set a tiny
+    // timeout to exercise the timeout branch.) The fake spawn does
+    // NOT consume the flag, so existsSync(flagPath) stays true and
+    // the timeout fires immediately.
+    O.executeActions(
+      [{ type: 'spawn', phaseId: 'phase-1', role: 'impl', mode: 'initial', iteration: 1 }],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: makeFakeSpawnSession(),
+        _generatePrompt: makeFakeGenerate(),
+        _runUpdate: makeFakeRunUpdate(),
+        logger: silentLogger(),
+        projectName: 'p',
+        flagConsumeTimeoutMs: 50, // tiny — fires fast
+        flagConsumePollMs: 10,
+      }
+    );
+    const flagPath = path.join(
+      dir, 'docs', 'orchestration', '.pending-orch-phase-1-impl'
+    );
+    assert.ok(
+      !fs.existsSync(flagPath),
+      'timed-out flag must be unlinked to prevent cross-session delivery'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
 test('Q2 CLI: missing manifest path exits 1', () => {
   const r = spawnSync(process.execPath, [path.join(__dirname, 'orchestrate.js')], {
     encoding: 'utf8',

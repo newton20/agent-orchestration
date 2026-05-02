@@ -327,11 +327,25 @@ function resolveCompletionSignal(manifest, manifestDir, phaseId, role) {
         return declared;
       }
     }
-    // Case 1b / 2: multi-role. Match by basename — `impl-complete.md`
-    // → impl, `qa-complete.md` → qa, etc.
+    // Multi-role phase. Two acceptance rules:
+    //   a. Basename matches `<role>-complete.md` → declared path is
+    //      this role's signal.
+    //   b. Basename does NOT match any declared role's default →
+    //      assume the path is the IMPL role's signal (the
+    //      conventional "phase-level signal" the manifest reference
+    //      assigns to impl). Other roles fall back to convention so
+    //      each gets its own file.
+    // (Codex round 8 P2: arbitrary names like
+    // `signals/phase-0-impl-complete.md` were previously ignored in
+    // multi-role phases because the basename check is exact.)
     if (baseName === `${role}-complete.md`) return declared;
-    // The basename names a DIFFERENT role; this role falls back to
-    // convention (each role gets its own per-role signal).
+    const declaredMatchesAnyRoleDefault = declaredRoles.some(
+      (r) => baseName === `${r}-complete.md`
+    );
+    if (!declaredMatchesAnyRoleDefault && role === 'impl') {
+      return declared;
+    }
+    // Otherwise: convention default (every other role).
   }
   return completionSignalFor(
     phaseDirFor(manifestDir, phaseId),
@@ -2000,8 +2014,27 @@ function executeSpawn(action, tickState, runState, opts, deps) {
     // documented in docs/manifest-reference.md as "extra plugin
     // directory for this agent"; it must reach spawnSession's
     // pluginDir field for the per-agent plugin to load.
-    const effectivePluginDir =
-      (agent && agent.plugin_dir) || opts.pluginDir || null;
+    //
+    // Codex round 8 P2: resolve relative paths against manifestDir.
+    // Without this, a manifest-relative path like `./my-plugin`
+    // would be passed verbatim to wt's child shell which interprets
+    // it relative to the spawned tab's cwd (workdir, possibly
+    // different from manifestDir).
+    let effectivePluginDir = null;
+    if (agent && typeof agent.plugin_dir === 'string' && agent.plugin_dir !== '') {
+      effectivePluginDir = path.isAbsolute(agent.plugin_dir)
+        ? agent.plugin_dir
+        : path.resolve(manifestDir, agent.plugin_dir);
+    } else if (typeof opts.pluginDir === 'string' && opts.pluginDir !== '') {
+      // CLI --plugin-dir: resolve against process cwd (the operator
+      // typed it on the command line; standard CLI conventions
+      // resolve relative paths against process.cwd()). Already done
+      // by main()'s path.resolve, but defended here too in case a
+      // programmatic caller passes a raw relative path.
+      effectivePluginDir = path.isAbsolute(opts.pluginDir)
+        ? opts.pluginDir
+        : path.resolve(opts.pluginDir);
+    }
     try {
       spawnResult = spawnFn({
         name: sessionName,
@@ -2072,11 +2105,18 @@ function executeSpawn(action, tickState, runState, opts, deps) {
         }
       }
       if (existsSync(flagPath)) {
+        // Codex round 8 P1: a timed-out flag is still a fresh
+        // `.pending-*` file. Without removal, the NEXT spawn's hook
+        // (oldest-flag-wins) can consume it, delivering this dead
+        // session's prompt to the next agent. Unlink before we
+        // proceed to subsequent spawns. Recovery still kicks in for
+        // this session via session_not_found convergence.
+        bestEffortUnlink(unlinkSync, flagPath);
         logger(
           'warn',
           `flag ${path.basename(flagPath)} not consumed within ` +
-            `${consumeTimeoutMs}ms — proceeding; recovery path will detect ` +
-            `if the session never starts`,
+            `${consumeTimeoutMs}ms — flag unlinked to prevent cross-session ` +
+            `delivery; recovery path will detect if the session never starts`,
           { phaseId: phase.id, role, sessionName }
         );
       }
