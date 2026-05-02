@@ -4683,6 +4683,78 @@ test('AI2 [codex round 18 P2] dry-run renders against the source templates dir',
   }
 });
 
+// =========================================================================
+// AJ — codex round 19 regression tests
+// =========================================================================
+
+test('AJ1 [codex round 19 P2] dry-run honors --plugin-dir for templates source', () => {
+  const dir = mkTmp('orch-AJ1');
+  try {
+    // Make a phony alternate plugin with its own templates dir.
+    const altPlugin = path.join(dir, 'alt-plugin');
+    fs.mkdirSync(path.join(altPlugin, 'templates'), { recursive: true });
+    const mp = writeManifest(dir, makeBaseManifest());
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const fakeGen = makeFakeGenerate();
+    O.executeActions(
+      [{ type: 'spawn', phaseId: 'phase-1', role: 'impl', mode: 'initial', iteration: 1 }],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: makeFakeSpawnSession(),
+        _generatePrompt: fakeGen,
+        _runUpdate: makeFakeRunUpdate(),
+        logger: silentLogger(),
+        projectName: 'p',
+        dryRun: true,
+        pluginDir: altPlugin,
+      }
+    );
+    const passed = fakeGen.calls[0].templatesDir;
+    assert.strictEqual(
+      path.normalize(passed),
+      path.normalize(path.join(altPlugin, 'templates')),
+      'dry-run should use --plugin-dir/templates as the source'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AJ2 [codex round 19 P2] duplicate roles → mark_phase_blocked, no spawns scheduled', () => {
+  const dir = mkTmp('orch-AJ2');
+  try {
+    const mp = writeManifest(
+      dir,
+      makeBaseManifest({
+        phases: [
+          {
+            id: 'p',
+            completion_signal: 'docs/orchestration/phases/p/impl-complete.md',
+            agents: [{ role: 'impl' }, { role: 'impl' }], // duplicate!
+          },
+        ],
+      })
+    );
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {}
+    );
+    assert.ok(
+      actions.some((a) => a.type === 'mark_phase_blocked' && /duplicate_role/.test(a.reason)),
+      'duplicate roles must mark phase blocked'
+    );
+    assert.ok(
+      !actions.some((a) => a.type === 'spawn'),
+      'no spawn should be scheduled for a phase with duplicate roles'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
 test('Q2 CLI: missing manifest path exits 1', () => {
   const r = spawnSync(process.execPath, [path.join(__dirname, 'orchestrate.js')], {
     encoding: 'utf8',

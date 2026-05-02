@@ -1435,6 +1435,38 @@ function decideTickActions(tickState, runState, opts) {
       });
       continue;
     }
+    // Codex round 19 P2: reject duplicate roles. Two agents with
+    // the same role would share a session name (`orch-<phase>-<role>`)
+    // and a single .pending-* flag — the second dispatch overwrites
+    // the first, PID lookup conflates them, and the SessionStart
+    // hook delivers the same prompt to two agents. parse-manifest
+    // doesn't enforce role-uniqueness (multiple agents per phase is
+    // a valid V1 shape with distinct roles).
+    const roleCounts = new Map();
+    for (const a of phase.agents) {
+      roleCounts.set(a.role, (roleCounts.get(a.role) || 0) + 1);
+    }
+    const duplicateRoles = [];
+    for (const [r, c] of roleCounts) {
+      if (c > 1) duplicateRoles.push(r);
+    }
+    if (duplicateRoles.length > 0) {
+      actions.push({
+        type: 'log',
+        level: 'error',
+        message:
+          `phase ${phase.id} declares duplicate role(s) ${JSON.stringify(duplicateRoles)} ` +
+          `— each agent within a phase must have a unique role (session names + flag files ` +
+          `key on orch-<phase>-<role>). Marking phase blocked.`,
+        phaseId: phase.id,
+      });
+      actions.push({
+        type: 'mark_phase_blocked',
+        phaseId: phase.id,
+        reason: `duplicate_role:${duplicateRoles.join(',')}`,
+      });
+      continue;
+    }
     // Spawn each declared role for the phase. Review-loop phases
     // dispatch only impl on first run — qa fires on impl completion.
     const reviewEnabled = phase.review_loop && phase.review_loop.enabled;
@@ -1585,14 +1617,24 @@ function executeActions(actions, tickState, runState, opts) {
   // Codex round 18 P2: under --dry-run, scaffold-protocol's
   // template-copy step is reported but not executed, so the live
   // `docs/orchestration/templates/` path won't exist. Fall back to
-  // this plugin's source `templates/` directory so dry-run can
-  // render against the real on-disk templates without requiring a
-  // prior non-dry scaffold pass.
+  // the templates dir that scaffold-protocol WOULD have copied
+  // from — that's `<pluginDir>/templates`, where pluginDir comes
+  // from --plugin-dir or this plugin's own root. Codex round 19
+  // P2: previous default ignored --plugin-dir, so dry-run validated
+  // against the wrong templates when the operator was previewing
+  // an alternate plugin.
+  const dryRunTemplateSource = (() => {
+    const pluginRoot =
+      typeof opts.pluginDir === 'string' && opts.pluginDir !== ''
+        ? path.isAbsolute(opts.pluginDir)
+          ? opts.pluginDir
+          : path.resolve(opts.pluginDir)
+        : path.resolve(__dirname, '..');
+    return path.join(pluginRoot, 'templates');
+  })();
   const templatesDir =
     opts.templatesDir ||
-    (dryRun
-      ? path.resolve(__dirname, '..', 'templates')
-      : templatesDirFor(manifestDir));
+    (dryRun ? dryRunTemplateSource : templatesDirFor(manifestDir));
 
   for (const action of actions) {
     if (out.fatal) break; // fatal halts further execution this tick
