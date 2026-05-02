@@ -991,16 +991,26 @@ function decideTickActions(tickState, runState, opts) {
           break;
         }
         if (sigParsed.status !== 'complete' && sigParsed.status !== 'unknown') {
+          // Codex round 16 P2: log + fall through to the
+          // health-check path below, NOT continue. A signal with an
+          // unrecognized status (e.g. `status: failed` from an
+          // agent that exited mid-write) should NOT block recovery
+          // — if the agent has actually died, we still want PID
+          // liveness + timeout to drive recovery instead of the
+          // phase staying `running` forever on a stale-but-present
+          // bad signal.
           actions.push({
             type: 'log',
             level: 'warn',
             message:
               `phase ${phase.id} role ${role} signal has unrecognized status=${JSON.stringify(sigParsed.status)}; ` +
-              `treating as not-yet-complete and re-polling`,
+              `falling through to health check`,
             phaseId: phase.id,
             role,
           });
-          continue;
+          // Fall through (no continue): isComplete computed below
+          // will be false for non-'complete' statuses, so the
+          // health-check path runs.
         }
       }
       const isComplete = isQaReviewSignal
@@ -2647,7 +2657,21 @@ async function runOrchestrator(opts) {
       const isActive =
         isActiveTick(tickRes.tickState) || tickRes.spawned > 0;
       const sleepMs = isActive ? activeMs : idleMs;
-      await sleep(sleepMs);
+      // Codex round 16 P2: race the sleep against the abort signal
+      // so SIGINT/SIGTERM mid-poll exits within ~50ms instead of
+      // waiting up to idleMs (120s). When tests pass `_sleep` that
+      // resolves immediately, this path is a no-op in practice.
+      if (signal && typeof signal.addEventListener === 'function') {
+        await Promise.race([
+          sleep(sleepMs),
+          new Promise((resolve) => {
+            if (signal.aborted) resolve();
+            else signal.addEventListener('abort', () => resolve(), { once: true });
+          }),
+        ]);
+      } else {
+        await sleep(sleepMs);
+      }
     }
   } finally {
     if (lockPath) {

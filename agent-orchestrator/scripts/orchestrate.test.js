@@ -4446,6 +4446,88 @@ test('AF3 [codex round 15 P2] permission_mode merges with manifest launcher bloc
   }
 });
 
+// =========================================================================
+// AG — codex round 16 regression tests
+// =========================================================================
+
+test('AG1 [codex round 16 P2] unrecognized signal status falls through to health-check (recovery still possible)', () => {
+  const dir = mkTmp('orch-AG1');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, { phases: { 'phase-1': { status: 'running', retry_count: 0 } } });
+    const phaseDir = makePhaseDir(mp, 'phase-1');
+    // Agent exited mid-write — `status: failed` is not a valid
+    // protocol status. Pre-fix, the orchestrator logged + continued,
+    // skipping the health-check, so the phase stayed running forever.
+    writeCompletionSignal(phaseDir, 'impl', 'failed');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      { _checkHealth: () => makeStubHealth({ pidAlive: false }) }
+    );
+    // health check shows pidAlive=false → recovery should fire even
+    // though there's a present-but-bad completion signal.
+    assert.ok(
+      actions.some((a) => a.type === 'spawn' && a.mode === 'recovery'),
+      'recovery must still trigger when signal has unrecognized status + agent dead'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AG2 [codex round 16 P2] abort during sleep exits without waiting full interval', async () => {
+  const dir = mkTmp('orch-AG2');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, { phases: { 'phase-1': { status: 'running' } } });
+    makePhaseDir(mp, 'phase-1');
+    const ac = new AbortController();
+    let sleepCalls = 0;
+    let abortedDuringSleep = false;
+    const startTime = Date.now();
+    const result = await O.runOrchestrator({
+      manifestPath: mp,
+      resume: true,
+      signal: ac.signal,
+      _spawnSession: makeFakeSpawnSession(),
+      _generatePrompt: makeFakeGenerate(),
+      _checkHealth: () => makeStubHealth({ pidAlive: true }),
+      _pidRunner: () => '[]',
+      // Real sleep — but abort fires after 50ms so the race resolves quickly.
+      _sleep: async (ms) => {
+        sleepCalls += 1;
+        if (sleepCalls === 1) {
+          // Schedule abort during the first sleep.
+          setTimeout(() => {
+            abortedDuringSleep = true;
+            ac.abort();
+          }, 50);
+        }
+        await new Promise((r) => setTimeout(r, ms));
+      },
+      logger: silentLogger(),
+      projectName: 't',
+      activeIntervalMs: 5000, // 5 seconds — would be visible if not raced
+      idleIntervalMs: 5000,
+      maxTicks: 10,
+    });
+    const elapsed = Date.now() - startTime;
+    assert.strictEqual(result.ok, false);
+    assert.strictEqual(result.summary, 'aborted');
+    assert.ok(abortedDuringSleep, 'abort fired during the sleep');
+    // Total time should be MUCH less than 5000ms (the active interval).
+    // The race should finish within ~100ms after the 50ms abort fire.
+    assert.ok(
+      elapsed < 1500,
+      `aborted run should exit fast; took ${elapsed}ms (interval was 5000ms)`
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
 test('Q2 CLI: missing manifest path exits 1', () => {
   const r = spawnSync(process.execPath, [path.join(__dirname, 'orchestrate.js')], {
     encoding: 'utf8',
