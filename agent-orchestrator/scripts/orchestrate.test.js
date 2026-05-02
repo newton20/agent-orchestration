@@ -4755,6 +4755,76 @@ test('AJ2 [codex round 19 P2] duplicate roles → mark_phase_blocked, no spawns 
   }
 });
 
+// =========================================================================
+// AK — codex round 20 regression tests
+// =========================================================================
+
+test('AK1 [codex round 20 P2] stale .pending-* flags are swept before writing the new flag', () => {
+  const dir = mkTmp('orch-AK1');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    const orchDir = path.join(dir, 'docs', 'orchestration');
+    fs.mkdirSync(orchDir, { recursive: true });
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    // Plant a leftover flag from a crashed prior orchestrator (different phase id).
+    const stalePath = path.join(orchDir, '.pending-orch-other-impl');
+    fs.writeFileSync(stalePath, '# stale from prior crashed run');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    O.executeActions(
+      [{ type: 'spawn', phaseId: 'phase-1', role: 'impl', mode: 'initial', iteration: 1 }],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: makeFakeSpawnSession(),
+        _generatePrompt: makeFakeGenerate(),
+        _runUpdate: makeFakeRunUpdate(),
+        logger: silentLogger(),
+        projectName: 'p',
+      }
+    );
+    // The stale flag must be GONE.
+    assert.ok(
+      !fs.existsSync(stalePath),
+      'stale .pending-* flag from prior orchestrator must be swept'
+    );
+    // The new flag for this dispatch must EXIST.
+    const newPath = path.join(orchDir, '.pending-orch-phase-1-impl');
+    assert.ok(fs.existsSync(newPath), 'new flag for this dispatch must be written');
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AK2 [codex round 20 P2] flag for THIS dispatch is not deleted by the sweep', () => {
+  const dir = mkTmp('orch-AK2');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    const orchDir = path.join(dir, 'docs', 'orchestration');
+    fs.mkdirSync(orchDir, { recursive: true });
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    // Plant a flag with the SAME session name (e.g. retry from a prior orchestrator).
+    const samePath = path.join(orchDir, '.pending-orch-phase-1-impl');
+    fs.writeFileSync(samePath, '# old prompt for same session');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    O.executeActions(
+      [{ type: 'spawn', phaseId: 'phase-1', role: 'impl', mode: 'initial', iteration: 1 }],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: makeFakeSpawnSession(),
+        _generatePrompt: makeFakeGenerate({ promptText: '# new prompt' }),
+        _runUpdate: makeFakeRunUpdate(),
+        logger: silentLogger(),
+        projectName: 'p',
+      }
+    );
+    // The flag must be the NEW prompt (rename overwrote the same-name flag).
+    assert.strictEqual(fs.readFileSync(samePath, 'utf8'), '# new prompt');
+  } finally {
+    rmrf(dir);
+  }
+});
+
 test('Q2 CLI: missing manifest path exits 1', () => {
   const r = spawnSync(process.execPath, [path.join(__dirname, 'orchestrate.js')], {
     encoding: 'utf8',

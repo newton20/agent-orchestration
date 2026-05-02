@@ -2234,6 +2234,32 @@ function executeSpawn(action, tickState, runState, opts, deps) {
       );
     }
     mkdir(hookOrchDir, { recursive: true });
+    // Codex round 20 P2: sweep stale `.pending-*` flags before
+    // writing this dispatch's flag. The SessionStart hook picks the
+    // OLDEST fresh flag with no per-session matching; if the hook
+    // dir contains a leftover from a crashed prior orchestrator (or
+    // a session whose tab never started), the new spawn's hook
+    // could consume the stale prompt instead of ours. We hold the
+    // orchestrator lock, so no concurrent writer is racing us;
+    // every existing `.pending-*` is by definition stale. Skip
+    // entries matching this dispatch's session name (they'll be
+    // overwritten by the rename below), and skip our own pending
+    // tmp suffix patterns.
+    const readdirSync = opts._readdirSync || fs.readdirSync;
+    let entries = [];
+    try {
+      entries = readdirSync(hookOrchDir);
+    } catch (_) {
+      /* dir might not exist on first sweep — mkdir above handles it */
+    }
+    const ourFlagBasename = `.pending-${sessionName}`;
+    for (const name of entries) {
+      if (typeof name !== 'string') continue;
+      if (!name.startsWith('.pending-')) continue;
+      if (name === ourFlagBasename) continue; // we'll rename over it
+      if (name.includes('.tmp-')) continue; // mid-write tmp; let it finish
+      bestEffortUnlink(unlinkSync, path.join(hookOrchDir, name));
+    }
     flagPath = flagFilePath(hookOrchDir, sessionName);
     // Atomic write per todo 029: tmp + rename (same filesystem).
     const tmpPath = path.join(
