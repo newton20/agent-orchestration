@@ -1,5 +1,5 @@
 ---
-status: ready
+status: complete
 priority: p2
 issue_id: "072"
 tags: [code-review, unit-8, check-health, api-contract, error-handling, unit-11-prep]
