@@ -4959,6 +4959,76 @@ test('AL5 [codex round 21 P2] bare run with all-completed manifest-status procee
   }
 });
 
+// =========================================================================
+// AM — codex round 22 regression tests
+// =========================================================================
+
+test('AM1 [codex round 22 P2] shared-workdir secondary lock refuses second concurrent orchestrator', async () => {
+  const dir = mkTmp('orch-AM1');
+  try {
+    const sharedWorkdir = path.join(dir, 'shared');
+    fs.mkdirSync(sharedWorkdir, { recursive: true });
+    // Manifest 1 lives in dir/m1, manifest 2 in dir/m2; both target
+    // the same workdir.
+    fs.mkdirSync(path.join(dir, 'm1'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'm2'), { recursive: true });
+    const mp1 = writeManifest(
+      path.join(dir, 'm1'),
+      makeBaseManifest({ workdir: path.relative(path.join(dir, 'm1'), sharedWorkdir) })
+    );
+    const mp2 = writeManifest(
+      path.join(dir, 'm2'),
+      makeBaseManifest({ workdir: path.relative(path.join(dir, 'm2'), sharedWorkdir) })
+    );
+    // Manifest 1 starts first and gets BOTH locks (manifestDir + workdir).
+    const r1 = await O.runOrchestrator({
+      manifestPath: mp1,
+      _spawnSession: makeFakeSpawnSession(),
+      _generatePrompt: makeFakeGenerate(),
+      _checkHealth: () => makeStubHealth({ pidAlive: true }),
+      _pidRunner: () => '[]',
+      _sleep: () => Promise.resolve(),
+      logger: silentLogger(),
+      projectName: 't',
+      maxTicks: 0, // immediate exit, but locks acquired during pre-flight
+    });
+    // Pre-write a `.orchestrator.lock` at the shared workdir so we
+    // can simulate a second orchestrator hitting it. (After r1
+    // completes its locks are released; we need to plant one for
+    // the test.)
+    const sharedLockPath = path.join(
+      sharedWorkdir,
+      'docs',
+      'orchestration',
+      '.orchestrator.lock'
+    );
+    fs.mkdirSync(path.dirname(sharedLockPath), { recursive: true });
+    fs.writeFileSync(
+      sharedLockPath,
+      JSON.stringify({ pid: 99999, startedAt: 'now', hostname: 'h' })
+    );
+    // m2 should refuse because the workdir lock is held by an
+    // "alive" PID.
+    const r2 = await O.runOrchestrator({
+      manifestPath: mp2,
+      _killer: () => {}, // alive
+      _spawnSession: makeFakeSpawnSession(),
+      _generatePrompt: makeFakeGenerate(),
+      _checkHealth: () => makeStubHealth(),
+      _pidRunner: () => '[]',
+      _sleep: () => Promise.resolve(),
+      logger: silentLogger(),
+      projectName: 't',
+      maxTicks: 1,
+    });
+    assert.strictEqual(r2.ok, false);
+    assert.strictEqual(r2.summary, 'lock_contention');
+    assert.match(r2.error, /workdir/);
+  } finally {
+    rmrf(dir);
+  }
+});
+
 test('Q2 CLI: missing manifest path exits 1', () => {
   const r = spawnSync(process.execPath, [path.join(__dirname, 'orchestrate.js')], {
     encoding: 'utf8',

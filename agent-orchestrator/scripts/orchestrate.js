@@ -166,6 +166,20 @@
  * counters reset to zero — recovery is delayed by at most N ticks,
  * never silently skipped, because a confirmed `pidAlive: false`
  * (kernel ESRCH) escalates immediately regardless of counter state.
+ *
+ * V1.5 deferred — concurrent multi-manifest runs:
+ *   - Session names are `orch-<phase>-<role>` (no manifest identity).
+ *     Two orchestrators running DIFFERENT manifests with overlapping
+ *     phase ids would both spawn `orch-phase-1-impl`; PID lookup is
+ *     global and would conflate the two. V1 contract: one
+ *     orchestrator instance per machine OR ensure phase ids are
+ *     unique across all simultaneous manifests. V1.5 will namespace
+ *     session names by a manifest-derived hash. Codex round 22 P2.
+ *   - The shared-workdir secondary lockfile (codex round 22 P2)
+ *     prevents two manifests from racing on the SAME workdir's
+ *     `.pending-*` directory — refuse-to-start if the workdir lock
+ *     is held by another manifest. Concurrent runs across DIFFERENT
+ *     workdirs remain unrestricted.
  */
 
 'use strict';
@@ -2659,7 +2673,19 @@ async function runOrchestrator(opts) {
   // mutate the filesystem, including the lockfile. Skip both
   // acquire and release on dry-run; concurrent dry-runs are
   // harmless since they don't touch any persistent state.
+  //
+  // Codex round 22 P2: when manifest.workdir != manifestDir, the
+  // hook flag directory is separate from the manifest directory.
+  // Two orchestrators targeting the same workdir from DIFFERENT
+  // manifests would each hold their own manifest-dir lock but
+  // race on the shared workdir's `.pending-*` files. Acquire a
+  // SECONDARY lock at the hook flag directory when it differs
+  // from the manifest's so shared-workdir concurrent runs are
+  // detected and refused. We don't yet know workdir at this
+  // scope, so we read the raw manifest once for the lock
+  // decision; the rest of the loop uses pollAllPhases.
   let lockPath = null;
+  let workdirLockPath = null;
   if (!dryRun) {
     try {
       lockPath = acquireLock(orchDir, opts);
@@ -2672,6 +2698,34 @@ async function runOrchestrator(opts) {
         error: e.message,
         code: e.code === 'ELOCKED' ? 2 : 1,
       };
+    }
+    // Conditional secondary lock for shared-workdir concurrency.
+    try {
+      const loadFn = opts._loadManifest || loadManifest;
+      const preLoad = loadFn(opts.manifestPath);
+      if (preLoad.ok && preLoad.manifest && typeof preLoad.manifest.workdir === 'string') {
+        const wd = path.isAbsolute(preLoad.manifest.workdir)
+          ? preLoad.manifest.workdir
+          : path.resolve(manifestDir, preLoad.manifest.workdir);
+        const wdOrch = orchDirFor(wd);
+        if (path.normalize(wdOrch) !== path.normalize(orchDir)) {
+          try {
+            workdirLockPath = acquireLock(wdOrch, opts);
+          } catch (e) {
+            logger('error', e.message);
+            releaseLock(lockPath, opts);
+            return {
+              ok: false,
+              summary: 'lock_contention',
+              history: [],
+              error: `secondary workdir lock: ${e.message}`,
+              code: e.code === 'ELOCKED' ? 2 : 1,
+            };
+          }
+        }
+      }
+    } catch (_) {
+      /* manifest load is best-effort here; pollAllPhases will surface real errors */
     }
   }
 
@@ -2834,6 +2888,9 @@ async function runOrchestrator(opts) {
   } finally {
     if (lockPath) {
       releaseLock(lockPath, opts);
+    }
+    if (workdirLockPath) {
+      releaseLock(workdirLockPath, opts);
     }
   }
 
