@@ -2824,6 +2824,225 @@ test('T4 [codex round 3 P1] phase plan_units literal string overrides plan_path'
   }
 });
 
+// =========================================================================
+// U — codex round 4 regression tests
+// =========================================================================
+
+test('U1 [codex round 4 P1] review-enabled phase with only impl agent → snapshot includes synthesized QA', () => {
+  const dir = mkTmp('orch-U1');
+  try {
+    const mp = writeManifest(
+      dir,
+      makeBaseManifest({
+        phases: [
+          {
+            id: 'p',
+            completion_signal: 'docs/orchestration/phases/p/impl-complete.md',
+            review_loop: { enabled: true, max_iterations: 3 },
+            agents: [{ role: 'impl' }], // only impl declared
+          },
+        ],
+      })
+    );
+    let queriedNames = null;
+    O.pollAllPhases({
+      manifestPath: mp,
+      _pidRunner: () => '[]',
+    });
+    // Probe the snapshot builder directly with a runner that captures
+    // the names list it parses against.
+    const snap = O.buildPidSnapshot(['orch-p-impl', 'orch-p-qa'], {
+      _pidRunner: () =>
+        JSON.stringify([
+          { ProcessId: 100, CommandLine: 'claude --name orch-p-impl' },
+          { ProcessId: 200, CommandLine: 'claude --name orch-p-qa' },
+        ]),
+    });
+    assert.strictEqual(snap.get('orch-p-impl').pid, 100);
+    assert.strictEqual(snap.get('orch-p-qa').pid, 200);
+    // And confirm pollAllPhases includes orch-p-qa in its name list
+    // (we can't directly inspect, but a tick that uses _pidSnapshot
+    // works correctly only if the synthesized QA is in the snapshot).
+    // This is exercised end-to-end by the J-series review tests; the
+    // direct test above is the regression-pin for the snapshot
+    // builder's integration.
+    void queriedNames;
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('U1b [codex round 4 P1] pollAllPhases includes synthesized QA role for review-enabled impl-only phase', () => {
+  const dir = mkTmp('orch-U1b');
+  try {
+    const mp = writeManifest(
+      dir,
+      makeBaseManifest({
+        phases: [
+          {
+            id: 'p',
+            completion_signal: 'docs/orchestration/phases/p/impl-complete.md',
+            review_loop: { enabled: true, max_iterations: 3 },
+            agents: [{ role: 'impl' }],
+          },
+        ],
+      })
+    );
+    // Capture the runner's stdin/argv pair to confirm pollAllPhases
+    // calls buildPidLookupArgs once per tick. The names we asked
+    // about live in the parser's output, not the input — so we
+    // assert via the resulting snapshot's keys instead.
+    const tickRes = O.pollAllPhases({
+      manifestPath: mp,
+      _pidRunner: () =>
+        JSON.stringify([
+          { ProcessId: 100, CommandLine: 'claude --name orch-p-impl' },
+          { ProcessId: 200, CommandLine: 'claude --name orch-p-qa' },
+        ]),
+    });
+    // Both impl and qa entries should be in the snapshot — proving
+    // the orchestrator looked up qa even though it isn't declared in
+    // phase.agents.
+    assert.ok(tickRes.pidSnapshot.has('orch-p-impl'));
+    assert.ok(tickRes.pidSnapshot.has('orch-p-qa'));
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('U2 [codex round 4 P2] CLI --review-loop-max-iterations applies when manifest omits the field', () => {
+  const dir = mkTmp('orch-U2');
+  try {
+    const mp = writeManifest(
+      dir,
+      makeBaseManifest({
+        phases: [
+          {
+            id: 'p',
+            completion_signal: 'docs/orchestration/phases/p/impl-complete.md',
+            // review_loop without max_iterations — normalize fills
+            // the default 3, which would mask any CLI override.
+            review_loop: { enabled: true },
+            agents: [{ role: 'impl' }, { role: 'qa' }],
+          },
+        ],
+      })
+    );
+    writeStatus(mp, {
+      phases: {
+        p: { status: 'running', review_stage: 'qa', review_iteration: 5 },
+      },
+    });
+    const phaseDir = makePhaseDir(mp, 'p');
+    writeCompletionSignal(phaseDir, 'qa', 'blocked'); // FAIL
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    // CLI raised the cap to 10. With the bug, normalizePhases set
+    // max_iterations to 3 and the orchestrator would have escalated
+    // at iteration 5. After the fix, iteration 5 < CLI cap of 10, so
+    // we expect a respawn.
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      { reviewLoopMaxIterations: 10 }
+    );
+    assert.ok(
+      actions.some((a) => a.type === 'spawn' && a.mode === 'review_retry'),
+      'CLI cap of 10 must allow respawn at iteration 5'
+    );
+    assert.ok(
+      !actions.some((a) => a.type === 'mark_phase_failed'),
+      'CLI cap of 10 must NOT escalate at iteration 5'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('U3 [codex round 4 P2] multi-role phase with one role blocked → does NOT mark complete', () => {
+  const dir = mkTmp('orch-U3');
+  try {
+    const mp = writeManifest(
+      dir,
+      makeBaseManifest({
+        phases: [
+          {
+            id: 'p',
+            completion_signal: 'docs/orchestration/phases/p/impl-complete.md',
+            // No review_loop — both impl and qa run as concurrent roles.
+            agents: [{ role: 'impl' }, { role: 'qa' }],
+          },
+        ],
+      })
+    );
+    writeStatus(mp, { phases: { p: { status: 'running' } } });
+    const phaseDir = makePhaseDir(mp, 'p');
+    // impl complete but qa blocked.
+    writeCompletionSignal(phaseDir, 'impl', 'complete');
+    writeCompletionSignal(phaseDir, 'qa', 'blocked');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      { _checkHealth: () => makeStubHealth() }
+    );
+    // QA's blocked status must trigger mark_phase_blocked for the
+    // phase, not mark_phase_completed even though impl is complete.
+    assert.ok(actions.some((a) => a.type === 'mark_phase_blocked'));
+    assert.ok(!actions.some((a) => a.type === 'mark_phase_completed'));
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('U4 [codex round 4 P2] multi-role phase with both roles complete → marks complete', () => {
+  const dir = mkTmp('orch-U4');
+  try {
+    const mp = writeManifest(
+      dir,
+      makeBaseManifest({
+        phases: [
+          {
+            id: 'p',
+            completion_signal: 'docs/orchestration/phases/p/impl-complete.md',
+            agents: [{ role: 'impl' }, { role: 'qa' }],
+          },
+        ],
+      })
+    );
+    writeStatus(mp, { phases: { p: { status: 'running' } } });
+    const phaseDir = makePhaseDir(mp, 'p');
+    writeCompletionSignal(phaseDir, 'impl', 'complete');
+    writeCompletionSignal(phaseDir, 'qa', 'complete');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      { _checkHealth: () => makeStubHealth() }
+    );
+    assert.ok(actions.some((a) => a.type === 'mark_phase_completed'));
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('U5 [codex round 4 P2] lockfile uses exclusive create — second concurrent acquire fails', () => {
+  const dir = mkTmp('orch-U5');
+  try {
+    // First acquire succeeds.
+    const p1 = O.acquireLock(dir, { _pid: 1 });
+    assert.ok(fs.existsSync(p1));
+    // Second acquire (different pid, would-be live process) fails
+    // because the file already exists. We mock killer to claim "alive"
+    // so the recovery branch can't bypass the exclusivity test.
+    assert.throws(
+      () => O.acquireLock(dir, { _pid: 2, _killer: () => {} }),
+      (err) => err.code === 'ELOCKED'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
 test('Q2 CLI: missing manifest path exits 1', () => {
   const r = spawnSync(process.execPath, [path.join(__dirname, 'orchestrate.js')], {
     encoding: 'utf8',

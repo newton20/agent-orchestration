@@ -295,8 +295,11 @@ function acquireLock(orchDir, opts = {}) {
   const existsSync = opts._existsSync || fs.existsSync;
   const readFileSync = opts._readFileSync || fs.readFileSync;
   const writeFileSync = opts._writeFileSync || fs.writeFileSync;
-  const renameSync = opts._renameSync || fs.renameSync;
   const mkdirSync = opts._mkdirSync || fs.mkdirSync;
+  const unlinkSync = opts._unlinkSync || fs.unlinkSync;
+  const openSync = opts._openSync || fs.openSync;
+  const closeSync = opts._closeSync || fs.closeSync;
+  const writeSync = opts._writeSync || fs.writeSync;
   const killer = opts._killer || ((p, sig) => process.kill(p, sig));
 
   mkdirSync(orchDir, { recursive: true });
@@ -332,7 +335,15 @@ function acquireLock(orchDir, opts = {}) {
         throw err;
       }
     }
-    // Stale lock — fall through and overwrite.
+    // Stale lock — unlink so the exclusive create below has room.
+    // Race-safe: if another orchestrator unlinks first, the next
+    // create-with-O_EXCL claims the lock and we lose the race
+    // (handled by the EEXIST branch below).
+    try {
+      unlinkSync(lockPath);
+    } catch (_) {
+      /* fall through; the exclusive create will surface contention */
+    }
   }
 
   const content = JSON.stringify(
@@ -340,13 +351,60 @@ function acquireLock(orchDir, opts = {}) {
     null,
     2
   );
-  if (Buffer.byteLength(content, 'utf8') === 0) {
-    throw new Error('lockfile content is empty — internal error'); // unreachable
+
+  // Codex round 4 P2: exclusive-create acquire. `wx` flag = O_CREAT |
+  // O_EXCL | O_WRONLY — fails with EEXIST if the file already
+  // exists. Two orchestrators racing to acquire the lock will
+  // deterministically resolve: the first openSync('wx') succeeds,
+  // every later openSync('wx') gets EEXIST and we throw ELOCKED.
+  // The prior `existsSync` + `rename` shape had a TOCTOU window
+  // between the check and the rename where two orchestrators could
+  // both see "no lock" and both rename successfully (rename does
+  // NOT fail on existing file — it overwrites).
+  let fd;
+  try {
+    fd = openSync(lockPath, 'wx');
+  } catch (e) {
+    if (e && e.code === 'EEXIST') {
+      // Race lost — another orchestrator just claimed the lock.
+      // Re-read it and surface contention vs corruption.
+      let other;
+      try {
+        other = JSON.parse(readFileSync(lockPath, 'utf8'));
+      } catch (_) {
+        const err = new Error(
+          `lockfile race: another orchestrator just took ${lockPath} ` +
+            `(file is unparseable; inspect manually).`
+        );
+        err.code = 'ELOCKED';
+        throw err;
+      }
+      const err = new Error(
+        `lockfile race: another orchestrator (pid ${other.pid || '?'}, ` +
+          `started ${other.startedAt || '?'}) just claimed ${lockPath}.`
+      );
+      err.code = 'ELOCKED';
+      throw err;
+    }
+    throw e;
   }
-  // Atomic write: tmp + rename within same filesystem.
-  const tmp = path.join(orchDir, `${LOCKFILE_NAME}.tmp-${ourPid}-${Date.now()}`);
-  writeFileSync(tmp, content, { encoding: 'utf8' });
-  renameSync(tmp, lockPath);
+  // We hold the fd. Write content + close.
+  try {
+    if (typeof writeFileSync === 'function' && writeFileSync !== fs.writeFileSync) {
+      // Test path passed a custom writer. Close the exclusive fd and
+      // use the injected writeFileSync (matches prior test seam shape).
+      closeSync(fd);
+      writeFileSync(lockPath, content, { encoding: 'utf8' });
+    } else {
+      const buf = Buffer.from(content, 'utf8');
+      writeSync(fd, buf, 0, buf.length, 0);
+      closeSync(fd);
+    }
+  } catch (e) {
+    try { closeSync(fd); } catch (_) { /* ignore */ }
+    try { unlinkSync(lockPath); } catch (_) { /* ignore */ }
+    throw e;
+  }
   return lockPath;
 }
 
@@ -470,10 +528,29 @@ function pollAllPhases(opts) {
   // manifest declares. We pre-fetch even for `pending` phases — the
   // marginal cost of one Map.set is trivial, and the same snapshot
   // is reused if a pending phase advances mid-tick.
+  //
+  // Codex round 4 P1: review-loop phases dispatch a QA role even
+  // when the manifest declares only impl agents (executeSpawn
+  // synthesizes the QA agent from defaults). Without including
+  // `orch-<phase>-qa` in the snapshot's session-name list, the live
+  // QA process is invisible to checkHealth's `_pidSnapshot` path —
+  // checkHealth treats a missing entry as authoritative ("session
+  // not found"), so a healthy QA agent gets recovered as a crash
+  // after startup-grace + convergence ticks.
   const sessionNames = [];
   for (const phase of phases) {
-    for (const agent of phase.agents) {
-      sessionNames.push(defaultSessionName(phase.id, agent.role));
+    const declaredRoles = new Set(phase.agents.map((a) => a.role));
+    for (const role of declaredRoles) {
+      sessionNames.push(defaultSessionName(phase.id, role));
+    }
+    // Synthesized review-loop roles. Today's only synthesized case is
+    // QA on a review-enabled phase whose agents[] declares only impl.
+    if (
+      phase.review_loop &&
+      phase.review_loop.enabled &&
+      !declaredRoles.has('qa')
+    ) {
+      sessionNames.push(defaultSessionName(phase.id, 'qa'));
     }
   }
   const pidSnapshot = buildPidSnapshot(sessionNames, opts);
@@ -682,17 +759,37 @@ function decideTickActions(tickState, runState, opts) {
     const reviewIteration = Number.isInteger(phaseEntry.review_iteration)
       ? phaseEntry.review_iteration
       : 1;
-    // Per-phase iteration cap takes precedence over the orchestrator-
-    // wide CLI default (codex round 1 P2). normalizePhases guarantees
-    // `phase.review_loop` exists with `max_iterations` set; we still
-    // guard for safety in case a future schema bump leaves it null.
+    // Review-loop iteration cap precedence (codex round 1 P2 + round
+    // 4 P2):
+    //   1. User-provided per-phase override via the RAW manifest's
+    //      `review_loop.max_iterations`. This is the operator's
+    //      explicit intent for THIS phase.
+    //   2. Orchestrator-wide CLI override via `--review-loop-max-iterations`
+    //      (`opts.reviewLoopMaxIterations`).
+    //   3. Built-in default DEFAULT_REVIEW_LOOP_MAX_ITERATIONS.
+    //
+    // The normalized phase always carries `max_iterations: 3` because
+    // normalizePhases fills in a default — using the normalized value
+    // here would mask the CLI flag whenever the manifest omits the
+    // field. We instead probe the raw manifest's phase entry for the
+    // user-provided value and fall back to the CLI / built-in default
+    // chain.
+    const rawPhaseForCap =
+      (Array.isArray(manifest.phases)
+        ? manifest.phases.find((p) => p && p.id === phase.id)
+        : null) || {};
+    const rawReviewLoopForCap =
+      rawPhaseForCap.review_loop && typeof rawPhaseForCap.review_loop === 'object'
+        ? rawPhaseForCap.review_loop
+        : {};
+    const userPhaseCap = Number.isInteger(rawReviewLoopForCap.max_iterations)
+      ? rawReviewLoopForCap.max_iterations
+      : null;
+    const cliCap = Number.isInteger(opts.reviewLoopMaxIterations)
+      ? opts.reviewLoopMaxIterations
+      : null;
     const reviewMaxIter =
-      (phase.review_loop && Number.isInteger(phase.review_loop.max_iterations)
-        ? phase.review_loop.max_iterations
-        : null) ??
-      (opts.reviewLoopMaxIterations != null
-        ? opts.reviewLoopMaxIterations
-        : DEFAULT_REVIEW_LOOP_MAX_ITERATIONS);
+      userPhaseCap ?? cliCap ?? DEFAULT_REVIEW_LOOP_MAX_ITERATIONS;
 
     const activeRoles = reviewEnabled
       ? [reviewStage]
@@ -881,12 +978,27 @@ function decideTickActions(tickState, runState, opts) {
           phaseId: phase.id,
           role,
         });
-        // Aggregate across all declared roles: the phase is complete
-        // only when every declared role has a completion signal.
-        const allRoleSignalsPresent = phase.agents.every((a) =>
-          (opts._existsSync || fs.existsSync)(completionSignalFor(phaseDir, a.role))
-        );
-        if (allRoleSignalsPresent) {
+        // Aggregate across all declared roles. The phase advances to
+        // `completed` only when EVERY declared role's completion
+        // signal exists AND parses to `status: complete` (codex round
+        // 4 P2). One role's `status: blocked` / `partial` would
+        // otherwise let a half-finished multi-role phase mark
+        // completed — silently advancing downstream phases.
+        // (The current role already passed the parse check above by
+        // virtue of reaching this branch; we re-check the others.)
+        let allRolesComplete = true;
+        for (const a of phase.agents) {
+          if (a.role === role) continue; // current role is complete
+          const sig = parseCompletionSignal(
+            completionSignalFor(phaseDir, a.role),
+            opts
+          );
+          if (!sig || sig.status !== 'complete') {
+            allRolesComplete = false;
+            break;
+          }
+        }
+        if (allRolesComplete) {
           actions.push({
             type: 'mark_phase_completed',
             phaseId: phase.id,
