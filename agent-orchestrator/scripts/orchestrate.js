@@ -777,9 +777,11 @@ function parseQaVerdict(phaseDir, role, opts = {}) {
       }
     }
   }
-  // Fall back to qa-complete.md frontmatter (V1 default — the template
-  // does not yet produce qa-verdict.json).
-  const signalPath = completionSignalFor(phaseDir, role);
+  // Fall back to the QA completion signal's frontmatter. Codex round
+  // 11 P2: when the manifest declares a custom path for QA's signal,
+  // callers pass it via `opts.signalPath`; otherwise we use the
+  // conventional <phaseDir>/qa-complete.md.
+  const signalPath = opts.signalPath || completionSignalFor(phaseDir, role);
   const sig = parseCompletionSignal(signalPath, opts);
   if (!sig) return null;
   return {
@@ -1001,7 +1003,9 @@ function decideTickActions(tickState, runState, opts) {
         }
         if (reviewEnabled && role === 'qa') {
           // QA just completed; parse verdict.
-          const verdict = parseQaVerdict(phaseDir, 'qa', opts);
+          // Codex round 11 P2: pass the resolved signalPath so a
+          // manifest-declared custom QA completion path is honored.
+          const verdict = parseQaVerdict(phaseDir, 'qa', { ...opts, signalPath });
           if (!verdict) {
             actions.push({
               type: 'log',
@@ -1861,6 +1865,13 @@ function executeSpawn(action, tickState, runState, opts, deps) {
     phaseDir,
     priorPhaseSignals,
     completionSignalPath: dispatchCompletionSignal,
+    // Codex round 11 P3: render the heartbeat path so agents emit
+    // heartbeats. Without this, generate-prompt's `{{heartbeat_path}}`
+    // is empty and protocol-header.md instructs the agent to skip
+    // heartbeats — disabling check-health's secondary liveness signal.
+    // The path matches check-health.js's hard-coded read path
+    // (<phaseDir>/heartbeat.jsonl).
+    heartbeatPath: path.join(phaseDir, 'heartbeat.jsonl'),
   };
 
   // plan_units (codex round 3 P1). impl-prompt.md, qa-prompt.md, and

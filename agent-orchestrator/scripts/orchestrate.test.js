@@ -3874,6 +3874,103 @@ test('AA3 [codex round 10 P2] spawn-only tick uses active cadence (does NOT slee
   }
 });
 
+// =========================================================================
+// AB — codex round 11 regression tests
+// =========================================================================
+
+test('AB1 [codex round 11 P2] parseQaVerdict honors signalPath opt for custom QA paths', () => {
+  const dir = mkTmp('orch-AB1');
+  try {
+    // Custom QA signal at a non-conventional path.
+    const customDir = path.join(dir, 'custom');
+    fs.mkdirSync(customDir, { recursive: true });
+    const customSig = path.join(customDir, 'qa-complete.md');
+    fs.writeFileSync(customSig, '---\nstatus: complete\n---\n# pass');
+    // Conventional path also exists with DIFFERENT content.
+    const convSig = path.join(dir, 'qa-complete.md');
+    fs.writeFileSync(convSig, '---\nstatus: blocked\n---\n# fail');
+    // Default path (no signalPath) reads conventional → blocked → fail.
+    const defaultV = O.parseQaVerdict(dir, 'qa');
+    assert.strictEqual(defaultV.pass, false);
+    // With signalPath set, reads custom → complete → pass.
+    const customV = O.parseQaVerdict(dir, 'qa', { signalPath: customSig });
+    assert.strictEqual(customV.pass, true);
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AB2 [codex round 11 P2] review-loop with custom QA signal path advances on pass', () => {
+  const dir = mkTmp('orch-AB2');
+  try {
+    const mp = writeManifest(
+      dir,
+      makeBaseManifest({
+        phases: [
+          {
+            id: 'p',
+            // Multi-role with qa-named manifest path → resolves to qa role's signal.
+            completion_signal: 'docs/x/qa-complete.md',
+            review_loop: { enabled: true, max_iterations: 3 },
+            agents: [{ role: 'impl' }, { role: 'qa' }],
+          },
+        ],
+      })
+    );
+    writeStatus(mp, {
+      phases: {
+        p: { status: 'running', review_stage: 'qa', review_iteration: 1 },
+      },
+    });
+    fs.mkdirSync(path.join(dir, 'docs', 'x'), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'docs', 'x', 'qa-complete.md'),
+      '---\nstatus: complete\n---\n# pass'
+    );
+    makePhaseDir(mp, 'p');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {}
+    );
+    assert.ok(
+      actions.some((a) => a.type === 'mark_phase_completed'),
+      'review-loop must complete the phase reading the custom QA signal path'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AB3 [codex round 11 P3] generate-prompt receives heartbeatPath in genOpts', () => {
+  const dir = mkTmp('orch-AB3');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const fakeGen = makeFakeGenerate();
+    O.executeActions(
+      [{ type: 'spawn', phaseId: 'phase-1', role: 'impl', mode: 'initial', iteration: 1 }],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: makeFakeSpawnSession(),
+        _generatePrompt: fakeGen,
+        _runUpdate: makeFakeRunUpdate(),
+        logger: silentLogger(),
+        projectName: 'p',
+      }
+    );
+    const passedHeartbeat = fakeGen.calls[0].heartbeatPath;
+    assert.ok(passedHeartbeat, 'heartbeatPath must be set on every dispatch');
+    assert.match(path.normalize(passedHeartbeat), /heartbeat\.jsonl$/);
+    assert.match(path.normalize(passedHeartbeat), /phase-1[\\/]heartbeat\.jsonl$/);
+  } finally {
+    rmrf(dir);
+  }
+});
+
 test('Q2 CLI: missing manifest path exits 1', () => {
   const r = spawnSync(process.execPath, [path.join(__dirname, 'orchestrate.js')], {
     encoding: 'utf8',

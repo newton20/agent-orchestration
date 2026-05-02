@@ -25,7 +25,18 @@ no such limit.
 
 When the user invokes this skill with a manifest path:
 
-1. **Validate the manifest.**
+1. **Ensure dependencies are installed.** This MUST run before any
+   other Node script invocation — `parse-manifest.js` requires
+   `js-yaml` at module-load time and will throw a `Cannot find module`
+   error on a fresh checkout if `node_modules/` is missing.
+
+   ```bash
+   cd ${CLAUDE_PLUGIN_ROOT}/scripts && (test -d node_modules || npm install)
+   ```
+
+   The first run on a fresh checkout installs; subsequent runs skip.
+
+2. **Validate the manifest.**
 
    ```bash
    node ${CLAUDE_PLUGIN_ROOT}/scripts/parse-manifest.js <manifest.yaml>
@@ -35,15 +46,6 @@ When the user invokes this skill with a manifest path:
    under `errors[]` to the user verbatim. Do NOT proceed — the
    orchestrator refuses an invalid manifest, so let the user fix the
    manifest first.
-
-2. **Ensure dependencies are installed.**
-
-   ```bash
-   cd ${CLAUDE_PLUGIN_ROOT}/scripts && (test -d node_modules || npm install)
-   ```
-
-   The orchestrator depends on `js-yaml`. The first run on a fresh
-   checkout needs `npm install`; subsequent runs skip it.
 
 3. **Start the orchestrator process.**
 
