@@ -3251,6 +3251,185 @@ test('V6 [codex round 5 P2] generate-prompt receives manifest completion_signal 
   }
 });
 
+// =========================================================================
+// W — codex round 6 regression tests
+// =========================================================================
+
+test('W1 [codex round 6 P2] arbitrary single-role completion_signal path is honored', () => {
+  const dir = mkTmp('orch-W1');
+  try {
+    const mp = writeManifest(
+      dir,
+      makeBaseManifest({
+        phases: [
+          {
+            id: 'p',
+            // Arbitrary path — no role-name in basename.
+            completion_signal: 'signals/phase-0-done.md',
+            agents: [{ role: 'impl' }],
+          },
+        ],
+      })
+    );
+    writeStatus(mp, { phases: { p: { status: 'running' } } });
+    fs.mkdirSync(path.join(dir, 'signals'), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'signals', 'phase-0-done.md'),
+      '---\nstatus: complete\n---\n# done'
+    );
+    makePhaseDir(mp, 'p');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {}
+    );
+    assert.ok(
+      actions.some((a) => a.type === 'mark_phase_completed' && a.phaseId === 'p'),
+      'arbitrary completion_signal path should be polled directly'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('W1b [codex round 6 P2] resolveCompletionSignal returns arbitrary path verbatim for single-role phase', () => {
+  const manifest = {
+    phases: [
+      {
+        id: 'p',
+        completion_signal: 'signals/done.md',
+        agents: [{ role: 'impl' }],
+      },
+    ],
+  };
+  const dir = mkTmp('orch-W1b');
+  try {
+    const got = O.resolveCompletionSignal(manifest, dir, 'p', 'impl');
+    assert.strictEqual(
+      path.normalize(got),
+      path.normalize(path.join(dir, 'signals', 'done.md'))
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('W2 [codex round 6 P2] partial multi-role spawn failure persists running so successful role is not re-spawned', () => {
+  const dir = mkTmp('orch-W2');
+  try {
+    const mp = writeManifest(
+      dir,
+      makeBaseManifest({
+        phases: [
+          {
+            id: 'p',
+            completion_signal: 'docs/orchestration/phases/p/impl-complete.md',
+            agents: [{ role: 'impl' }, { role: 'qa' }],
+          },
+        ],
+      })
+    );
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    let calls = 0;
+    const flakySpawn = (opts) => {
+      calls += 1;
+      // First (impl) succeeds; second (qa) fails.
+      if (calls === 2) throw new Error('qa spawn unavailable');
+      return {
+        pid: 4242,
+        command: 'fake',
+        argv: [],
+        sessionName: opts.name,
+        title: opts.name,
+        spawnedAt: '2026-05-02T00:00:00Z',
+      };
+    };
+    const fakeUpdate = makeFakeRunUpdate();
+    O.executeActions(
+      [
+        { type: 'spawn', phaseId: 'p', role: 'impl', mode: 'initial', iteration: 1 },
+        { type: 'spawn', phaseId: 'p', role: 'qa', mode: 'initial', iteration: 1 },
+        { type: 'persist', phaseId: 'p', updates: { status: 'running' } },
+      ],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: flakySpawn,
+        _generatePrompt: makeFakeGenerate(),
+        _runUpdate: fakeUpdate,
+        logger: silentLogger(),
+        projectName: 'p',
+      }
+    );
+    // Phase-level status: running MUST be persisted so the next tick
+    // doesn't re-dispatch impl as a "pending" phase.
+    const runningPersist = fakeUpdate.calls.find(
+      (c) => c.updates && c.updates.status === 'running'
+    );
+    assert.ok(runningPersist, 'phase status: running must be persisted on partial multi-role failure');
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('W3 [codex round 6 P2] all-spawns-failed → persist is skipped (next tick retries)', () => {
+  const dir = mkTmp('orch-W3');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const fakeUpdate = makeFakeRunUpdate();
+    O.executeActions(
+      [
+        { type: 'spawn', phaseId: 'phase-1', role: 'impl', mode: 'initial', iteration: 1 },
+        { type: 'persist', phaseId: 'phase-1', updates: { status: 'running' } },
+      ],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: () => {
+          throw new Error('all spawns fail');
+        },
+        _generatePrompt: makeFakeGenerate(),
+        _runUpdate: fakeUpdate,
+        logger: silentLogger(),
+        projectName: 'p',
+      }
+    );
+    // No running persist when ALL spawns failed — phase stays pending.
+    const runningPersist = fakeUpdate.calls.find(
+      (c) => c.updates && c.updates.status === 'running'
+    );
+    assert.ok(!runningPersist, 'no persist when every spawn for the phase failed');
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('W4 [codex round 6 P2] --max-ticks with running phases left → ok=false summary=max_ticks_unfinished', async () => {
+  const dir = mkTmp('orch-W4');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    const result = await O.runOrchestrator({
+      manifestPath: mp,
+      _spawnSession: makeFakeSpawnSession(),
+      _generatePrompt: makeFakeGenerate(),
+      _checkHealth: () => makeStubHealth({ pidAlive: true }),
+      _pidRunner: () => '[]',
+      _sleep: () => Promise.resolve(),
+      logger: silentLogger(),
+      projectName: 't',
+      maxTicks: 1, // exit before any phase reaches terminal
+    });
+    assert.strictEqual(result.ok, false);
+    assert.strictEqual(result.summary, 'max_ticks_unfinished');
+  } finally {
+    rmrf(dir);
+  }
+});
+
 test('Q2 CLI: missing manifest path exits 1', () => {
   const r = spawnSync(process.execPath, [path.join(__dirname, 'orchestrate.js')], {
     encoding: 'utf8',

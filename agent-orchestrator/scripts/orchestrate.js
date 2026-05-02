@@ -296,16 +296,42 @@ function resolveCompletionSignal(manifest, manifestDir, phaseId, role) {
     typeof phaseEntry.completion_signal === 'string' &&
     phaseEntry.completion_signal !== ''
   ) {
-    // The manifest's path applies to the role whose default file name
-    // is in the path's basename. e.g. `.../impl-complete.md` is the
-    // impl role's signal; for QA we still default to <phaseDir>/qa-complete.md.
     const declared = path.isAbsolute(phaseEntry.completion_signal)
       ? phaseEntry.completion_signal
       : path.resolve(manifestDir, phaseEntry.completion_signal);
+    // Codex round 6 P2: arbitrary path acceptance. The manifest's
+    // completion_signal is the operator's authoritative declaration —
+    // we should NOT silently fall back to convention because the
+    // basename doesn't match `<role>-complete.md`. Two cases:
+    //   1. Single-role phase OR phase with this role's impl-style
+    //      basename — use the declared path verbatim. Includes
+    //      arbitrary names like `signals/phase-0-done.md` for the
+    //      role declared in `agents[]`.
+    //   2. Multi-role phase whose declared path's basename matches a
+    //      DIFFERENT role's default — use convention for the OTHER
+    //      roles so each gets a distinct signal file.
+    const phaseAgents = Array.isArray(phaseEntry.agents)
+      ? phaseEntry.agents
+      : phaseEntry.agent
+        ? [phaseEntry.agent]
+        : [];
+    const declaredRoles = phaseAgents
+      .map((a) => (a && typeof a.role === 'string' ? a.role : null))
+      .filter(Boolean);
     const baseName = path.basename(declared);
+    // Case 1a: phase declares only one role.
+    if (declaredRoles.length <= 1) {
+      // Single-role phase OR shorthand `agent` form — the declared
+      // path is unambiguously this role's signal.
+      if (declaredRoles.length === 0 || declaredRoles[0] === role) {
+        return declared;
+      }
+    }
+    // Case 1b / 2: multi-role. Match by basename — `impl-complete.md`
+    // → impl, `qa-complete.md` → qa, etc.
     if (baseName === `${role}-complete.md`) return declared;
-    // Different role's path declared at the manifest level. Fall back
-    // to convention so QA / coord roles get their own files.
+    // The basename names a DIFFERENT role; this role falls back to
+    // convention (each role gets its own per-role signal).
   }
   return completionSignalFor(
     phaseDirFor(manifestDir, phaseId),
@@ -1456,6 +1482,10 @@ function executeActions(actions, tickState, runState, opts) {
             logger,
           });
           out.spawned += 1;
+          if (!runState.spawnSucceededThisTick) {
+            runState.spawnSucceededThisTick = new Set();
+          }
+          runState.spawnSucceededThisTick.add(action.phaseId);
         } catch (e) {
           out.warnings.push(
             `spawn failed for phase=${action.phaseId} role=${action.role}: ${e.message}`
@@ -1465,11 +1495,8 @@ function executeActions(actions, tickState, runState, opts) {
             role: action.role,
           });
           // Codex round 2 P2: track which phases had a spawn failure
-          // this tick so subsequent `persist` actions targeting the
-          // same phase (which would otherwise mark it `running`) can
-          // skip — leaving the phase `pending` so the next tick
-          // re-attempts the dispatch instead of polling/recovering a
-          // session that never started.
+          // this tick. Used by the persist branch below to decide
+          // whether to skip the phase-level status: running update.
           if (!runState.spawnFailedThisTick) {
             runState.spawnFailedThisTick = new Set();
           }
@@ -1479,20 +1506,26 @@ function executeActions(actions, tickState, runState, opts) {
       }
       case 'persist': {
         if (dryRun) break;
-        // Codex round 2 P2: skip the post-spawn persist when its
-        // sibling spawn for this phase failed. The persist would have
-        // transitioned the phase to `running`; without a real session,
-        // that lies to checkHealth and the recovery path. Other
-        // persist updates (review_stage, retry_count) ride on the
-        // same action and are intentionally also skipped — the phase
-        // stays in its prior state and the next tick re-decides
-        // cleanly.
-        if (
+        // Codex round 2 P2 + round 6 P2: persist policy when sibling
+        // spawn(s) for the same phase fail.
+        //   - If ALL spawns for the phase failed, skip persist —
+        //     phase stays pending, next tick re-attempts.
+        //   - If ANY spawn for the phase succeeded (multi-role with
+        //     partial failure), DO persist — otherwise the next tick
+        //     sees status: pending and re-spawns the already-running
+        //     role, creating duplicate tabs. The role(s) whose spawn
+        //     failed get picked up via the recovery path on the next
+        //     tick (their session_not_found verdict converges into
+        //     recovery).
+        const failed =
           runState.spawnFailedThisTick &&
-          runState.spawnFailedThisTick.has(action.phaseId)
-        ) {
+          runState.spawnFailedThisTick.has(action.phaseId);
+        const succeeded =
+          runState.spawnSucceededThisTick &&
+          runState.spawnSucceededThisTick.has(action.phaseId);
+        if (failed && !succeeded) {
           out.warnings.push(
-            `persist skipped for phase=${action.phaseId}: spawn failed this tick`
+            `persist skipped for phase=${action.phaseId}: all spawns failed this tick`
           );
           break;
         }
@@ -2018,10 +2051,13 @@ function executeSpawn(action, tickState, runState, opts, deps) {
  * callers can introspect or test.
  */
 function runOneTick(runState, opts) {
-  // Reset per-tick state. spawnFailedThisTick is the cross-action
-  // signal letting subsequent `persist` actions know the matching
-  // spawn failed — see executeActions's persist handler.
+  // Reset per-tick state. spawnFailedThisTick + spawnSucceededThisTick
+  // are the cross-action signals letting subsequent `persist` actions
+  // decide whether to apply the status: running update — see
+  // executeActions's persist handler for the all-failed-vs-partial
+  // policy (codex round 6 P2).
   runState.spawnFailedThisTick = new Set();
+  runState.spawnSucceededThisTick = new Set();
   const tickResult = pollAllPhases(opts);
   if (!tickResult.ok) {
     const logger = opts.logger || makeDefaultLogger();
@@ -2143,15 +2179,37 @@ async function runOrchestrator(opts) {
   // failed this tick under --once / --max-ticks 1. We OR in
   // `tickRes.failed.length > 0` per-tick so exit code stays correct.
   let sawFailureOrBlocked = false;
+  let exitReason = null; // 'completed' | 'aborted' | 'max_ticks_unfinished' | 'max_ticks_failed' | etc.
   try {
     for (;;) {
       if (signal && signal.aborted) {
         logger('info', 'aborted via signal');
+        exitReason = 'aborted';
         break;
       }
       if (maxTicks !== null && runState.tickIndex >= maxTicks) {
         logger('info', `max ticks reached (${maxTicks}); exiting`);
-        if (sawFailureOrBlocked) exitOk = false;
+        // Codex round 6 P2: if --once / --max-ticks exits while
+        // phases are still running (or pending), the run did NOT
+        // complete. exit code must be non-zero with a clear summary
+        // — the documented contract is "0 = every phase completed",
+        // and a tick that just spawned sessions and left them running
+        // is not "completed."
+        if (sawFailureOrBlocked) {
+          exitOk = false;
+          exitReason = 'max_ticks_failed';
+        } else {
+          // Inspect the last tick's loaded state to distinguish
+          // "everything terminal at maxTicks" (rare; would have hit
+          // allTerminal exit first) from "phases still running".
+          const lastTickState = runState.history[runState.history.length - 1];
+          // The loop exits via allTerminal BEFORE this branch when
+          // every phase is terminal, so reaching here with maxTicks
+          // implies at least one phase is non-terminal.
+          exitOk = false;
+          exitReason = 'max_ticks_unfinished';
+          void lastTickState;
+        }
         break;
       }
       runState.tickIndex += 1;
@@ -2198,6 +2256,9 @@ async function runOrchestrator(opts) {
         });
         if (anyFailed || anyBlocked) {
           exitOk = false;
+          exitReason = 'completed_with_failures';
+        } else {
+          exitReason = 'completed';
         }
         logger(
           'info',
@@ -2219,7 +2280,9 @@ async function runOrchestrator(opts) {
 
   return {
     ok: exitOk,
-    summary: exitOk ? 'completed' : 'completed_with_failures',
+    summary:
+      exitReason ||
+      (exitOk ? 'completed' : 'completed_with_failures'),
     history: runState.history,
     lockPath,
   };
