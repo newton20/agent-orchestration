@@ -4618,6 +4618,71 @@ test('AH4 [codex round 17 P2] --dry-run after --max-ticks (different argv order)
   assert.strictEqual(a.maxTicks, 3);
 });
 
+// =========================================================================
+// AI — codex round 18 regression tests
+// =========================================================================
+
+test('AI1 [codex round 18 P2] dry-run does not write the lockfile', async () => {
+  const dir = mkTmp('orch-AI1');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    const result = await O.runOrchestrator({
+      manifestPath: mp,
+      _spawnSession: makeFakeSpawnSession(),
+      _generatePrompt: makeFakeGenerate(),
+      _checkHealth: () => makeStubHealth(),
+      _pidRunner: () => '[]',
+      _sleep: () => Promise.resolve(),
+      logger: silentLogger(),
+      projectName: 't',
+      maxTicks: 1,
+      dryRun: true,
+    });
+    const lockPath = path.join(dir, 'docs', 'orchestration', '.orchestrator.lock');
+    assert.ok(!fs.existsSync(lockPath), 'dry-run must NOT create the lockfile');
+    assert.strictEqual(result.lockPath, null);
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AI2 [codex round 18 P2] dry-run renders against the source templates dir', () => {
+  // Verify the dry-run path resolves templatesDir to this plugin's
+  // source templates/ folder, NOT the (non-existent) live
+  // docs/orchestration/templates/ that scaffold-protocol would
+  // copy. Without this, every dry-run on a fresh manifest would
+  // throw "cannot read template" before the first action runs.
+  const dir = mkTmp('orch-AI2');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const fakeGen = makeFakeGenerate();
+    O.executeActions(
+      [{ type: 'spawn', phaseId: 'phase-1', role: 'impl', mode: 'initial', iteration: 1 }],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: makeFakeSpawnSession(),
+        _generatePrompt: fakeGen,
+        _runUpdate: makeFakeRunUpdate(),
+        logger: silentLogger(),
+        projectName: 'p',
+        dryRun: true,
+      }
+    );
+    const passedTmpl = fakeGen.calls[0].templatesDir;
+    // Should match the plugin source templates dir, not the live one.
+    const sourceTmpl = path.resolve(__dirname, '..', 'templates');
+    assert.strictEqual(
+      path.normalize(passedTmpl),
+      path.normalize(sourceTmpl),
+      `dry-run should render from source templates, got ${passedTmpl}`
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
 test('Q2 CLI: missing manifest path exits 1', () => {
   const r = spawnSync(process.execPath, [path.join(__dirname, 'orchestrate.js')], {
     encoding: 'utf8',

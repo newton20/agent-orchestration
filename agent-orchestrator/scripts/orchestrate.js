@@ -1582,7 +1582,17 @@ function executeActions(actions, tickState, runState, opts) {
   const manifestPath = tickState.manifestPath;
   const manifestDir = path.dirname(path.resolve(manifestPath));
   const orchDir = orchDirFor(manifestDir);
-  const templatesDir = opts.templatesDir || templatesDirFor(manifestDir);
+  // Codex round 18 P2: under --dry-run, scaffold-protocol's
+  // template-copy step is reported but not executed, so the live
+  // `docs/orchestration/templates/` path won't exist. Fall back to
+  // this plugin's source `templates/` directory so dry-run can
+  // render against the real on-disk templates without requiring a
+  // prior non-dry scaffold pass.
+  const templatesDir =
+    opts.templatesDir ||
+    (dryRun
+      ? path.resolve(__dirname, '..', 'templates')
+      : templatesDirFor(manifestDir));
 
   for (const action of actions) {
     if (out.fatal) break; // fatal halts further execution this tick
@@ -2535,18 +2545,24 @@ async function runOrchestrator(opts) {
   }
 
   // Lockfile. Acquired per orchestrator instance; released on exit.
+  // Codex round 18 P2: dry-run is the previewer — it must not
+  // mutate the filesystem, including the lockfile. Skip both
+  // acquire and release on dry-run; concurrent dry-runs are
+  // harmless since they don't touch any persistent state.
   let lockPath = null;
-  try {
-    lockPath = acquireLock(orchDir, opts);
-  } catch (e) {
-    logger('error', e.message);
-    return {
-      ok: false,
-      summary: 'lock_contention',
-      history: [],
-      error: e.message,
-      code: e.code === 'ELOCKED' ? 2 : 1,
-    };
+  if (!dryRun) {
+    try {
+      lockPath = acquireLock(orchDir, opts);
+    } catch (e) {
+      logger('error', e.message);
+      return {
+        ok: false,
+        summary: 'lock_contention',
+        history: [],
+        error: e.message,
+        code: e.code === 'ELOCKED' ? 2 : 1,
+      };
+    }
   }
 
   const runState = {
