@@ -583,8 +583,31 @@ function acquireLock(orchDir, opts = {}) {
     }
   }
 
+  // Codex re-round P1: record the OS-reported process start time
+  // (not Date.now) so the recycling tiebreaker compares apples-to-
+  // apples on resume. Pre-fix the recorded value was Date.now() at
+  // ACQUIRE time; if the orchestrator spent >1s in scaffold/preflight
+  // before acquiring the lock, Date.now != OS-creation-time and the
+  // tiebreaker falsely concluded "recycled PID" against ITSELF — a
+  // second orchestrator could overwrite a live lock and run
+  // concurrently.
+  const startTimeProbe = opts._startTimeProbe || probeProcessStartTime;
+  let osStartedAtMs = null;
+  try {
+    osStartedAtMs = startTimeProbe(ourPid);
+  } catch (_) {
+    osStartedAtMs = null;
+  }
+  // Persist the OS-reported start time as ISO when available; fall
+  // back to the wall-clock `now` when the probe is inconclusive
+  // (recycling detection becomes best-effort in that case but the
+  // lockfile still functions for the alive-or-not check).
+  const startedAtIso =
+    typeof osStartedAtMs === 'number' && Number.isFinite(osStartedAtMs)
+      ? new Date(osStartedAtMs).toISOString()
+      : now;
   const content = JSON.stringify(
-    { pid: ourPid, startedAt: now, hostname },
+    { pid: ourPid, startedAt: startedAtIso, hostname },
     null,
     2
   );
@@ -1059,16 +1082,23 @@ function decideTickActions(tickState, runState, opts) {
     // The role recorded as spawning isn't directly available on the
     // phase entry (we don't track per-role status in V1). For
     // multi-role + review-loop cases, reconcile every declared
-    // role. The simpler V1 invariant: a phase is in 'spawning'
-    // only because exactly one role's executeSpawn was mid-flight;
-    // any of phase.agents could be the candidate.
+    // role AND every synthesized role. Codex re-round P2:
+    // review-enabled phases synthesize qa (when only impl declared)
+    // or impl (when only qa declared); the prior loop only iterated
+    // declared agents and missed live synthesized sessions.
+    const declaredRoles = new Set(phase.agents.map((a) => a.role));
+    const candidateRoles = new Set(declaredRoles);
+    if (phase.review_loop && phase.review_loop.enabled) {
+      candidateRoles.add('impl');
+      candidateRoles.add('qa');
+    }
     let reconciledRole = null;
     let snapshotPid = null;
-    for (const a of phase.agents) {
-      const sessionName = defaultSessionName(phase.id, a.role);
+    for (const r of candidateRoles) {
+      const sessionName = defaultSessionName(phase.id, r);
       const snap = pidSnapshot.get(sessionName);
       if (snap && Number.isInteger(snap.pid) && snap.pid > 0) {
-        reconciledRole = a.role;
+        reconciledRole = r;
         snapshotPid = snap.pid;
         break;
       }
@@ -2800,13 +2830,20 @@ function executeSpawn(action, tickState, runState, opts, deps) {
   // write.
   if (!dryRun) {
     const updates = {
+      // Codex re-round P2: ALWAYS transition status: 'spawning' →
+      // 'running' here. Pre-fix relied on the phase-level `persist`
+      // action emitted by decideTickActions to set `status: 'running'`,
+      // but several spawn paths (e.g., QA dispatch after impl
+      // completion) only persist `review_stage` and never set
+      // `status` — leaving the phase stuck in 'spawning' after a
+      // successful spawn. Next tick's reconciliation would then
+      // potentially reset to 'pending' and re-dispatch.
+      status: 'running',
       pid: Number.isInteger(spawnResult.pid) ? spawnResult.pid : -1,
       started_at: spawnResult.spawnedAt, // <-- THE TRANSLATION (todo 087)
       // Todo 090: clear the pre-spawn dispatch marker. Empty string
       // (rather than undefined) is intentional — runUpdate's spread
-      // overwrites the field. The matching companion `status` move
-      // (spawning → running) lives in the phase-level `persist`
-      // action emitted by decideTickActions.
+      // overwrites the field.
       dispatched_at: '',
     };
     if (action.mode === 'initial' || action.mode === 'review_retry') {

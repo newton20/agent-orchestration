@@ -4519,9 +4519,11 @@ test('AG2 [codex round 16 P2] abort during sleep exits without waiting full inte
     assert.strictEqual(result.summary, 'aborted');
     assert.ok(abortedDuringSleep, 'abort fired during the sleep');
     // Total time should be MUCH less than 5000ms (the active interval).
-    // The race should finish within ~100ms after the 50ms abort fire.
+    // The race should finish within ~3s — tolerating up to two
+    // probeProcessStartTime PowerShell spawns (~140ms each) + the
+    // 50ms abort fire + baseline noise on slow hardware.
     assert.ok(
-      elapsed < 1500,
+      elapsed < 3000,
       `aborted run should exit fast; took ${elapsed}ms (interval was 5000ms)`
     );
   } finally {
@@ -5304,6 +5306,145 @@ test('AP12 [todo 092] safeReadAgentFile reads small regular file', () => {
     fs.writeFileSync(f, 'hello world');
     const r = O.safeReadAgentFile(f, 1024);
     assert.strictEqual(r, 'hello world');
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AP13 [re-round P1] lockfile records OS process start time (apples-to-apples on resume)', () => {
+  const dir = mkTmp('orch-AP13');
+  try {
+    // Acquire with a probe that returns a known OS start time. The
+    // recorded `startedAt` MUST equal that OS time, NOT Date.now()
+    // at acquire — otherwise the recycling tiebreaker compares
+    // wall-clock vs OS-time and falsely reports recycling against
+    // the same orchestrator.
+    const osStart = Date.parse('2026-05-03T00:00:00.000Z');
+    const lockPath = O.acquireLock(dir, {
+      _pid: 12345,
+      _now: () => '2026-05-03T01:00:00.000Z', // wall-clock at acquire (1h later)
+      _startTimeProbe: () => osStart,
+    });
+    const obj = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+    assert.strictEqual(
+      obj.startedAt,
+      new Date(osStart).toISOString(),
+      'recorded startedAt must be OS-reported start time, not Date.now() at acquire'
+    );
+    O.releaseLock(lockPath);
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AP14 [re-round P1] probe failure → falls back to wall-clock (lock still functions)', () => {
+  const dir = mkTmp('orch-AP14');
+  try {
+    const lockPath = O.acquireLock(dir, {
+      _pid: 1,
+      _now: () => '2026-05-03T00:00:00.000Z',
+      _startTimeProbe: () => null, // probe inconclusive
+    });
+    const obj = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+    assert.strictEqual(obj.startedAt, '2026-05-03T00:00:00.000Z');
+    O.releaseLock(lockPath);
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AP15 [re-round P2] post-spawn persist always sets status: running', () => {
+  const dir = mkTmp('orch-AP15');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const updates = [];
+    O.executeActions(
+      [{ type: 'spawn', phaseId: 'phase-1', role: 'impl', mode: 'initial', iteration: 1 }],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: makeFakeSpawnSession(),
+        _generatePrompt: makeFakeGenerate(),
+        _runUpdate: (mp_, phaseId, u) => {
+          updates.push({ phaseId, updates: u });
+          return { ok: true, status_file: mp_, phase: phaseId, updates: u };
+        },
+        logger: silentLogger(),
+        projectName: 'p',
+      }
+    );
+    // Find the post-spawn persist (the one that sets pid + clears
+    // dispatched_at). It MUST also set status: 'running'.
+    const postSpawn = updates.find(
+      (c) =>
+        c.updates &&
+        c.updates.dispatched_at === '' &&
+        Number.isInteger(c.updates.pid)
+    );
+    assert.ok(postSpawn, 'post-spawn persist must exist');
+    assert.strictEqual(
+      postSpawn.updates.status,
+      'running',
+      'post-spawn persist MUST always include status: running (no caller fallback)'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AP16 [re-round P2] reconciliation loop probes synthesized review-loop roles', () => {
+  const dir = mkTmp('orch-AP16');
+  try {
+    const mp = writeManifest(
+      dir,
+      makeBaseManifest({
+        phases: [
+          {
+            id: 'p',
+            completion_signal: 'docs/orchestration/phases/p/impl-complete.md',
+            review_loop: { enabled: true, max_iterations: 3 },
+            // ONLY impl declared. QA is synthesized.
+            agents: [{ role: 'impl' }],
+          },
+        ],
+      })
+    );
+    writeStatus(mp, {
+      phases: {
+        p: {
+          status: 'spawning',
+          dispatched_at: '2026-05-03T01:00:00.000Z',
+          retry_count: 0,
+        },
+      },
+    });
+    makePhaseDir(mp, 'p');
+    // Live SYNTHESIZED qa session in the snapshot.
+    const tickRes = O.pollAllPhases({
+      manifestPath: mp,
+      _pidRunner: () =>
+        JSON.stringify([
+          { ProcessId: 7777, CommandLine: 'claude --name orch-p-qa' },
+        ]),
+    });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {}
+    );
+    const adopt = actions.find(
+      (a) =>
+        a.type === 'persist' &&
+        a.updates &&
+        a.updates.status === 'running' &&
+        a.updates.pid === 7777
+    );
+    assert.ok(
+      adopt,
+      'reconciliation must adopt the synthesized qa session even though only impl is declared'
+    );
   } finally {
     rmrf(dir);
   }
