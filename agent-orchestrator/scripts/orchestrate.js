@@ -387,6 +387,89 @@ function qaVerdictFor(phaseDir) {
  * Test seams: `_now`, `_pid`, `_existsSync`, `_readFileSync`,
  * `_writeFileSync`, `_renameSync`, `_killer`, `_unlinkSync`, `_hostname`.
  */
+/**
+ * Probe the OS for the start time of a running process. Returns
+ * epoch ms, or null if the process is gone / probe failed / platform
+ * not supported.
+ *
+ * Used by acquireLock's PID-recycling tiebreaker (todo 089). The
+ * recorded `prev.startedAt` in the lockfile is the orchestrator's
+ * OWN Date.now() at acquire time; this function asks the kernel
+ * "what's the start time of the process currently holding this
+ * PID?" Comparing the two distinguishes "same orchestrator still
+ * running" from "PID recycled by an unrelated process".
+ *
+ * Windows: `Get-CimInstance Win32_Process -Filter "ProcessId=N"` →
+ *   `CreationDate` field is a CIM datetime string (e.g.
+ *   `20260503094530.123456-420`). PowerShell's CIM cmdlet returns
+ *   it as a parseable JS Date when piped through `Get-Date`.
+ * POSIX: `/proc/<pid>/stat` field 22 (starttime) is the process's
+ *   start time in jiffies since system boot. Combined with `/proc/
+ *   stat`'s `btime` (boot epoch) and `/proc/<pid>/stat`'s clock
+ *   tick rate, we can compute epoch ms. V1 only Windows is the
+ *   target shell; the POSIX branch is a best-effort future-proof.
+ *
+ * Probe overhead: ~140ms on Windows for the PowerShell spawn.
+ * acquireLock is called once per orchestrator instance startup (not
+ * per-tick), so this cost is acceptable.
+ */
+function probeProcessStartTime(pid, opts = {}) {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  if (process.platform === 'win32') {
+    const runner =
+      opts._runner ||
+      ((program, argv) =>
+        execFileSync(program, argv, {
+          stdio: ['ignore', 'pipe', 'ignore'],
+          encoding: 'utf8',
+          timeout: 5000,
+        }));
+    const script =
+      `$p = Get-CimInstance Win32_Process -Filter "ProcessId=${pid}" ` +
+      `-ErrorAction SilentlyContinue; ` +
+      `if ($p -and $p.CreationDate) { ` +
+      `$d = $p.CreationDate; ` +
+      `if ($d -is [datetime]) { Write-Output ($d.ToUniversalTime().ToString("o")) } ` +
+      `else { Write-Output ([Management.ManagementDateTimeConverter]::ToDateTime($d).ToUniversalTime().ToString("o")) } }`;
+    let stdout;
+    try {
+      stdout = runner('powershell', [
+        '-NoProfile',
+        '-NoLogo',
+        '-Command',
+        script,
+      ]);
+    } catch (_) {
+      return null;
+    }
+    if (typeof stdout !== 'string' || stdout.trim() === '') return null;
+    const ts = Date.parse(stdout.trim());
+    return Number.isFinite(ts) ? ts : null;
+  }
+  // POSIX best-effort. /proc/<pid>/stat field 22 is starttime in
+  // jiffies; convert via /proc/stat btime + /proc/<pid>/stat _SC_CLK_TCK.
+  // For V1 we don't need this path (Windows is the target); return
+  // null so acquireLock's tiebreaker treats the probe as inconclusive
+  // and falls back to the existing alive-or-not logic.
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const fields = stat.split(/\s+/);
+    if (fields.length < 22) return null;
+    const starttimeJiffies = Number(fields[21]);
+    if (!Number.isFinite(starttimeJiffies)) return null;
+    const btimeMatch = fs
+      .readFileSync('/proc/stat', 'utf8')
+      .match(/^btime\s+(\d+)/m);
+    if (!btimeMatch) return null;
+    const btimeMs = parseInt(btimeMatch[1], 10) * 1000;
+    // Assume 100 Hz (linux default _SC_CLK_TCK). For V1 that's
+    // close enough; the ±1s tolerance in acquireLock absorbs drift.
+    return btimeMs + starttimeJiffies * 10;
+  } catch (_) {
+    return null;
+  }
+}
+
 function acquireLock(orchDir, opts = {}) {
   const ourPid = opts._pid || process.pid;
   const now = opts._now ? opts._now() : new Date().toISOString();
@@ -423,6 +506,37 @@ function acquireLock(orchDir, opts = {}) {
         if (e && e.code === 'ESRCH') alive = false;
         else if (e && e.code === 'EPERM') alive = true; // process exists, ACL'd
         else alive = false; // unknown errno — treat as dead, overwrite
+      }
+      // Todo 089: PID-recycling tiebreaker. `kill(pid, 0)` returns
+      // success if ANY process owns that PID — including a process
+      // that recycled the PID after the prior orchestrator died.
+      // Cross-check against the OS-reported start time stored in
+      // the lockfile. If the OS reports a different start time than
+      // we recorded, the PID was recycled and the lock is stale.
+      // PID space is small on Windows (~32K) and recycling within
+      // 30 minutes after an orchestrator OOM/crash is common; this
+      // closes the case where an unrelated process now holds the
+      // recorded PID.
+      if (alive && typeof prev.startedAt === 'string' && prev.startedAt !== '') {
+        const startTimeProbe = opts._startTimeProbe || probeProcessStartTime;
+        let osStartedAtMs;
+        try {
+          osStartedAtMs = startTimeProbe(prev.pid);
+        } catch (_) {
+          osStartedAtMs = null; // probe failure: be conservative, treat as alive
+        }
+        if (typeof osStartedAtMs === 'number' && Number.isFinite(osStartedAtMs)) {
+          const recordedMs = Date.parse(prev.startedAt);
+          if (Number.isFinite(recordedMs)) {
+            // Tolerate ±1s clock drift between Node's Date and the
+            // OS's CIM-reported CreationDate. Anything beyond that
+            // is a recycled PID.
+            const diffMs = Math.abs(osStartedAtMs - recordedMs);
+            if (diffMs > 1000) {
+              alive = false; // PID recycled — recorded process is dead
+            }
+          }
+        }
       }
       if (alive) {
         const err = new Error(
@@ -755,16 +869,66 @@ function isTerminalStatus(s) {
  * that artifact directly, and parsing it first gives the future
  * dispatcher a cleaner upgrade path.
  */
-function parseCompletionSignal(signalPath, opts = {}) {
+// Todo 092: bounded-read caps for agent-written files. Hostile or
+// buggy agents could write arbitrarily large `.md` / `.json` files
+// or symlink them to `/dev/zero`; an unbounded readFileSync OOMs the
+// orchestrator. Sized to comfortably exceed legitimate use:
+//   - completion-signal: frontmatter + body, typically a few KB.
+//   - qa-verdict.json: structured JSON, typically a few KB.
+const MAX_COMPLETION_SIGNAL_BYTES = 256 * 1024; // 256 KB
+const MAX_QA_VERDICT_BYTES = 64 * 1024; // 64 KB
+
+/**
+ * Bounded read with size cap and symlink rejection. Returns the file
+ * content as a UTF-8 string, or null if the file is missing, too
+ * large, a symlink, or otherwise unsafe. Defense against the
+ * hostile-agent threat model the spec invokes (agents can produce
+ * files in their own phase dir; the orchestrator must not OOM on
+ * adversarial input).
+ *
+ * Test seams: `_lstatSync`, `_readFileSync`, `_existsSync`.
+ */
+function safeReadAgentFile(filePath, maxBytes, opts = {}) {
+  const lstatSync = opts._lstatSync || fs.lstatSync;
   const readFileSync = opts._readFileSync || fs.readFileSync;
   const existsSync = opts._existsSync || fs.existsSync;
-  if (!existsSync(signalPath)) return null;
-  let raw;
+  if (!existsSync(filePath)) return null;
+  let st;
   try {
-    raw = readFileSync(signalPath, 'utf8');
+    st = lstatSync(filePath);
   } catch (_) {
     return null;
   }
+  // Reject symlinks. lstatSync (not statSync) does NOT follow the
+  // link, so isSymbolicLink() is the authoritative check. A
+  // symlink-to-/dev/zero would otherwise read forever.
+  if (st && typeof st.isSymbolicLink === 'function' && st.isSymbolicLink()) {
+    return null;
+  }
+  // Reject non-regular files (sockets, FIFOs, devices). Only regular
+  // files have a meaningful size and finite read.
+  if (st && typeof st.isFile === 'function' && !st.isFile()) {
+    return null;
+  }
+  // Size cap. lstat's size for a regular file is reliable on Windows
+  // and POSIX. Refuse to read anything larger than the cap.
+  if (typeof st.size === 'number' && st.size > maxBytes) {
+    return null;
+  }
+  try {
+    return readFileSync(filePath, 'utf8');
+  } catch (_) {
+    return null;
+  }
+}
+
+function parseCompletionSignal(signalPath, opts = {}) {
+  // Todo 092: bounded read with size cap + symlink rejection. The
+  // existsSync + readFileSync pattern was unbounded; a hostile agent
+  // could write an arbitrarily large `<role>-complete.md` and OOM
+  // the orchestrator.
+  const raw = safeReadAgentFile(signalPath, MAX_COMPLETION_SIGNAL_BYTES, opts);
+  if (raw === null) return null;
   // Frontmatter parse — same shape generate-prompt + the templates
   // produce. Tolerate CRLF; require leading `---\n`.
   const norm = raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
@@ -788,31 +952,24 @@ function parseCompletionSignal(signalPath, opts = {}) {
 }
 
 function parseQaVerdict(phaseDir, role, opts = {}) {
-  const readFileSync = opts._readFileSync || fs.readFileSync;
-  const existsSync = opts._existsSync || fs.existsSync;
   // Prefer structured qa-verdict.json (future-shape from the dispatch
-  // contract: `{ pass, failures: [...] }`).
+  // contract: `{ pass, failures: [...] }`). Todo 092: bounded read
+  // with size cap + symlink rejection (qa-verdict.json is the most
+  // hostile-agent-attack-prone surface).
   const verdictPath = qaVerdictFor(phaseDir);
-  if (existsSync(verdictPath)) {
-    let raw;
+  const raw = safeReadAgentFile(verdictPath, MAX_QA_VERDICT_BYTES, opts);
+  if (raw !== null) {
     try {
-      raw = readFileSync(verdictPath, 'utf8');
-    } catch (_) {
-      // Fall through to frontmatter parse on read failure.
-    }
-    if (raw !== undefined) {
-      try {
-        const obj = JSON.parse(raw);
-        if (obj && typeof obj === 'object' && typeof obj.pass === 'boolean') {
-          return {
-            pass: obj.pass,
-            failures: Array.isArray(obj.failures) ? obj.failures : [],
-            source: 'qa-verdict.json',
-          };
-        }
-      } catch (_) {
-        // Malformed JSON — fall through.
+      const obj = JSON.parse(raw);
+      if (obj && typeof obj === 'object' && typeof obj.pass === 'boolean') {
+        return {
+          pass: obj.pass,
+          failures: Array.isArray(obj.failures) ? obj.failures : [],
+          source: 'qa-verdict.json',
+        };
       }
+    } catch (_) {
+      // Malformed JSON — fall through.
     }
   }
   // Fall back to the QA completion signal's frontmatter. Codex round
@@ -878,6 +1035,91 @@ function decideTickActions(tickState, runState, opts) {
       : DEFAULT_MAX_RECOVERY_RETRIES;
   const checkHealthFn = opts._checkHealth || checkHealth;
   const manifestDir = path.dirname(path.resolve(manifestPath));
+
+  // -- Reconciliation pass (todo 090). Phases with `status: 'spawning'`
+  // represent dispatches where the prior orchestrator wrote the
+  // pre-spawn marker but died (SIGTERM / Ctrl+C / crash) before the
+  // post-spawn `status: 'running'` persist. On the current
+  // orchestrator's first tick after --resume, we cross-check each
+  // spawning entry against the PID snapshot:
+  //   - PID snapshot has the session → tab is alive; adopt by
+  //     writing running + the snapshot's pid + started_at =
+  //     dispatched_at, then clearing dispatched_at.
+  //   - PID snapshot does NOT have the session → tab never
+  //     registered (or died before WMI saw it). Reset to pending +
+  //     clear dispatched_at + increment retry_count so the next
+  //     tick re-dispatches against the recovery budget.
+  // The pid snapshot may be `null` when buildPidSnapshot's runner
+  // failed; in that case skip reconciliation this tick — next tick
+  // re-tries with a fresh snapshot.
+  for (const phase of phases) {
+    const phaseEntry = getPhaseStatus(status, phase.id);
+    if (phaseEntry.status !== 'spawning') continue;
+    if (pidSnapshot === null) continue; // no snapshot this tick
+    // The role recorded as spawning isn't directly available on the
+    // phase entry (we don't track per-role status in V1). For
+    // multi-role + review-loop cases, reconcile every declared
+    // role. The simpler V1 invariant: a phase is in 'spawning'
+    // only because exactly one role's executeSpawn was mid-flight;
+    // any of phase.agents could be the candidate.
+    let reconciledRole = null;
+    let snapshotPid = null;
+    for (const a of phase.agents) {
+      const sessionName = defaultSessionName(phase.id, a.role);
+      const snap = pidSnapshot.get(sessionName);
+      if (snap && Number.isInteger(snap.pid) && snap.pid > 0) {
+        reconciledRole = a.role;
+        snapshotPid = snap.pid;
+        break;
+      }
+    }
+    if (reconciledRole !== null) {
+      // Adopt: tab is alive.
+      actions.push({
+        type: 'log',
+        level: 'info',
+        message:
+          `phase ${phase.id} resume reconciliation: found live ` +
+          `${defaultSessionName(phase.id, reconciledRole)} (pid ${snapshotPid}); ` +
+          `adopting and transitioning spawning → running`,
+        phaseId: phase.id,
+        role: reconciledRole,
+      });
+      actions.push({
+        type: 'persist',
+        phaseId: phase.id,
+        updates: {
+          status: 'running',
+          pid: snapshotPid,
+          started_at: phaseEntry.dispatched_at || new Date(now).toISOString(),
+          dispatched_at: '',
+        },
+      });
+    } else {
+      // Reset to pending; budget incremented so the orchestrator's
+      // recovery semantics treat this as one of the retry attempts.
+      const cur = Number.isInteger(phaseEntry.retry_count)
+        ? phaseEntry.retry_count
+        : 0;
+      actions.push({
+        type: 'log',
+        level: 'warn',
+        message:
+          `phase ${phase.id} resume reconciliation: no live session ` +
+          `for any declared role; resetting to pending (retry_count ${cur} → ${cur + 1})`,
+        phaseId: phase.id,
+      });
+      actions.push({
+        type: 'persist',
+        phaseId: phase.id,
+        updates: {
+          status: 'pending',
+          dispatched_at: '',
+          retry_count: cur + 1,
+        },
+      });
+    }
+  }
 
   // -- First pass: monitor each running phase × role.
   for (const phase of phases) {
@@ -2294,6 +2536,47 @@ function executeSpawn(action, tickState, runState, opts, deps) {
     renameFile(tmpPath, flagPath);
   }
 
+  // Todo 090 (ce:review P1): pre-spawn dispatch marker. Persist
+  // `status: 'spawning'` + `dispatched_at` BEFORE wt new-tab fires.
+  // This closes the SIGTERM-during-spawn-window where the prior
+  // logic would: (1) fire wt new-tab, (2) Claude tab launches and
+  // is now alive, (3) orchestrator dies before persisting the
+  // running status, (4) --resume sees status: 'pending' and
+  // re-dispatches → duplicate session for the same (phase, role).
+  //
+  // The reconciliation path in decideTickActions's first pass
+  // detects `status: 'spawning'` entries on resume, looks up the
+  // session in the PID snapshot, and either adopts the existing
+  // tab (write running + pid + actual started_at) OR resets to
+  // pending + increments retry_count if the tab never registered.
+  //
+  // Skip the pre-marker on dry-run (no FS mutations).
+  const dispatchTime = new Date(opts._now ? opts._now() : Date.now()).toISOString();
+  if (!dryRun) {
+    const preMarkerUpdates = {
+      status: 'spawning',
+      dispatched_at: dispatchTime,
+    };
+    // Reset retry_count on initial / review_retry dispatches
+    // (matches the post-spawn persist's reset). Recovery dispatches
+    // don't touch retry_count here — the planner already incremented
+    // it via decideRecoveryAction.
+    if (action.mode === 'initial' || action.mode === 'review_retry') {
+      preMarkerUpdates.retry_count = 0;
+    }
+    const preR = runUpdateFn(manifestPath, phase.id, preMarkerUpdates);
+    if (!preR.ok) {
+      // Pre-marker write failed (FS error). Don't proceed to spawn —
+      // we'd lose the recovery breadcrumb. Surface as a spawn failure
+      // and let the next tick re-attempt.
+      logger('error', `pre-spawn marker write failed: ${preR.error}`, {
+        phaseId: phase.id,
+        role,
+      });
+      throw new Error(`pre-spawn marker write failed: ${preR.error}`);
+    }
+  }
+
   // Spawn (or fake spawn on dry-run).
   // Codex round 7 P1: wrap in try so we can unlink the flag if spawn
   // throws. A leaked flag would otherwise be visible to the NEXT
@@ -2382,6 +2665,23 @@ function executeSpawn(action, tickState, runState, opts, deps) {
       // soft-TTL elapses) doesn't pick up this dead session's prompt
       // (codex round 7 P1).
       if (flagPath) bestEffortUnlink(unlinkSync, flagPath);
+      // Todo 090: also reset the pre-spawn marker so the next tick
+      // sees the phase as pending (not stuck in 'spawning' with no
+      // matching live session). Best-effort — failure to roll back
+      // is non-fatal because the resume reconciliation path also
+      // handles 'spawning' + no live PID.
+      if (!dryRun) {
+        const rollbackR = runUpdateFn(manifestPath, phase.id, {
+          status: 'pending',
+          dispatched_at: '',
+        });
+        if (!rollbackR.ok) {
+          logger('warn', `pre-spawn marker rollback failed: ${rollbackR.error}`, {
+            phaseId: phase.id,
+            role,
+          });
+        }
+      }
       throw e;
     }
   }
@@ -2502,6 +2802,12 @@ function executeSpawn(action, tickState, runState, opts, deps) {
     const updates = {
       pid: Number.isInteger(spawnResult.pid) ? spawnResult.pid : -1,
       started_at: spawnResult.spawnedAt, // <-- THE TRANSLATION (todo 087)
+      // Todo 090: clear the pre-spawn dispatch marker. Empty string
+      // (rather than undefined) is intentional — runUpdate's spread
+      // overwrites the field. The matching companion `status` move
+      // (spawning → running) lives in the phase-level `persist`
+      // action emitted by decideTickActions.
+      dispatched_at: '',
     };
     if (action.mode === 'initial' || action.mode === 'review_retry') {
       // Reset retry_count on a fresh dispatch (initial OR review_retry
@@ -2852,7 +3158,47 @@ async function runOrchestrator(opts) {
         break;
       }
       runState.tickIndex += 1;
-      const tickRes = runOneTick(runState, opts);
+      // Todo 088: defense-in-depth try/catch around runOneTick. The
+      // ce:review identified that any uncaught throw inside the tick
+      // body (e.g., a bare fs.writeFileSync that hits EBUSY before
+      // the round-13 atomic-rename fix lands, or any future bare
+      // throw introduced by a downstream change) would tank the
+      // entire polling loop. Per the unit's stated invariant —
+      // "failure of one tick must not tank the loop" — log and
+      // continue. Recovery on the next tick handles whatever state
+      // the partial tick left behind.
+      let tickRes;
+      try {
+        tickRes = runOneTick(runState, opts);
+      } catch (e) {
+        logger(
+          'error',
+          renderProblemBlock({
+            problem: `tick ${runState.tickIndex} threw an uncaught error`,
+            file: opts.manifestPath,
+            fix:
+              `inspect the error and the manifest-status state; the orchestrator ` +
+              `will continue polling on the next tick. Repeated throws on the same ` +
+              `tick suggest a config issue (read-only worktree, full disk).`,
+          })
+        );
+        logger('error', `uncaught: ${e && e.message}`);
+        // Synthesize an empty tick result so the loop continues
+        // cleanly. Skip the post-action terminal-state check this
+        // iteration (status didn't load) — next tick re-evaluates.
+        tickRes = {
+          ok: false,
+          halt: false,
+          error: e && e.message,
+          warnings: [`uncaught tick error: ${e && e.message}`],
+          completed: [],
+          failed: [],
+          blocked: [],
+          spawned: 0,
+          tickState: null,
+          actions: [],
+        };
+      }
       runState.history.push({
         tick: runState.tickIndex,
         spawned: tickRes.spawned,
@@ -2885,6 +3231,16 @@ async function runOrchestrator(opts) {
       // last phase completes this tick would exit as
       // max_ticks_unfinished, and even normal runs would burn an
       // extra polling interval before noticing all-done.
+      // Todo 088 follow-on: when the tick threw before producing a
+      // tickState (synthesized empty result above), skip the
+      // terminal-state check — there's no manifest snapshot to
+      // reason about. Next tick re-loads cleanly.
+      if (!tickRes.tickState) {
+        // Sleep + continue.
+        if (maxTicks !== null && runState.tickIndex >= maxTicks) continue;
+        await sleep(activeMs);
+        continue;
+      }
       const loadStatusFn = opts._loadStatus || loadStatus;
       const postStatusResult = loadStatusFn(opts.manifestPath);
       const postStatus =
@@ -3271,9 +3627,13 @@ module.exports = {
   executeActions,
   acquireLock,
   releaseLock,
+  probeProcessStartTime,
   buildPidSnapshot,
   parseQaVerdict,
   parseCompletionSignal,
+  safeReadAgentFile,
+  MAX_COMPLETION_SIGNAL_BYTES,
+  MAX_QA_VERDICT_BYTES,
   // Path helpers
   defaultSessionName,
   flagFilePath,

@@ -5140,6 +5140,352 @@ test('AO2 [codex round 24 P2] incomplete templates dir → scaffold_no_templates
   }
 });
 
+// =========================================================================
+// AP — ce:review round 1 P1 regression tests (todos 088-092)
+// =========================================================================
+
+test('AP2 [todo 089] alive PID + matching startedAt → ELOCKED', () => {
+  const dir = mkTmp('orch-AP2');
+  try {
+    const recordedIso = '2026-05-03T01:00:00.000Z';
+    fs.writeFileSync(
+      path.join(dir, '.orchestrator.lock'),
+      JSON.stringify({ pid: 999, startedAt: recordedIso, hostname: 'h' })
+    );
+    assert.throws(
+      () =>
+        O.acquireLock(dir, {
+          _pid: 1,
+          _killer: () => {}, // pid alive
+          // OS reports the SAME start time → not recycled.
+          _startTimeProbe: () => Date.parse(recordedIso),
+        }),
+      (err) => err.code === 'ELOCKED'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AP3 [todo 089] alive PID + DIFFERENT startedAt → reclaim path fires (recycled PID)', () => {
+  const dir = mkTmp('orch-AP3');
+  try {
+    fs.writeFileSync(
+      path.join(dir, '.orchestrator.lock'),
+      JSON.stringify({
+        pid: 999,
+        startedAt: '2026-05-03T01:00:00.000Z',
+        hostname: 'h',
+      })
+    );
+    // OS reports a DIFFERENT start time (recycled PID held by an
+    // unrelated process started later).
+    const lockPath = O.acquireLock(dir, {
+      _pid: 7,
+      _killer: () => {}, // pid alive
+      _startTimeProbe: () => Date.parse('2026-05-03T02:00:00.000Z'),
+      _now: () => 'fresh',
+    });
+    const obj = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+    assert.strictEqual(obj.pid, 7, 'reclaim path should have replaced the stale lock');
+    O.releaseLock(lockPath);
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AP4 [todo 089] ESRCH still triggers reclaim (existing behavior preserved)', () => {
+  const dir = mkTmp('orch-AP4');
+  try {
+    fs.writeFileSync(
+      path.join(dir, '.orchestrator.lock'),
+      JSON.stringify({ pid: 999, startedAt: '2026-05-03T01:00:00.000Z', hostname: 'h' })
+    );
+    const lockPath = O.acquireLock(dir, {
+      _pid: 7,
+      _killer: () => {
+        const e = new Error('no such');
+        e.code = 'ESRCH';
+        throw e;
+      },
+      // probe should NOT be consulted in this branch (alive=false from killer)
+      _startTimeProbe: () => {
+        throw new Error('should not be called when killer says ESRCH');
+      },
+    });
+    const obj = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+    assert.strictEqual(obj.pid, 7);
+    O.releaseLock(lockPath);
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AP5 [todo 089] alive PID + probe failure → ELOCKED (conservative)', () => {
+  const dir = mkTmp('orch-AP5');
+  try {
+    fs.writeFileSync(
+      path.join(dir, '.orchestrator.lock'),
+      JSON.stringify({ pid: 999, startedAt: '2026-05-03T01:00:00.000Z', hostname: 'h' })
+    );
+    assert.throws(
+      () =>
+        O.acquireLock(dir, {
+          _pid: 1,
+          _killer: () => {},
+          _startTimeProbe: () => null, // probe inconclusive
+        }),
+      (err) => err.code === 'ELOCKED'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AP9 [todo 092] giant qa-verdict.json (>cap) → returns null, does not OOM', () => {
+  const dir = mkTmp('orch-AP9');
+  try {
+    const phaseDir = makePhaseDir(dir, 'p');
+    const huge = Buffer.alloc(O.MAX_QA_VERDICT_BYTES + 1024, 'x');
+    fs.writeFileSync(path.join(phaseDir, 'qa-verdict.json'), huge);
+    fs.writeFileSync(
+      path.join(phaseDir, 'qa-complete.md'),
+      '---\nstatus: complete\n---\n# fallback'
+    );
+    // Should fall through to qa-complete.md (verdict.json over cap).
+    const v = O.parseQaVerdict(phaseDir, 'qa');
+    assert.ok(v, 'must return a verdict from frontmatter fallback');
+    assert.strictEqual(v.source, 'qa-complete.md');
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AP10 [todo 092] giant completion-signal (>cap) → null', () => {
+  const dir = mkTmp('orch-AP10');
+  try {
+    const sig = path.join(dir, 'impl-complete.md');
+    const huge = Buffer.alloc(O.MAX_COMPLETION_SIGNAL_BYTES + 1024, 'x');
+    fs.writeFileSync(sig, huge);
+    const r = O.parseCompletionSignal(sig);
+    assert.strictEqual(r, null, 'over-cap signal must return null');
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AP11 [todo 092] safeReadAgentFile rejects symlink', () => {
+  const dir = mkTmp('orch-AP11');
+  try {
+    const realFile = path.join(dir, 'real.md');
+    fs.writeFileSync(realFile, 'hello');
+    const linkFile = path.join(dir, 'link.md');
+    try {
+      fs.symlinkSync(realFile, linkFile, 'file');
+    } catch (e) {
+      // Windows requires admin or developer-mode for symlinks; skip
+      // gracefully if symlink creation is denied.
+      if (e && (e.code === 'EPERM' || e.code === 'ENOSYS')) {
+        return; // platform-skip
+      }
+      throw e;
+    }
+    const r = O.safeReadAgentFile(linkFile, 1024);
+    assert.strictEqual(r, null, 'symlink must be refused');
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AP12 [todo 092] safeReadAgentFile reads small regular file', () => {
+  const dir = mkTmp('orch-AP12');
+  try {
+    const f = path.join(dir, 'ok.md');
+    fs.writeFileSync(f, 'hello world');
+    const r = O.safeReadAgentFile(f, 1024);
+    assert.strictEqual(r, 'hello world');
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AP6 [todo 090] pre-spawn marker written before spawnFn fires', () => {
+  const dir = mkTmp('orch-AP6');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const updateCalls = [];
+    let spawnCalled = false;
+    let preMarkerWritten = false;
+    const fakeUpdate = (mp_, phaseId, updates) => {
+      updateCalls.push({ phaseId, updates });
+      // Capture whether dispatched_at was written before spawn.
+      if (
+        updates &&
+        updates.status === 'spawning' &&
+        typeof updates.dispatched_at === 'string'
+      ) {
+        if (!spawnCalled) preMarkerWritten = true;
+      }
+      return { ok: true, status_file: mp_, phase: phaseId, updates };
+    };
+    const fakeSpawn = (opts) => {
+      spawnCalled = true;
+      return {
+        pid: 4242,
+        command: 'fake',
+        argv: [],
+        sessionName: opts.name,
+        title: opts.name,
+        spawnedAt: '2026-05-03T01:00:00Z',
+      };
+    };
+    O.executeActions(
+      [{ type: 'spawn', phaseId: 'phase-1', role: 'impl', mode: 'initial', iteration: 1 }],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: fakeSpawn,
+        _generatePrompt: makeFakeGenerate(),
+        _runUpdate: fakeUpdate,
+        logger: silentLogger(),
+        projectName: 'p',
+      }
+    );
+    assert.ok(preMarkerWritten, 'pre-spawn marker (status: spawning + dispatched_at) must be written BEFORE spawnFn');
+    // Post-spawn persist should clear dispatched_at.
+    const postCall = updateCalls.find(
+      (c) => c.updates && c.updates.dispatched_at === ''
+    );
+    assert.ok(postCall, 'post-spawn persist should clear dispatched_at');
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AP7 [todo 090] resume with status: spawning + live PID → adopt (no duplicate spawn)', () => {
+  const dir = mkTmp('orch-AP7');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, {
+      phases: {
+        'phase-1': {
+          status: 'spawning',
+          dispatched_at: '2026-05-03T01:00:00.000Z',
+          retry_count: 0,
+        },
+      },
+    });
+    makePhaseDir(mp, 'phase-1');
+    // Simulate the live tab in the PID snapshot.
+    const tickRes = O.pollAllPhases({
+      manifestPath: mp,
+      _pidRunner: () =>
+        JSON.stringify([
+          {
+            ProcessId: 4242,
+            CommandLine: 'claude --name orch-phase-1-impl',
+          },
+        ]),
+    });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {}
+    );
+    // Should adopt: persist with status: running + pid: 4242.
+    const adopt = actions.find(
+      (a) =>
+        a.type === 'persist' &&
+        a.updates &&
+        a.updates.status === 'running' &&
+        a.updates.pid === 4242
+    );
+    assert.ok(adopt, 'reconciliation should adopt the live session');
+    // No spawn action should be emitted for phase-1 — duplicate prevention.
+    assert.ok(
+      !actions.some((a) => a.type === 'spawn' && a.phaseId === 'phase-1'),
+      'no duplicate spawn for phase already in spawning + adopted'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AP8 [todo 090] resume with status: spawning + no live PID → reset to pending + retry_count++', () => {
+  const dir = mkTmp('orch-AP8');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, {
+      phases: {
+        'phase-1': {
+          status: 'spawning',
+          dispatched_at: '2026-05-03T01:00:00.000Z',
+          retry_count: 0,
+        },
+      },
+    });
+    makePhaseDir(mp, 'phase-1');
+    // Empty PID snapshot — no live session.
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {}
+    );
+    const reset = actions.find(
+      (a) =>
+        a.type === 'persist' &&
+        a.updates &&
+        a.updates.status === 'pending' &&
+        a.updates.retry_count === 1
+    );
+    assert.ok(reset, 'reconciliation should reset to pending + retry_count++');
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AP1 [todo 088] uncaught throw inside runOneTick is caught; loop survives', async () => {
+  const dir = mkTmp('orch-AP1');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    let tick = 0;
+    const result = await O.runOrchestrator({
+      manifestPath: mp,
+      _spawnSession: makeFakeSpawnSession(),
+      _generatePrompt: makeFakeGenerate(),
+      _checkHealth: () => makeStubHealth({ pidAlive: true }),
+      _pidRunner: () => '[]',
+      // Inject a runUpdate that throws on the FIRST call (simulating
+      // an EBUSY mid-tick). The orchestrator's try/catch around
+      // runOneTick should swallow the throw and continue. On tick 2
+      // a normal runUpdate runs, the phase completes, and the loop
+      // exits cleanly.
+      _runUpdate: (mp_, phaseId, updates) => {
+        tick += 1;
+        if (tick === 1) throw new Error('EBUSY: status file in use');
+        return { ok: true, status_file: mp_, phase: phaseId, updates };
+      },
+      _sleep: () => Promise.resolve(),
+      logger: silentLogger(),
+      projectName: 't',
+      maxTicks: 3,
+    });
+    // The first tick threw, but the loop kept going and reached
+    // maxTicks without crashing.
+    assert.ok(tick >= 2, `expected tick to advance past the throw, got ${tick}`);
+    // Result can be max_ticks_unfinished — the point is no crash.
+    assert.ok(
+      ['max_ticks_unfinished', 'completed', 'completed_with_failures'].includes(result.summary),
+      `unexpected summary: ${result.summary}`
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
 test('Q2 CLI: missing manifest path exits 1', () => {
   const r = spawnSync(process.execPath, [path.join(__dirname, 'orchestrate.js')], {
     encoding: 'utf8',
