@@ -38,10 +38,10 @@ At `agent-orchestrator/scripts/orchestrate.js:1353`, the tri-state convergence c
 
 ## Acceptance Criteria
 
-- [ ] Sequence `lookup_failed` → `startup_grace` → `lookup_failed`: counter ends at 1 (NOT 2).
-- [ ] Sequence `lookup_failed` → `lookup_failed` → `lookup_failed`: counter reaches 3 → recovery triggers.
+- [ ] Sequence `lookup_failed` → `startup_grace` → `lookup_failed`: counter ends at 1 (NOT 2). Recovery does NOT trigger.
+- [ ] Sequence `lookup_failed` → `lookup_failed`: counter reaches 2 → recovery triggers per todo 071's "two consecutive `lookup_failed` past startup-grace = crash" contract. (Do NOT require a third failure — that would silently change the threshold.)
 - [ ] Sequence `lookup_failed` → `pidAlive: true` → `lookup_failed`: counter resets to 1 on the second `lookup_failed`.
-- [ ] Test covers the flap pattern explicitly.
+- [ ] Test covers the flap pattern explicitly and asserts the counter threshold matches todo 071's contract (= 2, not 3).
 
 ## Work Log
 

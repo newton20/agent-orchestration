@@ -52,7 +52,7 @@ status (typically `pending`).
 
 ## Recommended Action
 
-**Option A — approved 2026-05-04 by coord.** Shared rollback hook with todo 111. Bundle both in PR #23 cleanup wave. The hook also closes todo 096's runUpdate-throw → duplicate-spawn case (three sites converge on one rollback function).
+**Option A — approved 2026-05-04 by coord; revised post-codex round 1 of PR #22 to remove 096 from the bundling.** Shared rollback hook with todo 111 only. Bundle both in PR #23 cleanup wave. NOTE: todo 096 (runUpdate-throw → duplicate-spawn) is **explicitly NOT** in this bundle — that case requires the marker to be **left intact** (the spawn HAPPENED), not rolled back. See 096's revised RA. Two sites converge on this rollback hook (110's executeSpawn-throws + 111's EFLAGTIMEOUT).
 
 ## Technical Details
 
@@ -65,7 +65,7 @@ status (typically `pending`).
 - [ ] executeSpawn throws (spawnFn / runUpdate / flag-write) → status reverts to prior (typically 'pending').
 - [ ] Next tick: phase re-eligible for spawn (not stuck in 'spawning').
 - [ ] Retry count NOT incremented on fresh-spawn-failure (this is not a recovery scenario).
-- [ ] Shared `rollbackSpawningMarker` helper reused by todo 111 + todo 096.
+- [ ] Shared `rollbackSpawningMarker` helper reused by todo 111 only (NOT 096 — 096 leaves the marker intact because the spawn launched successfully; rolling back there would orphan the live tab).
 - [ ] Precise line number filled in this todo's Technical Details (was TBD).
 
 ## Work Log

@@ -15,22 +15,24 @@ At `agent-orchestrator/scripts/orchestrate.js:2456`, the EFLAGTIMEOUT handling t
 ## Findings
 
 - EFLAGTIMEOUT poison-pill is intra-tick only — orphan slow tab can consume next tick's flag (cross-tick wrong-prompt-to-wrong-agent).
+- **Already in main (codex round 8 P1):** the EFLAGTIMEOUT path at `orchestrate.js:2786` already calls `bestEffortUnlink(unlinkSync, flagPath)` before throwing. So the intra-tick "delete the stale flag" mitigation is in place. The cross-tick gap remains: a slow tab whose hook fires AFTER the next tick has written a fresh `.pending-<name>` will consume that fresh flag (same session name, different prompt content), delivering wrong prompt to wrong agent.
 - /ce:review reviewer attribution: reliability + security.
 
 ## Proposed Solutions
 
-### Option A — Delete the .pending-* flag on EFLAGTIMEOUT (recommended)
-- On EFLAGTIMEOUT, immediately unlink the `.pending-<name>` flag. Slow tab consuming an empty/missing file gets nothing; orchestrator's next tick re-issues a fresh flag if the spawn is still warranted.
-- Pros: fits the file-protocol model (delete = orphan); no sidecar metadata. Effort: small.
-- Cons: if the slow tab eventually does start and consumes a *next-tick* flag for the SAME (phase, role), it gets the right prompt — but it's a different invocation. Acceptable: the flag content for a re-issue is correct for the new spawn.
+### Option A — Delete the `.pending-*` flag on EFLAGTIMEOUT (already in main; not the new work)
+- On EFLAGTIMEOUT, immediately unlink the `.pending-<name>` flag. Already implemented at `orchestrate.js:2786` (codex round 8 P1).
+- Pros: fits the file-protocol model. Cons: **does NOT close the cross-tick case** — orphan tab whose hook fires after the next tick writes a fresh flag still consumes it. Listed here for completeness; the actual fix is Option B (or equivalent).
 
-### Option B — Sidecar consumption metadata
-- Persist consumption attempt in `.pending-<name>.consuming-<pid>-<ts>` so cross-tick continuation can detect the orphan and abort.
-- Pros: more defensive. Cons: more file-protocol surface; more failure modes.
+### Option B — Sidecar consumption metadata + per-spawn token in flag content (recommended)
+- Persist a per-spawn token in the `.pending-<name>` flag content (e.g., a UUID). The SessionStart hook reads the token at consume time and passes it to the orchestrator via the consume-side response (or the hook's existing `.consuming-<id>-<pid>-<ms>-<i>` sidecar prefix). On the orchestrator side, track the latest issued token per session-name; if the consume-side response carries a stale token (from a timed-out spawn whose orphan tab eventually fired), reject the consumption (the hook can refuse to deliver the prompt; orchestrator re-issues with a fresh token).
+- Alternatively (simpler): rotate the session-name suffix on each spawn-after-EFLAGTIMEOUT for that (phase, role). Orphan tab's hook never matches a fresh flag because the name diverged. Trade-off: breaks session-name determinism within a (phase, role).
+- Pros: closes the cross-tick wrong-prompt-to-wrong-agent class definitively; defensive against any future "slow start" causes.
+- Cons: more file-protocol surface (token tracking) OR mild loss of session-name determinism (rotation). Cross-module work — needs SessionStart hook coordination.
 
 ## Recommended Action
 
-**Option A — approved 2026-05-04 by coord.** Delete the flag on EFLAGTIMEOUT; orchestrator's existing flag-write path on next tick handles re-issue. Bundle with 111 (shared spawning-marker rollback).
+**Option B — revised 2026-05-04 post-codex round 1.** Coord's original choice of Option A is already implemented in main (codex round 8 P1, `orchestrate.js:2786`); the original RA describes work that is not new. The actual cross-tick fix needs the per-spawn token (or session-name rotation) in Option B. Implementer's first task in PR #23 is to choose between the two Option B variants based on which is least disruptive to the existing SessionStart hook surface (per todos 037, 081 institutional context). Bundle in PR #23 cleanup wave; coordinate with 111 on the EFLAGTIMEOUT call site (the EFLAGTIMEOUT throw still triggers 111's spawning-marker rollback — that part of the bundling remains correct).
 
 ## Technical Details
 
@@ -38,10 +40,12 @@ At `agent-orchestrator/scripts/orchestrate.js:2456`, the EFLAGTIMEOUT handling t
 
 ## Acceptance Criteria
 
-- [ ] Test: EFLAGTIMEOUT → `.pending-<name>` flag is deleted.
-- [ ] Test: orphan slow tab consumed previous tick's now-deleted flag → no prompt delivered (file missing); session terminates.
-- [ ] Test: next tick after EFLAGTIMEOUT re-issues a fresh flag if spawn still warranted.
-- [ ] Cross-tick wrong-prompt-to-wrong-agent eliminated.
+- [ ] Existing intra-tick mitigation preserved: EFLAGTIMEOUT path at `orchestrate.js:2786` still calls `bestEffortUnlink` before throwing.
+- [ ] Cross-tick fix landed: orphan slow tab whose hook fires AFTER a next-tick fresh flag exists for the SAME session name does NOT consume that fresh flag. Verified via either:
+  - per-spawn token mismatch (hook reads token from flag content, refuses to deliver if token does not match the orchestrator's latest issued token), OR
+  - session-name rotation (orphan tab's hook never finds a matching `.pending-<rotated-name>`).
+- [ ] Test: simulate EFLAGTIMEOUT, then write a fresh `.pending-<same-name>` for an unrelated phase/role/iteration, then trigger the orphan tab's hook → orphan does NOT receive the unrelated prompt.
+- [ ] Cross-tick wrong-prompt-to-wrong-agent eliminated end-to-end (not just the same-tick case).
 
 ## Work Log
 

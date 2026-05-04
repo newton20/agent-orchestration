@@ -12,9 +12,12 @@ dependencies: []
 
 Seventeen P3 mechanical cleanups surfaced in /ce:review of PR #19.
 Bundled into one tracking todo per coord dispatch — this entire
-bundle ships in **PR #21 cleanup wave**. Mostly `safe_auto`-grade
-maintainability / api-contract / cli-readiness / performance / reliability
-nits with high reviewer confidence (per the source doc's `Conf` column).
+bundle ships in **PR #23 cleanup wave** (the source /ce:review doc
+labelled it "PR #21 cleanup wave"; numbering shifted because the
+post-PR-19 triage capture took #21 and the coord triage round took
+#22). Mostly `safe_auto`-grade maintainability / api-contract /
+cli-readiness / performance / reliability nits with high reviewer
+confidence (per the source doc's `Conf` column).
 
 ## Findings
 

@@ -21,8 +21,8 @@ At `agent-orchestrator/scripts/orchestrate.js:1562`, the retry-count read path s
 
 ### Option A — Strict integer validation; reject corrupt as blocked (recommended)
 - Validate `retry_count` via `Number.isInteger(parsed) && parsed >= 0 && parsed <= MAX_RETRIES`.
-- Corrupt state (`'two'`, `2.5`, `null`, `-1`, `> MAX_RETRIES`) → set phase `status: blocked` with structured error; do NOT silently coerce.
-- Pros: corrupt state surfaces explicitly; bypasses no longer possible. Effort: small. Risk: low.
+- **Distinguish absent field from explicit null:** if the `retry_count` key is absent from the YAML object (`!('retry_count' in status)`), default to 0 (legitimate fresh-spawn case). If the key is present with explicit `null` (or any non-integer non-undefined value: `'two'`, `2.5`, `-1`, `> MAX_RETRIES`), treat as corrupt and set phase `status: blocked` with structured error; do NOT silently coerce.
+- Pros: corrupt state surfaces explicitly; bypasses no longer possible; preserves the legitimate "no retry yet" default when the field is simply not yet written. Effort: small. Risk: low.
 
 ### Option B — Silent coercion (current); document
 - Accept the foot-gun; document the coercion rules.
@@ -42,7 +42,8 @@ At `agent-orchestrator/scripts/orchestrate.js:1562`, the retry-count read path s
 - [ ] `retry_count: 2.5` → rejected (float).
 - [ ] `retry_count: 2` → accepted (existing behavior).
 - [ ] `retry_count: -1` or `> MAX_RETRIES` → rejected.
-- [ ] `retry_count: null` (missing field) → defaults to 0 (NOT blocked — this is the legitimate fresh-spawn case).
+- [ ] **Field absent from YAML** (key not present in the manifest-status object) → defaults to 0 (legitimate fresh-spawn case; NOT blocked).
+- [ ] **Field present with explicit `retry_count: null`** → blocked (corrupt state). The validator must distinguish absence (`!('retry_count' in status)`) from explicit null (`status.retry_count === null`).
 
 ## Work Log
 
