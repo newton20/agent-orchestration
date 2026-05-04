@@ -12,11 +12,12 @@ dependencies: []
 
 PR #19's fix for P1 todo 090 added a pre-spawn `status: 'spawning'`
 marker before `executeSpawn` calls `spawnFn`. This closes the
-SIGTERM-during-spawn-window class. **However**: when `executeSpawn`
-itself fails (e.g., spawn-session throws, the wt tab launch fails, the
-flag-write fails), the marker has already been written and the
-spawn never completed. The marker stays as `'spawning'` despite no live
-process having been launched.
+SIGTERM-during-spawn-window class. **However**: when the spawn-launch
+path fails BEFORE `spawnFn` successfully returns (spawn-session throws
+the wt tab launch failure, the pre-spawn flag-write fails, etc.), the
+marker has already been written and the spawn never produced a live
+process. The marker stays as `'spawning'` despite no live process having
+been launched.
 
 On the next tick, the reconciliation pass finds:
 - no live PID for `(phase, role)` in the snapshot
@@ -29,15 +30,21 @@ remains until reconciliation eventually classifies it as crashed —
 but that path adds an unnecessary retry-count increment for what is
 actually a fresh-spawn failure.
 
-The fix is symmetric with todo 111: any spawn-path failure (executeSpawn
-throws, EFLAGTIMEOUT, etc.) should roll the marker back to its prior
-status (typically `pending`).
+The fix is **scoped to spawn-launch-path failures only** — it is
+symmetric with todo 111 (EFLAGTIMEOUT during the flag-consume window).
+It explicitly does **NOT** cover the post-spawn `runUpdate` throw
+case in todo 096, where `spawnFn` has already returned successfully
+and the wt tab is live: rolling the marker back there would orphan
+the live tab and trigger duplicate dispatch on the next tick. See
+todo 096's revised RA for the leave-marker-intact rule that applies
+to that distinct path.
 
 ## Findings
 
-- `executeSpawn` failure leaves `status: 'spawning'` marker stranded; reconciliation can't distinguish fresh-spawn-failed from orchestrator-crashed-mid-spawn without expensive heuristics.
+- Spawn-launch-path failure (spawnFn-throws, pre-spawn flag-write throws, EFLAGTIMEOUT) leaves `status: 'spawning'` marker stranded; reconciliation can't distinguish fresh-spawn-failed from orchestrator-crashed-mid-spawn without expensive heuristics.
 - Surfaced by re-codex Round 2 of PR #19 — held off the P1 gate as P2 because the existing reconciliation eventually classifies the stranded marker (just with a wasted retry).
 - Symmetric with todo 111 (EFLAGTIMEOUT rollback path).
+- **Scope exclusion:** post-spawn `runUpdate`-throws (todo 096) are NOT in this case — those happen after `spawnFn` returned successfully, so the marker must be left intact for reconciliation to adopt the live session. See 096.
 
 ## Proposed Solutions
 

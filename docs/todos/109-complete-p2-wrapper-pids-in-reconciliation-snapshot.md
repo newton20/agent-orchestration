@@ -27,9 +27,17 @@ filter step) so only inner Claude PIDs land in the snapshot.
 
 ## Findings
 
-- Reconciliation snapshot (added in PR #19 commit `c1bd625`) uses raw PID list including wrapper PIDs.
-- Inner Claude PID is what reconciliation should compare against (matches manifest-status `pid` field semantics).
-- Surfaced by re-codex Round 2 of PR #19 — held off the P1 gate as P2 because it is a soft mis-classification (not a data-loss class), but worth closing in the cleanup wave.
+> **Historical / superseded by verification — see Recommended Action and Work Log.**
+> The original re-codex Round 2 finding asserted the bullets below.
+> Verification post-PR-22 codex round 1 (commit aa789e2) found the
+> reconciliation pipeline already filters wrappers via
+> `buildPidSnapshot → parsePidLookupOutput(..., { excludeWrappers: true })`
+> at `orchestrate.js:723`. The bullets remain for audit-trail traceability
+> to the original report; they no longer describe live state on `main`.
+
+- ~~Reconciliation snapshot (added in PR #19 commit `c1bd625`) uses raw PID list including wrapper PIDs.~~ — **invalidated:** snapshot is built via `buildPidSnapshot` which calls `parsePidLookupOutput(stdout, name, { excludeWrappers: true })` at `orchestrate.js:723`.
+- Inner Claude PID is what reconciliation should compare against (matches manifest-status `pid` field semantics) — still correct, and that is what `excludeWrappers: true` guarantees.
+- Surfaced by re-codex Round 2 of PR #19 — held off the P1 gate as P2; verification post-merge confirmed the fix had already landed inside PR #19 itself or the original finding misidentified the call site.
 
 ## Proposed Solutions
 
