@@ -3,7 +3,7 @@ status: ready
 priority: p2
 issue_id: "111"
 tags: [unit-11, orchestrate, post-pr-19, re-codex-round-2, flag-consume, timeout, spawning-marker]
-dependencies: ["110"]
+dependencies: ["099", "110"]
 ---
 
 # orchestrate: EFLAGTIMEOUT 'spawning' rollback — flag-consume timeout leaves marker stranded
@@ -44,7 +44,7 @@ sites.
 
 ## Recommended Action
 
-**Option A — approved 2026-05-04 by coord.** Bundle with todo 110 in PR #23 cleanup wave. The shared hook from 110 IS the implementation; this todo's site (EFLAGTIMEOUT branch) just calls it. Closing 110 closes 111 by construction.
+**Option A — approved 2026-05-04 by coord; revised post-codex round 8 to add 099 dependency.** Bundle with todo 110 (rollback hook) AND todo 099 (cross-tick poison-pill via out-of-band token binding) in PR #23 cleanup wave. The shared 110 hook IS the rollback implementation; this todo's site (EFLAGTIMEOUT branch) calls it. **Critical sequencing:** 099 MUST land before or alongside 111 — otherwise EFLAGTIMEOUT-then-rollback re-makes the role eligible for the next tick's spawn, but the orphan tab from the timed-out spawn is still alive. Without 099's token binding, the next tick's fresh `.pending-*` flag is consumable by that orphan, restoring the cross-tick wrong-prompt-to-wrong-agent bug. With 099 in place, the orphan's argv-token can't match the new flag's file-token, so the orphan's hook filters the fresh flag out → safe to roll back and re-dispatch.
 
 ## Technical Details
 
@@ -58,7 +58,8 @@ sites.
 - [ ] EFLAGTIMEOUT during 'spawning' state → status rolled back via shared `rollbackSpawningMarker` from todo 110.
 - [ ] Next tick re-dispatches if conditions met.
 - [ ] No retry-count increment (fresh-spawn failure, not recovery).
-- [ ] Cross-reference: when todo 099 (EFLAGTIMEOUT poison-pill cross-tick) lands, the flag-delete + marker-rollback land at the same call site.
+- [ ] **099's token-binding is in place** before 111's rollback enables re-dispatch. Test: EFLAGTIMEOUT, rollback to pending, next tick writes fresh `.pending-*` with NEW token. The orphan tab from the timed-out spawn (with its OLD argv-token) cannot consume the fresh flag (099's pre-rename token filter rejects it).
+- [ ] Cross-reference: 099 (cross-tick token binding) and 111 (marker rollback) land in the same dispatch — closing 111 without 099 re-introduces the cross-tick wrong-prompt bug.
 - [ ] Precise line number filled in this todo's Technical Details (was TBD).
 
 ## Work Log
