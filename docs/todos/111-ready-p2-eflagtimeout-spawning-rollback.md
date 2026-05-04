@@ -3,7 +3,7 @@ status: ready
 priority: p2
 issue_id: "111"
 tags: [unit-11, orchestrate, post-pr-19, re-codex-round-2, flag-consume, timeout, spawning-marker]
-dependencies: []
+dependencies: ["110"]
 ---
 
 # orchestrate: EFLAGTIMEOUT 'spawning' rollback — flag-consume timeout leaves marker stranded
