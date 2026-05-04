@@ -24,15 +24,25 @@ At `agent-orchestrator/scripts/orchestrate.js` (flag-consume + EFLAGTIMEOUT thro
 - On EFLAGTIMEOUT, immediately unlink the `.pending-<name>` flag. Already implemented at `orchestrate.js:2786` (codex round 8 P1).
 - Pros: fits the file-protocol model. Cons: **does NOT close the cross-tick case** — orphan tab whose hook fires after the next tick writes a fresh flag still consumes it. Listed here for completeness; the actual fix is Option B (or equivalent).
 
-### Option B — Sidecar consumption metadata + per-spawn token in flag content (recommended)
-- Persist a per-spawn token in the `.pending-<name>` flag content (e.g., a UUID). The SessionStart hook reads the token at consume time and passes it to the orchestrator via the consume-side response (or the hook's existing `.consuming-<id>-<pid>-<ms>-<i>` sidecar prefix). On the orchestrator side, track the latest issued token per session-name; if the consume-side response carries a stale token (from a timed-out spawn whose orphan tab eventually fired), reject the consumption (the hook can refuse to deliver the prompt; orchestrator re-issues with a fresh token).
-- Alternatively (simpler): rotate the session-name suffix on each spawn-after-EFLAGTIMEOUT for that (phase, role). Orphan tab's hook never matches a fresh flag because the name diverged. Trade-off: breaks session-name determinism within a (phase, role).
-- Pros: closes the cross-tick wrong-prompt-to-wrong-agent class definitively; defensive against any future "slow start" causes.
-- Cons: more file-protocol surface (token tracking) OR mild loss of session-name determinism (rotation). Cross-module work — needs SessionStart hook coordination.
+### Option B — Out-of-band token binding OR session-name rotation (recommended)
+
+Two viable variants; choose at implementation time based on minimal disruption to existing surface (per todos 037, 081 institutional context).
+
+**B1: Out-of-band token binding.** Orchestrator generates a per-spawn token (UUID) and passes it to the spawned tab via an out-of-band channel — argv (`--expected-flag-token <uuid>`), env var (`AGENT_FLAG_TOKEN`), or a per-tab manifest entry. The token is also written into the `.pending-<name>` flag content. The SessionStart hook reads the file's token AND the out-of-band token (from argv/env), and refuses to deliver the prompt unless they match. An orphan tab carries the token from its original (now timed-out) spawn; when it eventually fires and grabs whatever fresh `.pending-<name>` exists, the file-token will be the orchestrator's NEW per-spawn token while the tab's argv/env token is still the OLD one — mismatch detected, prompt refused. **Critical:** comparing tokens read only from the flag file is NOT sufficient — the hook would just read the fresh-tick token and accept it. The token must be bound to the spawned tab out-of-band so it cannot be replaced by reading a different file.
+
+**B2: Session-name rotation.** Rotate the session-name suffix on each spawn-after-EFLAGTIMEOUT for that (phase, role) (e.g., append `-r1`, `-r2`, etc. on each retry). Orphan tab's hook looks for `.pending-<old-name>` and never finds one because the name diverged. Trade-off: breaks session-name determinism within a (phase, role); operator-visible debug paths (`tasklist`, `Get-Process`) need to track the rotated name.
+
+**Pros (both):** close the cross-tick wrong-prompt-to-wrong-agent class definitively; defensive against any future "slow start" causes.
+**Cons (both):** cross-module — needs SessionStart hook coordination (B1 reads argv/env in addition to the file; B2 changes name-derivation in spawn-session).
 
 ## Recommended Action
 
-**Option B — revised 2026-05-04 post-codex round 1.** Coord's original choice of Option A is already implemented in main (codex round 8 P1, `orchestrate.js:2786`); the original RA describes work that is not new. The actual cross-tick fix needs the per-spawn token (or session-name rotation) in Option B. Implementer's first task in PR #23 is to choose between the two Option B variants based on which is least disruptive to the existing SessionStart hook surface (per todos 037, 081 institutional context). Bundle in PR #23 cleanup wave; coordinate with 111 on the EFLAGTIMEOUT call site (the EFLAGTIMEOUT throw still triggers 111's spawning-marker rollback — that part of the bundling remains correct).
+**Option B — revised 2026-05-04 post-codex rounds 1+5.** Coord's original choice of Option A is already implemented in main (codex round 8 P1, `orchestrate.js:2786`); the original RA describes work that is not new. The actual cross-tick fix needs the redesigned **Option B** with two viable variants:
+
+- **B1 (out-of-band token binding)** — token must reach the spawned tab via argv/env (NOT just via the flag file), so the hook can compare the file-token to the tab-bound token before delivering. A token-only-in-file design does NOT close the bug because the hook would accept whatever token the fresh next-tick flag carries.
+- **B2 (session-name rotation)** — simpler; trade-off is loss of name-determinism per (phase, role).
+
+Implementer's first task in PR #23 is to choose between B1 and B2 based on which is least disruptive to the SessionStart hook surface (per todos 037, 081). Bundle in PR #23 cleanup wave; coordinate with 111 on the EFLAGTIMEOUT call site (the EFLAGTIMEOUT throw still triggers 111's spawning-marker rollback — that part of the bundling remains correct).
 
 ## Technical Details
 
@@ -42,8 +52,8 @@ At `agent-orchestrator/scripts/orchestrate.js` (flag-consume + EFLAGTIMEOUT thro
 
 - [ ] Existing intra-tick mitigation preserved: EFLAGTIMEOUT path at `orchestrate.js:2786` still calls `bestEffortUnlink` before throwing.
 - [ ] Cross-tick fix landed: orphan slow tab whose hook fires AFTER a next-tick fresh flag exists for the SAME session name does NOT consume that fresh flag. Verified via either:
-  - per-spawn token mismatch (hook reads token from flag content, refuses to deliver if token does not match the orchestrator's latest issued token), OR
-  - session-name rotation (orphan tab's hook never finds a matching `.pending-<rotated-name>`).
+  - **B1: out-of-band token binding** — hook reads the file-token AND the tab-bound token (from argv/env/per-tab manifest). Refuses to deliver unless both match. A test must specifically cover the orphan-grabs-fresh-flag case: orphan's argv-token is OLD, fresh flag's file-token is NEW, mismatch → prompt refused.
+  - **B2: session-name rotation** — orphan tab's hook looks up `.pending-<original-name>` and finds nothing because the orchestrator wrote `.pending-<rotated-name>` for the retry.
 - [ ] Test: simulate EFLAGTIMEOUT, then write a fresh `.pending-<same-name>` for an unrelated phase/role/iteration, then trigger the orphan tab's hook → orphan does NOT receive the unrelated prompt.
 - [ ] Cross-tick wrong-prompt-to-wrong-agent eliminated end-to-end (not just the same-tick case).
 
