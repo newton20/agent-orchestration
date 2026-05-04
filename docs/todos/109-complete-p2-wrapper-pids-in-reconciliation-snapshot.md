@@ -10,20 +10,13 @@ dependencies: []
 
 ## Problem Statement
 
-The reconciliation snapshot pass added in PR #19 fix commit `c1bd625`
-(closing the P2 cluster around todo 097) builds its live-PID set from
-a raw PID list which can include **wrapper PIDs** — `cmd.exe`,
-`powershell.exe`, the agency wrapper — rather than the **inner Claude
-PID** that the rest of the manifest-status pipeline tracks. When
-reconciliation compares the snapshot against `prev.pid` from
-manifest-status, the comparison can match against a wrapper PID and
-mis-classify a stranded session as alive (or vice versa).
+> **Status: closed as already-applied. The original concern below is preserved for audit-trail traceability to the re-codex Round 2 finding; verification post-PR-22 codex review confirmed the fix had already landed on `main`. See Recommended Action + Work Log.**
 
-Same root cause as todo 073's `excludeWrappers` flip in
-`get-session-pid` (closed in PR #15) — but at a *different* call site
-that didn't pick up the flip. The fix is symmetric: the reconciliation
-snapshot must use `excludeWrappers: true` (or its equivalent
-filter step) so only inner Claude PIDs land in the snapshot.
+**Original re-codex Round 2 concern (now invalidated):** the reconciliation snapshot pass added in PR #19 fix commit `c1bd625` (closing the P2 cluster around todo 097) was reported to build its live-PID set from a raw PID list — possibly including **wrapper PIDs** (`cmd.exe`, `powershell.exe`, the agency wrapper) — rather than the **inner Claude PID** that the rest of the manifest-status pipeline tracks. The hypothesized failure mode: reconciliation compares the snapshot against `prev.pid` from manifest-status, matches a wrapper PID, and mis-classifies a stranded session as alive (or vice versa).
+
+**Verified state on `main` (post-PR-22 codex round 1):** the snapshot is built via `buildPidSnapshot` (`orchestrate.js:704`), which calls `parsePidLookupOutput(stdout, name, { excludeWrappers: true })` at `orchestrate.js:723`. Wrapper-only matches are filtered out before the snapshot reaches the reconciliation pass at `orchestrate.js:1062-1106`. The post-todo-073 `excludeWrappers: true` default flows through; no remaining call site bypasses it.
+
+The original re-codex Round 2 finding either misidentified the call site or the fix landed inside PR #19 itself before re-codex completed. No new work is required in PR #23.
 
 ## Findings
 
