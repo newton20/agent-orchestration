@@ -41,18 +41,20 @@ to that distinct path.
 
 ## Findings
 
-- Spawn-launch-path failure (spawnFn-throws, pre-spawn flag-write throws, EFLAGTIMEOUT) leaves `status: 'spawning'` marker stranded; reconciliation can't distinguish fresh-spawn-failed from orchestrator-crashed-mid-spawn without expensive heuristics.
+- Pre-spawnFn-launch failure (spawnFn-throws-before-launch, pre-spawn flag-write throws) leaves `status: 'spawning'` marker stranded; reconciliation can't distinguish fresh-spawn-failed from orchestrator-crashed-mid-spawn without expensive heuristics.
 - Surfaced by re-codex Round 2 of PR #19 — held off the P1 gate as P2 because the existing reconciliation eventually classifies the stranded marker (just with a wasted retry).
-- Symmetric with todo 111 (EFLAGTIMEOUT rollback path).
+- **Scope:** this todo covers ONLY the cases where the spawn never produced a live tab (spawnFn-throws-before-launch, pre-spawn flag-write throws). The orphan tab from those failures does not exist, so rolling the marker back to `'pending'` is safe — there's no orphan to consume the next-tick fresh flag.
+- **EFLAGTIMEOUT is OUT OF 110's scope:** that case lands in todo 111 because the orphan tab IS alive and rolling back to `'pending'` without 099's token-binding restores the cross-tick wrong-prompt bug. 111 carries the 099 dependency precisely for that reason.
 - **Scope exclusion:** post-spawn `runUpdate`-throws (todo 096) are NOT in this case — those happen after `spawnFn` returned successfully, so the marker must be left intact for reconciliation to adopt the live session. See 096.
 
 ## Proposed Solutions
 
-### Option A — Shared rollback hook for spawn-launch failure (recommended)
-- Add a try/catch wrapper around `executeSpawn` body. On any throw on the **spawn-launch path** (spawnFn fails to return, EFLAGTIMEOUT, flag-write before `spawnFn` returns, etc.), call a shared `rollbackSpawningMarker(phaseId, role, priorStatus)` helper that reverts the manifest-status `status` field from `'spawning'` to its prior value.
+### Option A — Shared rollback hook for pre-spawnFn-launch failures only (recommended)
+- Add a try/catch wrapper around the **pre-spawnFn-launch** portion of `executeSpawn`. On a throw from `spawnFn` itself (before it returns) or from a flag-write that runs before `spawnFn`, call a shared `rollbackSpawningMarker(phaseId, role, priorStatus)` helper that reverts the manifest-status `status` field from `'spawning'` to its prior value.
+- **Explicitly excludes EFLAGTIMEOUT from 110's call sites.** EFLAGTIMEOUT happens AFTER `spawnFn` has already launched a tab (the wt tab is alive; only the consume-side flag never disappeared in time). Rolling back at that point makes the next tick eligible to write a fresh `.pending-*` while the orphan tab is still alive — re-introducing the cross-tick wrong-prompt bug. EFLAGTIMEOUT lands in 111 only, which carries the 099 dependency for the cross-tick token binding.
 - **Explicitly excludes** the post-spawn `runUpdate`-throw case (todo 096): when `spawnFn` already returned successfully (the wt tab is live) and a subsequent `runUpdate` throws, the marker must be **left intact** so the next tick's reconciliation can adopt the live session. Adding the rollback there would orphan the live tab and trigger duplicate dispatch — exactly the bug 096 warns against.
-- Pros: clean; symmetric with todo 111's EFLAGTIMEOUT case; one rollback site to test. Effort: small. Risk: low.
-- Bundle: this todo + 111 ship together with the shared hook. 096 is **not** in this bundle.
+- Pros: clean; one rollback site to test; safe to land WITHOUT 099 because the cases in 110's scope don't leave a live orphan tab. Effort: small. Risk: low.
+- Bundle: this todo (110) introduces the helper. 111 calls it from the EFLAGTIMEOUT branch and additionally depends on 099. 096 explicitly does NOT call it.
 
 ### Option B — Reconciliation logic absorbs stranded markers
 - Let stranded `'spawning'` eventually resolve via the existing reconciliation pass.
@@ -60,7 +62,13 @@ to that distinct path.
 
 ## Recommended Action
 
-**Option A — approved 2026-05-04 by coord; revised post-codex round 1 of PR #22 to remove 096 from the bundling.** Shared rollback hook with todo 111 only. Bundle both in PR #23 cleanup wave. NOTE: todo 096 (runUpdate-throw → duplicate-spawn) is **explicitly NOT** in this bundle — that case requires the marker to be **left intact** (the spawn HAPPENED), not rolled back. See 096's revised RA. Two sites converge on this rollback hook (110's executeSpawn-throws + 111's EFLAGTIMEOUT).
+**Option A — approved 2026-05-04 by coord; revised post-codex rounds 1+10 to scope the rollback to pre-spawnFn-launch failures only.** Bundle in PR #23 cleanup wave. Three explicit scope decisions:
+
+1. **EFLAGTIMEOUT moves to 111 only** — 110's helper is callable from there, but the call site itself (with the 099 cross-tick token check as a prerequisite) lives in 111.
+2. **post-spawn `runUpdate`-throws (todo 096) do NOT call this helper** — leave-marker-intact rule applies (the spawn launched).
+3. **110 has no 099 dependency** because none of the cases in 110's scope leaves a live orphan tab; the rollback is safe to apply standalone for the pre-spawnFn-launch failure paths.
+
+110 introduces the `rollbackSpawningMarker` helper and calls it from the pre-spawnFn-launch try/catch site. 111 calls the same helper from the EFLAGTIMEOUT site (paired with 099's token binding). 096 calls neither.
 
 ## Technical Details
 
@@ -70,9 +78,10 @@ to that distinct path.
 
 ## Acceptance Criteria
 
-- [ ] executeSpawn throws on the **spawn-launch path** (spawnFn fails to return, EFLAGTIMEOUT, flag-write before spawnFn returns) → status reverts to prior (typically `'pending'`) via `rollbackSpawningMarker`.
+- [ ] executeSpawn throws on the **pre-spawnFn-launch path** (spawnFn-throws-before-launch, pre-spawn flag-write throws) → status reverts to prior (typically `'pending'`) via `rollbackSpawningMarker`.
+- [ ] **EFLAGTIMEOUT does NOT call rollbackSpawningMarker from this todo's call sites.** EFLAGTIMEOUT is 111's call site (with 099 dependency). The test must verify 110-only landing does NOT roll back EFLAGTIMEOUT cases — those cases stay stranded until 111+099 land together.
 - [ ] **Post-spawn `runUpdate` throw (todo 096) does NOT call rollbackSpawningMarker** — the test must verify the marker remains `'spawning'` after such a throw, so reconciliation can adopt the live tab on the next tick.
-- [ ] Next tick: phase re-eligible for spawn (not stuck in `'spawning'`) when the spawn never launched.
+- [ ] Next tick: phase re-eligible for spawn (not stuck in `'spawning'`) when the spawn never launched (110's scope).
 - [ ] Retry count NOT incremented on fresh-spawn-failure (this is not a recovery scenario).
 - [ ] Shared `rollbackSpawningMarker` helper reused by todo 111 only (NOT 096 — see Option A note).
 - [ ] Precise line number filled in this todo's Technical Details (was TBD).

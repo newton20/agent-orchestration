@@ -19,17 +19,23 @@ At `agent-orchestrator/scripts/orchestrate.js:2624-2647, 2262-2279`, the `--resu
 
 ## Proposed Solutions
 
-### Option A — Targeted mtime-based startup sweep (recommended)
-- On `--resume` entry, scan `.pending-*` files; unlink any whose mtime predates the prior orchestrator's lockfile last-touch (or, if no prior lockfile metadata, predates the resume's own start time minus a small grace).
-- Pros: targeted; preserves any genuinely-in-flight pendings at restart. Effort: small. Risk: low.
+### Option A — Aggressive sweep of all `.pending-*` on `--resume` (recommended)
+- On `--resume` entry, before the main loop starts, unlink every `.pending-*` in the protocol directory unconditionally.
+- Rationale: by definition `--resume` runs after the prior orchestrator died. The prior orchestrator was the only legitimate writer of `.pending-*` flags; nothing the prior orchestrator wrote could still be valid for the new orchestrator's spawns (each new spawn writes a fresh `.pending-<name>` for the (phase, role) it dispatches). The contract "exists ↔ produced by THIS orchestrator's most recent spawn for that name" is violated for any flag found at resume entry, regardless of age.
+- The first spawn this resume issues writes its own `.pending-<name>` after the sweep, so legitimate in-flight pendings re-appear within milliseconds.
+- Pros: simple; correct against the protocol model; no mtime threshold to misjudge. Effort: trivial. Risk: low.
 
-### Option B — Aggressive sweep all .pending-* on resume
-- Unlink every .pending-* on resume regardless of age.
-- Cons: removes legitimate in-flight pendings if the user restarts the orchestrator quickly.
+### Option B — Targeted mtime-based startup sweep
+- On `--resume` entry, scan `.pending-*` files; unlink any whose mtime predates some threshold.
+- **Codex round 10 ruled this out:** comparing against the prior orchestrator's lockfile mtime fails because the prior orchestrator wrote the lockfile at startup and `.pending-*` flags later, so post-lockfile-mtime stale flags survive the sweep. Comparing against `resume start - 60s` works only by accident — flags written less than 60s before the new orchestrator starts get to leak into the new run.
+- Cons: every mtime threshold has a similar leak-window; the protocol model doesn't need any preservation, so this option only adds risk.
+
+### Option C — No sweep
+- Current behavior. Cons: re-introduces the cross-tick wrong-prompt-to-wrong-agent class at the resume boundary.
 
 ## Recommended Action
 
-**Option A — approved 2026-05-04 by coord.** Targeted by mtime against the prior lockfile timestamp. If lockfile metadata is unavailable (clean shutdown removed it), fall back to "predates resume start - 60s" — same hard-TTL pattern as todo 005. Bundle in PR #23 cleanup wave.
+**Option A — revised 2026-05-04 post-codex round 10.** Aggressive sweep on `--resume`. The protocol model says any `.pending-*` flag found at resume entry is by-definition stale; mtime thresholds add risk without benefit. Bundle in PR #23 cleanup wave.
 
 ## Technical Details
 
@@ -37,10 +43,11 @@ At `agent-orchestrator/scripts/orchestrate.js:2624-2647, 2262-2279`, the `--resu
 
 ## Acceptance Criteria
 
-- [ ] `--resume` on a dir with stale `.pending-*` (mtime older than prior lockfile) → those files removed before main loop starts.
-- [ ] `--resume` preserves recent `.pending-*` (within 60s of resume start when no prior lockfile metadata).
-- [ ] Sweep is logged (count of unlinked + reason).
+- [ ] `--resume` on a dir with any `.pending-*` files (regardless of mtime) → ALL of them removed before main loop starts.
+- [ ] Sweep is logged (count of unlinked + filenames).
 - [ ] Test: orphan `.pending-orch-phase-1-impl` from prior run + `--resume` → flag swept, no wrong-prompt delivery.
+- [ ] Test: the resume's first spawn writes its own `.pending-<name>` after the sweep; the SessionStart hook for that spawn finds and consumes it (i.e., the sweep doesn't break the new orchestrator's first-tick happy path).
+- [ ] Test: `--resume` with a recently-written `.pending-*` (e.g., 5 seconds before resume start) → still swept (the protocol model says no flag is preservable across orchestrator instances).
 
 ## Work Log
 
