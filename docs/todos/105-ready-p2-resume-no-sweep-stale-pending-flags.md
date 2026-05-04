@@ -32,6 +32,8 @@ On `--resume` entry, BEFORE sweeping, run the existing 090 reconciliation pass (
 
 AFTER the reconciliation pass, sweep all `.pending-*` files in the protocol directory EXCEPT the preserved set (the row-1 flags above). Each new spawn from this resume's main loop writes its own `.pending-<name>` after the sweep — they are not affected.
 
+**Degenerate case — null pidSnapshot:** if `buildPidSnapshot` returns `null` (PowerShell/WMI failure on this resume entry), the preserved set cannot be computed reliably. In that case the sweep must DEFER entirely — do not sweep, do not roll back any spawning markers. Match the existing 090 reconciliation's "skip when `pidSnapshot === null`" branch (orchestrate.js:1081). The next tick will retry the snapshot; if it succeeds, the sweep + reconciliation runs then. If it never succeeds, we accept that stale flags persist and rely on the operator-level remediation path; sweeping blind would be worse (could delete legitimate live flags).
+
 Rationale: legitimate cross-orchestrator-instance survivors fall into TWO categories — (a) the spawn-launched-but-not-yet-consumed flag (preserve) and (b) the consumed-prompt-tab-already-running case (adopt without flag). All other pendings violate the protocol model and must be swept to prevent cross-tick wrong-prompt-to-wrong-agent. Pros: correct against the protocol model; aligns with the existing 090 reconciliation table; no mtime threshold. Effort: small. Risk: low.
 
 ### Option A1 — Aggressive sweep without preservation (rejected)
@@ -58,6 +60,7 @@ Rationale: legitimate cross-orchestrator-instance survivors fall into TWO catego
 
 - [ ] `--resume` runs the 090 spawning-marker reconciliation BEFORE sweeping, producing both a preserved-flags set and an adopted-phases set per the four-cell decision table.
 - [ ] All `.pending-*` files in the protocol directory NOT in the preserved set are unlinked before the main loop starts.
+- [ ] **Degenerate-case test (null pidSnapshot):** if `buildPidSnapshot` returns `null` (simulate PowerShell/WMI failure), the sweep DEFERS entirely — no flags swept, no markers rolled back. The next tick retries the snapshot. Match the existing reconciliation skip-on-null behavior at `orchestrate.js:1081`.
 - [ ] Sweep + adoption is logged (count of swept + filenames; count of preserved + filenames; count of adopted + phase/role).
 - [ ] **Test (cell 1 — preserve flag):** prior orchestrator died after launching a tab but before SessionStart hook fired (`'spawning'` + live PID + matching `.pending-<name>`) → flag preserved; tab's hook eventually consumes it; reconciliation later transitions to `'running'`. Phase does NOT silently have no work.
 - [ ] **Test (cell 2 — adopt without flag):** prior orchestrator died after the tab consumed its flag and got the prompt but before persisting `'running'` (`'spawning'` + live PID + NO matching `.pending-<name>`) → the new orchestrator transitions `'spawning'` → `'running'` directly during resume, persists pid. The tab is NOT re-dispatched.
