@@ -19,8 +19,10 @@ At `agent-orchestrator/scripts/orchestrate.js:1992-2003, 2474-2492`, the stale-s
 
 ## Proposed Solutions
 
-### Option A — Per-spawn signal id encoded in artifact frontmatter (recommended)
-- Orchestrator generates a fresh `spawn_id` (UUID or monotonic integer) per spawn. Persists it to manifest-status alongside `started_at`. Renders the spawn_id into the agent's prompt template (or passes via argv/env) so the agent embeds it into produced signal artifacts (`{role}-complete.md` frontmatter, `qa-verdict.json` field).
+### Option A — Per-spawn signal id encoded in artifact frontmatter, scoped per (phase, role, iteration) (recommended)
+- Orchestrator generates a fresh `spawn_id` (UUID or monotonic integer) per **(phase, role, iteration)** spawn — NOT phase-wide. Phases that fan out across multiple roles (impl/qa/review/coord) need each role's spawn to have its own id; phases with review-retry iterations need each iteration to have its own id.
+- Persists `spawn_id` to manifest-status under a per-role key (e.g., `status.phases[phaseId].roles[role].spawn_id` or whatever per-role nesting parse-manifest already uses for `pid` / `started_at` per-role tracking — the implementer must verify what the actual nesting is and place spawn_id symmetrically). Phase-level `started_at` is shared and not a safe co-location for a per-role identifier.
+- Renders the spawn_id into the agent's prompt template (or passes via argv/env) so the agent embeds it into produced signal artifacts (`{role}-complete.md` frontmatter, `qa-verdict.json` field).
 - The orchestrator-side cleanup pass: a signal counts as fresh iff its embedded `spawn_id` matches the current spawn's id; otherwise stale, eligible for cleanup. Cleanup runs **post-success only** (preserving the partial-failure protection from current main; signals from a failed spawn never get written, so no rollback issue).
 - Eliminates mtime comparison entirely. The freshness invariant is "spawn_id matches" — no timestamp involved, so coarse-FS resolution is irrelevant. Spawn-failure-safe: if `spawnFn` throws or EFLAGTIMEOUT fires, the new spawn never wrote a signal, so the previous tick's signal (with its old spawn_id) is still on disk for the next tick to consume. The orchestrator's transition logic for review retries / QA dispatch sees the signal it expects (the verdict that triggered the transition is whatever was on disk before this spawn, and it's still there because the failed spawn didn't write a new one).
 - Pros: FS-resolution-independent at the design level; spawn-failure-safe (post-success cleanup preserves the existing partial-failure semantics); auditable (spawn_id is in the artifact frontmatter, easy to inspect). Effort: medium (touches signal schemas + agent prompt rendering). Risk: low.
@@ -47,7 +49,9 @@ At `agent-orchestrator/scripts/orchestrate.js:1992-2003, 2474-2492`, the stale-s
 
 ## Acceptance Criteria
 
-- [ ] Orchestrator generates a fresh `spawn_id` per spawn; persists in manifest-status alongside `started_at`.
+- [ ] Orchestrator generates a fresh `spawn_id` per **(phase, role, iteration)** — NOT phase-wide. Persists to manifest-status under a per-role key (the implementer verifies the existing per-role nesting in parse-manifest's `KNOWN_UPDATE_FIELDS` / runUpdate API and places spawn_id symmetrically).
+- [ ] **Test: multi-role phase scoping.** A phase fanning out across impl/qa/review/coord generates 4 distinct `spawn_id`s; each role's signal artifact carries its own id; the cleanup pass for one role's signals does NOT mistakenly classify a sibling role's signal as stale.
+- [ ] **Test: review-retry iteration scoping.** Each review-retry iteration produces a new `spawn_id`; signals from a prior iteration are correctly classified as stale on the new iteration's cleanup pass.
 - [ ] Agent prompt templates render `{{spawn_id}}` into the rendered prompt (or pass via argv/env to the spawned tab).
 - [ ] Agent embeds `spawn_id` into produced signal artifacts (`{role}-complete.md` frontmatter, `qa-verdict.json` field).
 - [ ] Orchestrator-side cleanup: signal is fresh iff its embedded `spawn_id` matches the current spawn's id; otherwise stale.

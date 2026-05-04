@@ -19,10 +19,11 @@ At `agent-orchestrator/scripts/orchestrate.js:1562`, the retry-count read path s
 
 ## Proposed Solutions
 
-### Option A — Strict integer validation; reject corrupt as blocked (recommended)
-- Validate `retry_count` via `Number.isInteger(parsed) && parsed >= 0 && parsed <= MAX_RETRIES`.
-- **Distinguish absent field from explicit null:** if the `retry_count` key is absent from the YAML object (`!('retry_count' in status)`), default to 0 (legitimate fresh-spawn case). If the key is present with explicit `null` (or any non-integer non-undefined value: `'two'`, `2.5`, `-1`, `> MAX_RETRIES`), treat as corrupt and set phase `status: blocked` with structured error; do NOT silently coerce.
-- Pros: corrupt state surfaces explicitly; bypasses no longer possible; preserves the legitimate "no retry yet" default when the field is simply not yet written. Effort: small. Risk: low.
+### Option A — Strict shape validation; over-budget hits the normal recovery-budget-exhausted path, not blocked (recommended)
+- Validate `retry_count` via `Number.isInteger(parsed) && parsed >= 0`. Shape-malformed values (`'two'`, `2.5`, `-1`) → phase `status: blocked` with structured error.
+- **`retry_count > MAX_RETRIES` is NOT corrupt** — it can be legitimate historical state (e.g., a prior run used `--max-recovery-retries 5` and the operator restarted under default `=3`). That value flows through normal validation as a well-formed integer; the budget comparison happens later inside `decideRecoveryAction`, which interprets "over budget" as "recovery exhausted, halt the phase" (per the existing recovery contract). Do NOT short-circuit it as `blocked` at validation time.
+- **Distinguish absent field from explicit null:** if the `retry_count` key is absent from the YAML object (`!('retry_count' in status)`), default to 0 (legitimate fresh-spawn case). If the key is present with explicit `null`, treat as shape-corrupt and block; do NOT silently coerce.
+- Pros: corrupt SHAPE state surfaces explicitly; legitimate over-budget historical state flows through the documented recovery-budget-exhausted path; bypasses no longer possible. Effort: small. Risk: low.
 
 ### Option B — Silent coercion (current); document
 - Accept the foot-gun; document the coercion rules.
@@ -38,12 +39,13 @@ At `agent-orchestrator/scripts/orchestrate.js:1562`, the retry-count read path s
 
 ## Acceptance Criteria
 
-- [ ] `retry_count: "two"` → status: blocked; structured error mentions field name + observed value.
-- [ ] `retry_count: 2.5` → rejected (float).
-- [ ] `retry_count: 2` → accepted (existing behavior).
-- [ ] `retry_count: -1` or `> MAX_RETRIES` → rejected.
+- [ ] `retry_count: "two"` → status: blocked at validation (shape-corrupt); structured error mentions field name + observed value.
+- [ ] `retry_count: 2.5` → rejected at validation (shape-corrupt; not an integer).
+- [ ] `retry_count: 2` → accepted at validation (existing behavior).
+- [ ] `retry_count: -1` → rejected at validation (shape-corrupt; negative integer).
+- [ ] **`retry_count: 5` when `MAX_RETRIES = 3`** → accepted at validation (well-formed integer); flows through to `decideRecoveryAction`, which detects over-budget and applies the existing recovery-budget-exhausted policy (halt phase). NOT blocked at validation.
 - [ ] **Field absent from YAML** (key not present in the manifest-status object) → defaults to 0 (legitimate fresh-spawn case; NOT blocked).
-- [ ] **Field present with explicit `retry_count: null`** → blocked (corrupt state). The validator must distinguish absence (`!('retry_count' in status)`) from explicit null (`status.retry_count === null`).
+- [ ] **Field present with explicit `retry_count: null`** → blocked (shape-corrupt). The validator must distinguish absence (`!('retry_count' in status)`) from explicit null (`status.retry_count === null`).
 
 ## Work Log
 
