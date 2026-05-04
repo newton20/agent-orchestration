@@ -19,17 +19,24 @@ At `agent-orchestrator/scripts/orchestrate.js:1992-2003, 2474-2492`, the stale-s
 
 ## Proposed Solutions
 
-### Option A — mtime snapshot at spawn time (recommended)
-- Capture spawn timestamp in manifest-status `started_at` (already there per todo 078). Compare current signal `mtime` against `started_at` directly. A signal with `mtime >= started_at` is fresh; older is stale.
-- Pros: FS-resolution-independent; ties freshness to a known orchestrator-controlled timestamp. Effort: small. Risk: low.
+### Option A — Pre-spawn sweep of (phase, role) signals (recommended)
+- Before launching a spawn, the orchestrator sweeps and deletes all `(phase, role)` signal artifacts (`{role}-complete.md`, `qa-verdict.json`, completion-signal frontmatter, etc.) from the protocol directory. After spawn, ANY signal that appears is necessarily from the new spawn.
+- Eliminates mtime comparison entirely. The freshness invariant is "exists ↔ produced by current spawn" — no timestamp involved, so coarse-FS resolution is irrelevant.
+- Pros: FS-resolution-independent at the design level (not just the threshold); auditable (sweep happens at a single, well-defined point); resilient to future FS quirks. Effort: small (extract the sweep into a dedicated function called pre-spawn). Risk: low — the orchestrator was the writer that the agent inherits from; deleting before re-spawn is the correct semantic.
+- Cons: agent must produce signals from scratch on every spawn (no continuation across restarts) — this is already the contract.
 
-### Option B — `>=` instead of `>`
+### Option B — mtime snapshot at spawn time
+- Capture spawn timestamp in manifest-status `started_at` (already there per todo 078). Compare current signal `mtime >= started_at`.
+- Cons: **still has the equality-boundary case** — a signal written *just before* spawn (e.g., during the spawn-launch window) sits in the same FS-resolution bucket as `started_at` on coarse FS, so `mtime >= started_at` evaluates "fresh" even though the signal predates the spawn. Codex round 7 surfaced this. Doesn't fully close the coarse-FS case.
+- This was the original RA before codex round 7. Promoted to fallback only.
+
+### Option C — `>=` instead of `>`
 - Accept equal mtime as fresh.
-- Cons: still couples freshness to tick-start instead of spawn-time; doesn't fully close coarse-FS edge cases.
+- Cons: same equality-boundary issue at a different spot; doesn't change the underlying coupling to mtime.
 
 ## Recommended Action
 
-**Option A — approved 2026-05-04 by coord.** Use `started_at` from manifest-status as the freshness anchor. Eliminates the strict-`>` vs `>=` debate by anchoring against a different (and correct) reference point. Bundle in PR #23 cleanup wave.
+**Option A — revised 2026-05-04 post-codex round 7.** Pre-spawn sweep eliminates the mtime-comparison family of bugs (`>` strict, `>=`, `>= started_at`) by changing the freshness model from "timestamps vs threshold" to "exists ↔ current". Bundle in PR #23 cleanup wave. The original Option A (mtime vs `started_at`) was floated in coord's first pass, but codex round 7 showed the equality-boundary bug survives that fix on coarse-resolution filesystems.
 
 ## Technical Details
 
@@ -37,11 +44,13 @@ At `agent-orchestrator/scripts/orchestrate.js:1992-2003, 2474-2492`, the stale-s
 
 ## Acceptance Criteria
 
-- [ ] Stale-signal cleanup compares signal mtime against `started_at` (not tick-start mtime).
-- [ ] Test: signal written at same mtime-second as `started_at` → recognized as fresh, not stale.
-- [ ] FAT-2s coarse-FS edge case covered.
-- [ ] NFS subsecond-less edge case covered.
-- [ ] Test: signal predating `started_at` correctly classified as stale.
+- [ ] Pre-spawn sweep deletes all `(phase, role)` signal artifacts before the orchestrator launches the spawn.
+- [ ] Post-spawn: orchestrator reads signals as they appear; existence is the freshness signal. No mtime comparison in the cleanup path.
+- [ ] Test: signal written one mtime-bucket BEFORE spawn launch → swept; never visible to the post-spawn read path.
+- [ ] Test: signal written same mtime-bucket as spawn launch (coarse-FS tie) → swept by the pre-spawn pass; not preserved by an mtime equality bug.
+- [ ] Test: FAT-2s coarse-FS scenario — pre-spawn sweep deletes everything, post-spawn signal is the only one present.
+- [ ] Test: NFS subsecond-less scenario — same as FAT-2s case; sweep doesn't depend on subsecond resolution.
+- [ ] Sweep is auditable: dedicated function with a clear name (e.g., `sweepPriorSignals(phaseId, role)`) called from a single site in `executeSpawn` pre-spawnFn.
 
 ## Work Log
 
