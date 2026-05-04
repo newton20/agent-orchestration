@@ -12,12 +12,14 @@ dependencies: []
 
 Seventeen P3 mechanical cleanups surfaced in /ce:review of PR #19.
 Bundled into one tracking todo per coord dispatch — this entire
-bundle ships in **PR #23 cleanup wave** (the source /ce:review doc
-labelled it "PR #21 cleanup wave"; numbering shifted because the
-post-PR-19 triage capture took #21 and the coord triage round took
-#22). Mostly `safe_auto`-grade maintainability / api-contract /
-cli-readiness / performance / reliability nits with high reviewer
-confidence (per the source doc's `Conf` column).
+bundle ships in **PR #23 cleanup wave**. (Numbering history: the
+post-PR-19 triage capture took the next available PR slot and the
+coord triage round took the slot after that; the cleanup wave is
+PR #23. The source /ce:review doc had used an earlier projected
+number that no longer applies.) Mostly `safe_auto`-grade
+maintainability / api-contract / cli-readiness / performance /
+reliability nits with high reviewer confidence (per the source
+doc's `Conf` column).
 
 ## Findings
 
@@ -53,7 +55,7 @@ Sub-items per /ce:review report (lines 340-362), with reviewer + confidence pres
 
 ## Recommended Action
 
-**Option A — approved 2026-05-04 by coord.** All 17 sub-items in PR #23 cleanup wave. Implementer follows each sub-item's reviewer + confidence guidance verbatim from the body checklist. Note: the body's reference to "PR #21" is a stale label from the source /ce:review doc; the cleanup wave is now PR #23 (PR #20-22 numbering shifted; see post-PR-19 triage history).
+**Option A — approved 2026-05-04 by coord; relabel verified post-codex round 2 of PR #22.** All 17 sub-items ship in PR #23 cleanup wave. Implementer follows each sub-item's reviewer + confidence guidance verbatim from the body checklist. Numbering history is captured in the Problem Statement; no stale labels remain in any todo body.
 
 ## Technical Details
 

@@ -56,9 +56,13 @@ No new work needed in PR #23. If a future call site introduces a raw PID lookup 
 ## Acceptance Criteria
 
 - [x] Reconciliation snapshot excludes wrapper PIDs (cmd.exe, powershell.exe, agency wrapper) — verified via `orchestrate.js:723` `excludeWrappers: true`.
-- [ ] Test coverage for "phase with live cmd.exe wrapper + dead inner Claude → classified as crashed" — already exists at the `parsePidLookupOutput` level (`spawn-session.test.js:491,506,517` confirm `excludeWrappers: true` returns null when only the wrapper survives). Reconciliation-level integration test is a separate concern; if explicit reconciliation-path coverage is wanted, capture as a sub-item under todo 107 (testing-coverage bundle) rather than re-opening this todo.
+- [x] Test coverage for "live wrapper + dead inner Claude → classified as crashed" — exists at the `parsePidLookupOutput` unit level (`spawn-session.test.js:491,506,517` confirm `excludeWrappers: true` returns null when only the wrapper survives). The reconciliation pass consumes this filtered snapshot, so the wrapper-only case cannot reach the comparison loop.
 - [x] Cross-reference cite to todo 073 — implicit via `buildPidSnapshot` calling the post-todo-073 primitive.
 - [x] Precise line number filled — `orchestrate.js:723` (was TBD).
+
+## Follow-ups (not blocking closure)
+
+- An explicit reconciliation-path **integration** test (covering the full `pollAllPhases → reconciliation → adopt/abandon` flow with a wrapper-only PID snapshot) is a separate, narrower coverage gap. If wanted, capture as a sub-item under todo 107 (testing-coverage bundle) rather than re-opening this todo. The existing unit-level coverage already prevents the wrapper-only case from reaching reconciliation.
 
 ## Work Log
 

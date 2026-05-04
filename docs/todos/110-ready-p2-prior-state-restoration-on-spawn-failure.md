@@ -41,10 +41,11 @@ status (typically `pending`).
 
 ## Proposed Solutions
 
-### Option A — Shared rollback hook for executeSpawn failure (recommended)
-- Add a try/catch wrapper around `executeSpawn` body. On any throw (spawnFn, runUpdate, flag-write), call a shared `rollbackSpawningMarker(phaseId, role, priorStatus)` helper that reverts the manifest-status `status` field from `'spawning'` to its prior value.
+### Option A — Shared rollback hook for spawn-launch failure (recommended)
+- Add a try/catch wrapper around `executeSpawn` body. On any throw on the **spawn-launch path** (spawnFn fails to return, EFLAGTIMEOUT, flag-write before `spawnFn` returns, etc.), call a shared `rollbackSpawningMarker(phaseId, role, priorStatus)` helper that reverts the manifest-status `status` field from `'spawning'` to its prior value.
+- **Explicitly excludes** the post-spawn `runUpdate`-throw case (todo 096): when `spawnFn` already returned successfully (the wt tab is live) and a subsequent `runUpdate` throws, the marker must be **left intact** so the next tick's reconciliation can adopt the live session. Adding the rollback there would orphan the live tab and trigger duplicate dispatch — exactly the bug 096 warns against.
 - Pros: clean; symmetric with todo 111's EFLAGTIMEOUT case; one rollback site to test. Effort: small. Risk: low.
-- Bundle: this todo + 111 ship together with the shared hook.
+- Bundle: this todo + 111 ship together with the shared hook. 096 is **not** in this bundle.
 
 ### Option B — Reconciliation logic absorbs stranded markers
 - Let stranded `'spawning'` eventually resolve via the existing reconciliation pass.
@@ -62,10 +63,11 @@ status (typically `pending`).
 
 ## Acceptance Criteria
 
-- [ ] executeSpawn throws (spawnFn / runUpdate / flag-write) → status reverts to prior (typically 'pending').
-- [ ] Next tick: phase re-eligible for spawn (not stuck in 'spawning').
+- [ ] executeSpawn throws on the **spawn-launch path** (spawnFn fails to return, EFLAGTIMEOUT, flag-write before spawnFn returns) → status reverts to prior (typically `'pending'`) via `rollbackSpawningMarker`.
+- [ ] **Post-spawn `runUpdate` throw (todo 096) does NOT call rollbackSpawningMarker** — the test must verify the marker remains `'spawning'` after such a throw, so reconciliation can adopt the live tab on the next tick.
+- [ ] Next tick: phase re-eligible for spawn (not stuck in `'spawning'`) when the spawn never launched.
 - [ ] Retry count NOT incremented on fresh-spawn-failure (this is not a recovery scenario).
-- [ ] Shared `rollbackSpawningMarker` helper reused by todo 111 only (NOT 096 — 096 leaves the marker intact because the spawn launched successfully; rolling back there would orphan the live tab).
+- [ ] Shared `rollbackSpawningMarker` helper reused by todo 111 only (NOT 096 — see Option A note).
 - [ ] Precise line number filled in this todo's Technical Details (was TBD).
 
 ## Work Log

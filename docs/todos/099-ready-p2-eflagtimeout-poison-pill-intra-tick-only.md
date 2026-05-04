@@ -10,7 +10,7 @@ dependencies: []
 
 ## Problem Statement
 
-At `agent-orchestrator/scripts/orchestrate.js:2456`, the EFLAGTIMEOUT handling treats the poison-pill semantic as intra-tick only. If a slow tab is orphaned (the orchestrator gives up waiting on flag-consume within a tick), the tab is still alive and can consume the *next* tick's flag for an unrelated phase/role, delivering the wrong prompt to the wrong agent across tick boundaries. Both reliability and security reviewers flagged this from independent angles.
+At `agent-orchestrator/scripts/orchestrate.js` (flag-consume + EFLAGTIMEOUT throw site, around `:2740-2796`; the source /ce:review doc cited `:2456` but the actual current site is `:2786` for the unlink call and `:2792` for the throw), the EFLAGTIMEOUT handling treats the poison-pill semantic as intra-tick only. If a slow tab is orphaned (the orchestrator gives up waiting on flag-consume within a tick), the tab is still alive and can consume the *next* tick's flag for an unrelated phase/role, delivering the wrong prompt to the wrong agent across tick boundaries. Both reliability and security reviewers flagged this from independent angles.
 
 ## Findings
 
@@ -36,7 +36,7 @@ At `agent-orchestrator/scripts/orchestrate.js:2456`, the EFLAGTIMEOUT handling t
 
 ## Technical Details
 
-- Affected file: `agent-orchestrator/scripts/orchestrate.js:2456`
+- Affected file: `agent-orchestrator/scripts/orchestrate.js:2740-2796` (flag-consume busy-wait + EFLAGTIMEOUT throw). The source doc's cite of `:2456` is stale; the actual unlink call is at `:2786` and the throw is at `:2792`.
 
 ## Acceptance Criteria
 

@@ -38,9 +38,9 @@ At `agent-orchestrator/scripts/orchestrate.js:1208-1218`, manifest `schema_versi
 ## Acceptance Criteria
 
 - [ ] `schema_version: 1` accepted (V1 baseline).
-- [ ] `schema_version: 1.1` accepted with warning.
+- [ ] `schema_version: 1.1` accepted with warning ("manifest declares schema 1.1; orchestrator targets 1 — proceeding under soft-compat band").
 - [ ] `schema_version: 2` rejected as hard major mismatch with structured error.
-- [ ] `schema_version: "1.0.x"` parsed as major=1; accepted.
+- [ ] Malformed values (`"1.0.x"`, `"abc"`, `null`, missing field) rejected as structured config errors per Option A's `MAJOR | MAJOR.MINOR` format. (No lenient parse — only well-formed integer or `MAJOR.MINOR` is accepted.)
 - [ ] Soft-band documented in `--help` text.
 
 ## Work Log
