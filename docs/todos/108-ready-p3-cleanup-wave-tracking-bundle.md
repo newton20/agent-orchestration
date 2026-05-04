@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p3
 issue_id: "108"
 tags: [unit-11, orchestrate, post-pr-19, ce-review, p3-cleanup-bundle, tracking]
@@ -12,9 +12,14 @@ dependencies: []
 
 Seventeen P3 mechanical cleanups surfaced in /ce:review of PR #19.
 Bundled into one tracking todo per coord dispatch — this entire
-bundle ships in **PR #21 cleanup wave**. Mostly `safe_auto`-grade
-maintainability / api-contract / cli-readiness / performance / reliability
-nits with high reviewer confidence (per the source doc's `Conf` column).
+bundle ships in **PR #23 cleanup wave**. (Numbering history: the
+post-PR-19 triage capture took the next available PR slot and the
+coord triage round took the slot after that; the cleanup wave is
+PR #23. The source /ce:review doc had used an earlier projected
+number that no longer applies.) Mostly `safe_auto`-grade
+maintainability / api-contract / cli-readiness / performance /
+reliability nits with high reviewer confidence (per the source
+doc's `Conf` column).
 
 ## Findings
 
@@ -40,11 +45,17 @@ Sub-items per /ce:review report (lines 340-362), with reviewer + confidence pres
 
 ## Proposed Solutions
 
-_(To be drafted during coord triage round; the /ce:review doc's brief format does not include solution options for these.)_
+### Option A — Implement all 17 sub-items in PR #23 cleanup wave (recommended)
+- Each sub-item is a documented `safe_auto`-grade fix. Implementer applies per-item per the description.
+- Pros: closes the entire P3 backlog in one wave. Effort: small (most are 1-3 LOC).
+
+### Option B — Defer low-conf items (Conf 75) to V1.5
+- Cherry-pick only Conf-100 items.
+- Cons: bookkeeping for 8 deferred items; perpetual P3 queue.
 
 ## Recommended Action
 
-_Pending triage._ This entire bundle ships in PR #21 cleanup wave per coord dispatch.
+**Option A — approved 2026-05-04 by coord; relabel verified post-codex round 2 of PR #22.** All 17 sub-items ship in PR #23 cleanup wave. Implementer follows each sub-item's reviewer + confidence guidance verbatim from the body checklist. Numbering history is captured in the Problem Statement; no stale labels remain in any todo body.
 
 ## Technical Details
 
@@ -53,7 +64,9 @@ _Pending triage._ This entire bundle ships in PR #21 cleanup wave per coord disp
 
 ## Acceptance Criteria
 
-- [ ] _(To be drafted during coord triage round.)_
+- [ ] All 17 sub-items in the body checklist closed (boxes checked with cite-of-fix-commit each).
+- [ ] No regression in existing tests after each sub-item lands.
+- [ ] Tests added for 108.j (convergence counter unknown reason) and 108.k (stale-signal statSync-throws branch) per sub-item descriptions.
 
 ## Work Log
 

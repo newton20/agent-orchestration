@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "106"
 tags: [unit-11, orchestrate, post-pr-19, ce-review, cli-readiness, flag-parsing]
@@ -19,11 +19,17 @@ At `agent-orchestrator/scripts/orchestrate.js:3092-3098, 3132-3137`, the CLI fla
 
 ## Proposed Solutions
 
-_(To be drafted during coord triage round; the /ce:review doc's brief format does not include solution options for these.)_
+### Option A — Reject `-`-prefixed values for these flags (recommended)
+- For flags with required string arg (`--plugin-dir`, `--project-name`), if the next argv token starts with `-`, error out with a clear message: `--plugin-dir requires a path; got '--resume' (looks like another flag — use --plugin-dir=<path> for paths starting with -)`.
+- Pros: simple; catches the canonical foot-gun. Effort: small. Risk: low.
+
+### Option B — Warn but accept
+- Same parse, but log a warning when next token starts with `-`.
+- Cons: ambiguous semantics; user may not see the warning.
 
 ## Recommended Action
 
-_Pending triage._
+**Option A — approved 2026-05-04 by coord.** Hard reject. Operators using genuinely-`-`-prefixed paths can use the `--flag=value` form. Bundle in PR #23 cleanup wave; symmetric across `--plugin-dir` and `--project-name`.
 
 ## Technical Details
 
@@ -31,7 +37,10 @@ _Pending triage._
 
 ## Acceptance Criteria
 
-- [ ] _(To be drafted during coord triage round.)_
+- [ ] `--plugin-dir foo --resume bar.yaml` → `pluginDir=foo`, `resume=true` (existing happy path preserved).
+- [ ] `--plugin-dir --resume bar.yaml` → error: missing value for `--plugin-dir`; exit code 1; clear error message naming the offending token.
+- [ ] `--plugin-dir=--special-path --resume bar.yaml` → `pluginDir=--special-path`, `resume=true` (escape hatch via `=`).
+- [ ] Symmetric for `--project-name`.
 
 ## Work Log
 

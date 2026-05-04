@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "107"
 tags: [unit-11, orchestrate, post-pr-19, ce-review, testing, coverage-gaps, bundle]
@@ -29,11 +29,17 @@ Sub-items per /ce:review report:
 
 ## Proposed Solutions
 
-_(To be drafted during coord triage round; the /ce:review doc's brief format does not include solution options for these.)_
+### Option A — Address all 5 sub-items in cleanup wave (recommended)
+- All 5 are small (1-test each); no reason to split.
+- Pros: closes the bundle in one pass. Effort: small.
+
+### Option B — Cherry-pick highest-value 2-3
+- Pick 107.b (FLAG_NAME_RE import — cross-module invariant) + 107.d (recovery max-3 boundary — convergence guarantee).
+- Cons: leaves easy wins on the table.
 
 ## Recommended Action
 
-_Pending triage._
+**Option A — approved 2026-05-04 by coord.** All 5 sub-items in PR #23 cleanup wave. Each is a focused test addition or fix; no design judgment needed beyond what's already documented in the sub-item descriptions.
 
 ## Technical Details
 
@@ -43,7 +49,11 @@ _Pending triage._
 
 ## Acceptance Criteria
 
-- [ ] _(To be drafted during coord triage round.)_
+- [ ] 107.a — Test X3 has functional check beyond `assert.ok(true)`; reported test count reflects real coverage.
+- [ ] 107.b — AL1 imports `FLAG_NAME_RE` from `../hooks/session-start` (no copy-paste).
+- [ ] 107.c — Stale-lock reclaim ENOENT branch covered by a test (rename-loser path).
+- [ ] 107.d — Recovery max-3 inner boundary asserted: `retry_count=2 → spawn iteration=3` test exists; `>=` vs `>` swap fails the test.
+- [ ] 107.e — AM1 secondary-lock test asserts r1 acquired the workdir lockfile + cleanup happens + samePath / case-insensitive Windows branch covered.
 
 ## Work Log
 
