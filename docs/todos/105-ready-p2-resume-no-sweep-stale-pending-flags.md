@@ -19,23 +19,30 @@ At `agent-orchestrator/scripts/orchestrate.js:2624-2647, 2262-2279`, the `--resu
 
 ## Proposed Solutions
 
-### Option A — Aggressive sweep of all `.pending-*` on `--resume` (recommended)
-- On `--resume` entry, before the main loop starts, unlink every `.pending-*` in the protocol directory unconditionally.
-- Rationale: by definition `--resume` runs after the prior orchestrator died. The prior orchestrator was the only legitimate writer of `.pending-*` flags; nothing the prior orchestrator wrote could still be valid for the new orchestrator's spawns (each new spawn writes a fresh `.pending-<name>` for the (phase, role) it dispatches). The contract "exists ↔ produced by THIS orchestrator's most recent spawn for that name" is violated for any flag found at resume entry, regardless of age.
-- The first spawn this resume issues writes its own `.pending-<name>` after the sweep, so legitimate in-flight pendings re-appear within milliseconds.
-- Pros: simple; correct against the protocol model; no mtime threshold to misjudge. Effort: trivial. Risk: low.
+### Option A — Reconciliation-aware sweep on `--resume` (recommended)
+- On `--resume` entry, BEFORE sweeping, run the existing 090 reconciliation pass (or a sweep-friendly variant). For each phase in manifest-status with `status: 'spawning'`:
+  - If the pidSnapshot has a live PID for the corresponding session name AND the matching `.pending-<name>` exists, the prior orchestrator died AFTER launching the tab but BEFORE the SessionStart hook fired. The tab is alive and waiting for its prompt. Mark the matching `.pending-<name>` as **preserved**.
+  - Otherwise (no live PID, or no matching pending), the spawning marker is stranded: roll back to `pending` and let the matching `.pending-<name>` (if any) be swept normally.
+- AFTER the reconciliation pass, sweep `.pending-*` files in the protocol directory EXCEPT the preserved set.
+- Each new spawn from this resume's main loop writes its own `.pending-<name>` after the sweep — they are not affected.
+- Rationale: the only legitimate `.pending-<name>` survivor across orchestrator instances is one that's bound to a live spawning marker (the prior orchestrator's spawn-launched-but-not-yet-consumed tab). All other pendings violate the protocol model and must be swept to prevent cross-tick wrong-prompt-to-wrong-agent.
+- Pros: preserves the only legitimate cross-instance survivor (the in-flight spawn); correct against the protocol model; no mtime threshold. Effort: small (extends the existing 090 reconciliation pass with a sweep-set output). Risk: low.
+
+### Option A1 — Aggressive sweep without preservation (rejected)
+- Unconditional sweep of all `.pending-*` on resume.
+- **Rejected post-codex round 11:** breaks the spawning-marker resume/adoption path. If the prior orchestrator died in the spawn-launched-but-not-yet-consumed window, the tab's hook fires after resume's aggressive sweep, finds no `.pending-<name>`, and the tab gets no prompt. Reconciliation marks the phase `'running'` (live PID match), but the tab silently has no work — silent broken state.
 
 ### Option B — Targeted mtime-based startup sweep
 - On `--resume` entry, scan `.pending-*` files; unlink any whose mtime predates some threshold.
 - **Codex round 10 ruled this out:** comparing against the prior orchestrator's lockfile mtime fails because the prior orchestrator wrote the lockfile at startup and `.pending-*` flags later, so post-lockfile-mtime stale flags survive the sweep. Comparing against `resume start - 60s` works only by accident — flags written less than 60s before the new orchestrator starts get to leak into the new run.
-- Cons: every mtime threshold has a similar leak-window; the protocol model doesn't need any preservation, so this option only adds risk.
+- Cons: every mtime threshold has a similar leak-window.
 
 ### Option C — No sweep
 - Current behavior. Cons: re-introduces the cross-tick wrong-prompt-to-wrong-agent class at the resume boundary.
 
 ## Recommended Action
 
-**Option A — revised 2026-05-04 post-codex round 10.** Aggressive sweep on `--resume`. The protocol model says any `.pending-*` flag found at resume entry is by-definition stale; mtime thresholds add risk without benefit. Bundle in PR #23 cleanup wave.
+**Option A — revised 2026-05-04 post-codex rounds 10+11.** Reconciliation-aware sweep: the 090 spawning-marker reconciliation runs BEFORE the sweep and identifies the set of `.pending-<name>` files that are bound to a live (spawn-launched, not-yet-consumed) tab. Those are preserved; everything else is swept. The protocol model has exactly one cross-orchestrator-instance survivor (the in-flight spawn), and reconciliation is the existing mechanism for identifying it. Bundle in PR #23 cleanup wave.
 
 ## Technical Details
 
@@ -43,11 +50,14 @@ At `agent-orchestrator/scripts/orchestrate.js:2624-2647, 2262-2279`, the `--resu
 
 ## Acceptance Criteria
 
-- [ ] `--resume` on a dir with any `.pending-*` files (regardless of mtime) → ALL of them removed before main loop starts.
-- [ ] Sweep is logged (count of unlinked + filenames).
-- [ ] Test: orphan `.pending-orch-phase-1-impl` from prior run + `--resume` → flag swept, no wrong-prompt delivery.
-- [ ] Test: the resume's first spawn writes its own `.pending-<name>` after the sweep; the SessionStart hook for that spawn finds and consumes it (i.e., the sweep doesn't break the new orchestrator's first-tick happy path).
-- [ ] Test: `--resume` with a recently-written `.pending-*` (e.g., 5 seconds before resume start) → still swept (the protocol model says no flag is preservable across orchestrator instances).
+- [ ] `--resume` runs the 090 spawning-marker reconciliation BEFORE sweeping. Reconciliation produces a set of preserved `.pending-<name>` filenames that are bound to a live PID + `'spawning'` marker.
+- [ ] All `.pending-*` files in the protocol directory NOT in the preserved set are unlinked before the main loop starts.
+- [ ] Sweep is logged (count of unlinked + filenames + count of preserved + reasons).
+- [ ] Test: orphan `.pending-orch-phase-1-impl` from a prior run with NO live PID + `--resume` → flag swept, no wrong-prompt delivery.
+- [ ] Test: prior orchestrator died after launching a tab but before SessionStart hook fired (`'spawning'` marker + live PID + matching `.pending-<name>`) → the matching flag is **preserved**, the tab's hook eventually consumes it, reconciliation transitions the phase from `'spawning'` to `'running'` correctly. The phase does NOT silently have no work.
+- [ ] Test: prior orchestrator died with `'spawning'` marker but no live PID → marker rolled back to `'pending'`, matching `.pending-<name>` (if any) swept.
+- [ ] Test: the resume's first new spawn writes its own `.pending-<name>` after the sweep; the SessionStart hook for that spawn finds and consumes it (sweep doesn't break the new orchestrator's first-tick happy path).
+- [ ] Test: a recently-written `.pending-*` (e.g., 5 seconds before resume start) NOT bound to a live spawning marker → still swept.
 
 ## Work Log
 
