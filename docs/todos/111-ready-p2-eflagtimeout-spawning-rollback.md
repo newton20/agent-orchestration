@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "111"
 tags: [unit-11, orchestrate, post-pr-19, re-codex-round-2, flag-consume, timeout, spawning-marker]
@@ -34,11 +34,17 @@ sites.
 
 ## Proposed Solutions
 
-_(To be drafted during coord triage round; the re-codex Round 2 brief did not propose options.)_
+### Option A — Reuse todo 110's shared rollback hook (recommended)
+- On EFLAGTIMEOUT during a phase in `'spawning'` state, call the same `rollbackSpawningMarker(phaseId, role, priorStatus)` helper introduced by todo 110.
+- Pros: one rollback function; symmetric handling across spawn-path failures. Effort: trivial (one helper call). Risk: low.
+
+### Option B — Defer until 110 lands; ship as a no-op until then
+- Wait for 110's hook to exist; no separate work.
+- Cons: 111 stays open as bookkeeping while 110 is in flight.
 
 ## Recommended Action
 
-_Pending triage._
+**Option A — approved 2026-05-04 by coord.** Bundle with todo 110 in PR #23 cleanup wave. The shared hook from 110 IS the implementation; this todo's site (EFLAGTIMEOUT branch) just calls it. Closing 110 closes 111 by construction.
 
 ## Technical Details
 
@@ -49,7 +55,11 @@ _Pending triage._
 
 ## Acceptance Criteria
 
-- [ ] _(To be drafted during coord triage round.)_
+- [ ] EFLAGTIMEOUT during 'spawning' state → status rolled back via shared `rollbackSpawningMarker` from todo 110.
+- [ ] Next tick re-dispatches if conditions met.
+- [ ] No retry-count increment (fresh-spawn failure, not recovery).
+- [ ] Cross-reference: when todo 099 (EFLAGTIMEOUT poison-pill cross-tick) lands, the flag-delete + marker-rollback land at the same call site.
+- [ ] Precise line number filled in this todo's Technical Details (was TBD).
 
 ## Work Log
 

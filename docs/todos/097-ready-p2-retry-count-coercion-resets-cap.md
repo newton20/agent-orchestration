@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "097"
 tags: [unit-11, orchestrate, post-pr-19, ce-review, reliability, retry-count, type-coercion, recovery]
@@ -19,11 +19,18 @@ At `agent-orchestrator/scripts/orchestrate.js:1562`, the retry-count read path s
 
 ## Proposed Solutions
 
-_(To be drafted during coord triage round; the /ce:review doc's brief format does not include solution options for these.)_
+### Option A — Strict integer validation; reject corrupt as blocked (recommended)
+- Validate `retry_count` via `Number.isInteger(parsed) && parsed >= 0 && parsed <= MAX_RETRIES`.
+- Corrupt state (`'two'`, `2.5`, `null`, `-1`, `> MAX_RETRIES`) → set phase `status: blocked` with structured error; do NOT silently coerce.
+- Pros: corrupt state surfaces explicitly; bypasses no longer possible. Effort: small. Risk: low.
+
+### Option B — Silent coercion (current); document
+- Accept the foot-gun; document the coercion rules.
+- Cons: corrupt state grants up to 3 extra retries beyond cap.
 
 ## Recommended Action
 
-_Pending triage._
+**Option A — approved 2026-05-04 by coord.** Strict integer validation. Corrupt retry_count is operator-visible state, not a silent default. Bundle in PR #23 cleanup wave.
 
 ## Technical Details
 
@@ -31,7 +38,11 @@ _Pending triage._
 
 ## Acceptance Criteria
 
-- [ ] _(To be drafted during coord triage round.)_
+- [ ] `retry_count: "two"` → status: blocked; structured error mentions field name + observed value.
+- [ ] `retry_count: 2.5` → rejected (float).
+- [ ] `retry_count: 2` → accepted (existing behavior).
+- [ ] `retry_count: -1` or `> MAX_RETRIES` → rejected.
+- [ ] `retry_count: null` (missing field) → defaults to 0 (NOT blocked — this is the legitimate fresh-spawn case).
 
 ## Work Log
 

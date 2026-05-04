@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "109"
 tags: [unit-11, orchestrate, post-pr-19, re-codex-round-2, reconciliation, wrapper-pid]
@@ -33,11 +33,17 @@ filter step) so only inner Claude PIDs land in the snapshot.
 
 ## Proposed Solutions
 
-_(To be drafted during coord triage round; the re-codex Round 2 brief did not propose options.)_
+### Option A — Pass excludeWrappers: true at the snapshot call site (recommended)
+- The reconciliation snapshot's PID-lookup call site missed the new default from todo 073's flip. Either it explicitly passes `false` (override) or it's calling a different primitive that didn't pick up the default. Pass `true` explicitly.
+- Pros: minimal change; uses existing primitive; consistent with the rest of the codebase. Effort: trivial. Risk: low.
+
+### Option B — Filter wrapper PIDs at the comparison layer
+- Build the snapshot raw, then filter wrapper PIDs in the comparison loop.
+- Cons: duplicates wrapper-detection logic that already lives in spawn-session.
 
 ## Recommended Action
 
-_Pending triage._
+**Option A — approved 2026-05-04 by coord.** Use the existing primitive (`getSessionPid` or `buildPidSnapshot`) with `excludeWrappers: true`. Verify the call site receives the post-todo-073 default; if it's calling a different primitive, route through one that respects the default. Bundle in PR #23 cleanup wave. Implementer should locate the precise line in commit `c1bd625` and update the source file's TBD reference.
 
 ## Technical Details
 
@@ -47,7 +53,10 @@ _Pending triage._
 
 ## Acceptance Criteria
 
-- [ ] _(To be drafted during coord triage round.)_
+- [ ] Reconciliation snapshot excludes wrapper PIDs (cmd.exe, powershell.exe, agency wrapper).
+- [ ] Test: phase with live cmd.exe wrapper + dead inner Claude → reconciliation correctly classifies as crashed (not alive).
+- [ ] Cross-reference cite to todo 073 (closed) preserved in code comment.
+- [ ] Precise line number filled in this todo's Technical Details (was TBD).
 
 ## Work Log
 

@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "110"
 tags: [unit-11, orchestrate, post-pr-19, re-codex-round-2, recovery, spawn-failure, spawning-marker]
@@ -41,11 +41,18 @@ status (typically `pending`).
 
 ## Proposed Solutions
 
-_(To be drafted during coord triage round; the re-codex Round 2 brief did not propose options.)_
+### Option A — Shared rollback hook for executeSpawn failure (recommended)
+- Add a try/catch wrapper around `executeSpawn` body. On any throw (spawnFn, runUpdate, flag-write), call a shared `rollbackSpawningMarker(phaseId, role, priorStatus)` helper that reverts the manifest-status `status` field from `'spawning'` to its prior value.
+- Pros: clean; symmetric with todo 111's EFLAGTIMEOUT case; one rollback site to test. Effort: small. Risk: low.
+- Bundle: this todo + 111 ship together with the shared hook.
+
+### Option B — Reconciliation logic absorbs stranded markers
+- Let stranded `'spawning'` eventually resolve via the existing reconciliation pass.
+- Cons: adds an unnecessary retry-count increment for what is actually fresh-spawn-failed.
 
 ## Recommended Action
 
-_Pending triage._
+**Option A — approved 2026-05-04 by coord.** Shared rollback hook with todo 111. Bundle both in PR #23 cleanup wave. The hook also closes todo 096's runUpdate-throw → duplicate-spawn case (three sites converge on one rollback function).
 
 ## Technical Details
 
@@ -55,7 +62,11 @@ _Pending triage._
 
 ## Acceptance Criteria
 
-- [ ] _(To be drafted during coord triage round.)_
+- [ ] executeSpawn throws (spawnFn / runUpdate / flag-write) → status reverts to prior (typically 'pending').
+- [ ] Next tick: phase re-eligible for spawn (not stuck in 'spawning').
+- [ ] Retry count NOT incremented on fresh-spawn-failure (this is not a recovery scenario).
+- [ ] Shared `rollbackSpawningMarker` helper reused by todo 111 + todo 096.
+- [ ] Precise line number filled in this todo's Technical Details (was TBD).
 
 ## Work Log
 

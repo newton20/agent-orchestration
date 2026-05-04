@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "105"
 tags: [unit-11, orchestrate, post-pr-19, ce-review, adversarial, resume, stale-flags, pending-flags]
@@ -19,11 +19,17 @@ At `agent-orchestrator/scripts/orchestrate.js:2624-2647, 2262-2279`, the `--resu
 
 ## Proposed Solutions
 
-_(To be drafted during coord triage round; the /ce:review doc's brief format does not include solution options for these.)_
+### Option A — Targeted mtime-based startup sweep (recommended)
+- On `--resume` entry, scan `.pending-*` files; unlink any whose mtime predates the prior orchestrator's lockfile last-touch (or, if no prior lockfile metadata, predates the resume's own start time minus a small grace).
+- Pros: targeted; preserves any genuinely-in-flight pendings at restart. Effort: small. Risk: low.
+
+### Option B — Aggressive sweep all .pending-* on resume
+- Unlink every .pending-* on resume regardless of age.
+- Cons: removes legitimate in-flight pendings if the user restarts the orchestrator quickly.
 
 ## Recommended Action
 
-_Pending triage._
+**Option A — approved 2026-05-04 by coord.** Targeted by mtime against the prior lockfile timestamp. If lockfile metadata is unavailable (clean shutdown removed it), fall back to "predates resume start - 60s" — same hard-TTL pattern as todo 005. Bundle in PR #23 cleanup wave.
 
 ## Technical Details
 
@@ -31,7 +37,10 @@ _Pending triage._
 
 ## Acceptance Criteria
 
-- [ ] _(To be drafted during coord triage round.)_
+- [ ] `--resume` on a dir with stale `.pending-*` (mtime older than prior lockfile) → those files removed before main loop starts.
+- [ ] `--resume` preserves recent `.pending-*` (within 60s of resume start when no prior lockfile metadata).
+- [ ] Sweep is logged (count of unlinked + reason).
+- [ ] Test: orphan `.pending-orch-phase-1-impl` from prior run + `--resume` → flag swept, no wrong-prompt delivery.
 
 ## Work Log
 

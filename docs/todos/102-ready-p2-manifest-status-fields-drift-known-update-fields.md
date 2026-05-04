@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "102"
 tags: [unit-11, orchestrate, post-pr-19, ce-review, api-contract, manifest-status, schema-drift]
@@ -19,11 +19,17 @@ The manifest-status YAML field schema is unversioned at `agent-orchestrator/scri
 
 ## Proposed Solutions
 
-_(To be drafted during coord triage round; the /ce:review doc's brief format does not include solution options for these.)_
+### Option A — Add review_iteration + review_stage to KNOWN_UPDATE_FIELDS (recommended)
+- Hoist the missing fields to `parse-manifest.KNOWN_UPDATE_FIELDS`. orchestrate.js writes against the canonical authority.
+- Pros: closes the drift; maintains parse-manifest as single source of truth. Effort: trivial. Risk: low.
+
+### Option B — runUpdate accepts-but-warns on unknown fields
+- Allow orchestrate.js to write any field; runUpdate warns on unknown.
+- Cons: KNOWN_UPDATE_FIELDS becomes documentation rather than enforcement.
 
 ## Recommended Action
 
-_Pending triage._
+**Option A — approved 2026-05-04 by coord.** Add `review_iteration` and `review_stage` to `KNOWN_UPDATE_FIELDS`. Defense-in-depth: have runUpdate also warn on truly-unknown fields (Option B's good idea preserved as defensive logging, not as the primary contract). Bundle in PR #23 cleanup wave.
 
 ## Technical Details
 
@@ -32,7 +38,10 @@ _Pending triage._
 
 ## Acceptance Criteria
 
-- [ ] _(To be drafted during coord triage round.)_
+- [ ] `KNOWN_UPDATE_FIELDS` includes `review_iteration` and `review_stage`.
+- [ ] Test: runUpdate with these fields persists them to manifest-status.
+- [ ] Test: runUpdate with truly unknown field logs warning (defense in depth).
+- [ ] orchestrate.js write sites verified consistent with the expanded allow-list.
 
 ## Work Log
 

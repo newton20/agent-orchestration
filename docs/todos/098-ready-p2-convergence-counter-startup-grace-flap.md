@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "098"
 tags: [unit-11, orchestrate, post-pr-19, ce-review, reliability, convergence, startup-grace, tri-state]
@@ -19,11 +19,18 @@ At `agent-orchestrator/scripts/orchestrate.js:1353`, the tri-state convergence c
 
 ## Proposed Solutions
 
-_(To be drafted during coord triage round; the /ce:review doc's brief format does not include solution options for these.)_
+### Option A — startup_grace resets the counter (recommended)
+- Only `lookup_failed` and `session_not_found` increment the consecutive-null counter; any non-null pidAlive value (true/false) AND `startup_grace` reset to 0.
+- Pros: matches the documented "consecutive" semantic; flap pattern correctly counts 1 (not 2).
+- Effort: small (one reset call in the convergence path). Risk: low.
+
+### Option B — Document the flap as expected behavior
+- Update todo 071's contract doc to say "consecutive includes startup_grace as a continuation".
+- Cons: weakens the convergence guarantee; loosens the contract Unit 11 was designed against.
 
 ## Recommended Action
 
-_Pending triage._
+**Option A — approved 2026-05-04 by coord.** The "consecutive" word in the contract is load-bearing; flap patterns must NOT bypass the convergence threshold. Bundle in PR #23 cleanup wave.
 
 ## Technical Details
 
@@ -31,7 +38,10 @@ _Pending triage._
 
 ## Acceptance Criteria
 
-- [ ] _(To be drafted during coord triage round.)_
+- [ ] Sequence `lookup_failed` → `startup_grace` → `lookup_failed`: counter ends at 1 (NOT 2).
+- [ ] Sequence `lookup_failed` → `lookup_failed` → `lookup_failed`: counter reaches 3 → recovery triggers.
+- [ ] Sequence `lookup_failed` → `pidAlive: true` → `lookup_failed`: counter resets to 1 on the second `lookup_failed`.
+- [ ] Test covers the flap pattern explicitly.
 
 ## Work Log
 

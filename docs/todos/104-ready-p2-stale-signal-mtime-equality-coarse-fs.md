@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "104"
 tags: [unit-11, orchestrate, post-pr-19, ce-review, adversarial, mtime, stale-signal, coarse-fs, testing-gap]
@@ -19,11 +19,17 @@ At `agent-orchestrator/scripts/orchestrate.js:1992-2003, 2474-2492`, the stale-s
 
 ## Proposed Solutions
 
-_(To be drafted during coord triage round; the /ce:review doc's brief format does not include solution options for these.)_
+### Option A — mtime snapshot at spawn time (recommended)
+- Capture spawn timestamp in manifest-status `started_at` (already there per todo 078). Compare current signal `mtime` against `started_at` directly. A signal with `mtime >= started_at` is fresh; older is stale.
+- Pros: FS-resolution-independent; ties freshness to a known orchestrator-controlled timestamp. Effort: small. Risk: low.
+
+### Option B — `>=` instead of `>`
+- Accept equal mtime as fresh.
+- Cons: still couples freshness to tick-start instead of spawn-time; doesn't fully close coarse-FS edge cases.
 
 ## Recommended Action
 
-_Pending triage._
+**Option A — approved 2026-05-04 by coord.** Use `started_at` from manifest-status as the freshness anchor. Eliminates the strict-`>` vs `>=` debate by anchoring against a different (and correct) reference point. Bundle in PR #23 cleanup wave.
 
 ## Technical Details
 
@@ -31,7 +37,11 @@ _Pending triage._
 
 ## Acceptance Criteria
 
-- [ ] _(To be drafted during coord triage round.)_
+- [ ] Stale-signal cleanup compares signal mtime against `started_at` (not tick-start mtime).
+- [ ] Test: signal written at same mtime-second as `started_at` → recognized as fresh, not stale.
+- [ ] FAT-2s coarse-FS edge case covered.
+- [ ] NFS subsecond-less edge case covered.
+- [ ] Test: signal predating `started_at` correctly classified as stale.
 
 ## Work Log
 

@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p3
 issue_id: "108"
 tags: [unit-11, orchestrate, post-pr-19, ce-review, p3-cleanup-bundle, tracking]
@@ -40,11 +40,17 @@ Sub-items per /ce:review report (lines 340-362), with reviewer + confidence pres
 
 ## Proposed Solutions
 
-_(To be drafted during coord triage round; the /ce:review doc's brief format does not include solution options for these.)_
+### Option A — Implement all 17 sub-items in PR #23 cleanup wave (recommended)
+- Each sub-item is a documented `safe_auto`-grade fix. Implementer applies per-item per the description.
+- Pros: closes the entire P3 backlog in one wave. Effort: small (most are 1-3 LOC).
+
+### Option B — Defer low-conf items (Conf 75) to V1.5
+- Cherry-pick only Conf-100 items.
+- Cons: bookkeeping for 8 deferred items; perpetual P3 queue.
 
 ## Recommended Action
 
-_Pending triage._ This entire bundle ships in PR #21 cleanup wave per coord dispatch.
+**Option A — approved 2026-05-04 by coord.** All 17 sub-items in PR #23 cleanup wave. Implementer follows each sub-item's reviewer + confidence guidance verbatim from the body checklist. Note: the body's reference to "PR #21" is a stale label from the source /ce:review doc; the cleanup wave is now PR #23 (PR #20-22 numbering shifted; see post-PR-19 triage history).
 
 ## Technical Details
 
@@ -53,7 +59,9 @@ _Pending triage._ This entire bundle ships in PR #21 cleanup wave per coord disp
 
 ## Acceptance Criteria
 
-- [ ] _(To be drafted during coord triage round.)_
+- [ ] All 17 sub-items in the body checklist closed (boxes checked with cite-of-fix-commit each).
+- [ ] No regression in existing tests after each sub-item lands.
+- [ ] Tests added for 108.j (convergence counter unknown reason) and 108.k (stale-signal statSync-throws branch) per sub-item descriptions.
 
 ## Work Log
 

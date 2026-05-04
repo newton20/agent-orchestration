@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "096"
 tags: [unit-11, orchestrate, post-pr-19, ce-review, reliability, executespawn, runupdate, related-088-093]
@@ -20,11 +20,18 @@ At `agent-orchestrator/scripts/orchestrate.js:2511`, `executeSpawn`'s post-spawn
 
 ## Proposed Solutions
 
-_(To be drafted during coord triage round; the /ce:review doc's brief format does not include solution options for these.)_
+### Option A — try/catch + rollback in executeSpawn (recommended; bundle with 110)
+- Wrap the `runUpdateFn` call inside `executeSpawn` with try/catch. On throw, log + revert phase status to prior (typically 'pending') via the shared rollback hook from todo 110.
+- Pros: closes the duplicate-spawn case independently of 088/093's atomic-write fix; symmetric with the spawn-failure rollback work in 110/111.
+- Effort: small (one try/catch + reuse of the 110 rollback function).
+
+### Option B — Rely on 088/093 atomic-write only
+- Accept duplicate-spawn as residual risk; document.
+- Pros: zero additional work. Cons: 088/093 only close FS-class throws; non-FS exceptions (validation drift, etc.) still cause duplicate spawn.
 
 ## Recommended Action
 
-_Pending triage._
+**Option A — approved 2026-05-04 by coord.** Bundle with todo 110 in the cleanup wave; share the rollback hook. Closes the duplicate-spawn outcome regardless of throw class.
 
 ## Technical Details
 
@@ -32,7 +39,9 @@ _Pending triage._
 
 ## Acceptance Criteria
 
-- [ ] _(To be drafted during coord triage round.)_
+- [ ] Test: runUpdate throws after spawn → next tick does NOT re-spawn the same role.
+- [ ] Phase status correctly rolled back to prior on throw.
+- [ ] Shared rollback hook with todo 110 (DRY).
 
 ## Work Log
 

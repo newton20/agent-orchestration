@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "095"
 tags: [unit-11, orchestrate, post-pr-19, ce-review, reliability, abort-signal, listener-leak]
@@ -19,11 +19,17 @@ At `agent-orchestrator/scripts/orchestrate.js:2952`, the main loop registers `ad
 
 ## Proposed Solutions
 
-_(To be drafted during coord triage round; the /ce:review doc's brief format does not include solution options for these.)_
+### Option A — Register listener once outside the loop (recommended)
+- Move `signal.addEventListener('abort', handler, {once:true})` to a one-time registration at orchestrator start; the handler invokes a closure-captured per-tick action via a shared mutable reference.
+- Pros: one listener total across the lifetime of the orchestrator. Effort: small. Risk: low.
+
+### Option B — AbortController per tick
+- Create a fresh AbortController + signal at tick start; explicitly abort/dispose at tick end.
+- Pros: clean per-tick lifecycle. Cons: more allocation; signal hand-off to children that span ticks needs care.
 
 ## Recommended Action
 
-_Pending triage._
+**Option A — approved 2026-05-04 by coord.** Single listener registered at orchestrator start; per-tick state is captured by a closure variable the listener reads. Bundle in PR #23 cleanup wave.
 
 ## Technical Details
 
@@ -31,7 +37,9 @@ _Pending triage._
 
 ## Acceptance Criteria
 
-- [ ] _(To be drafted during coord triage round.)_
+- [ ] Listener count on the AbortSignal stays at 1 across N ticks.
+- [ ] Test: simulate 100 ticks → no MaxListenersExceededWarning fires.
+- [ ] Graceful shutdown removes the listener.
 
 ## Work Log
 

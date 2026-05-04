@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "101"
 tags: [unit-11, orchestrate, post-pr-19, ce-review, api-contract, schema-version, v15-compat]
@@ -19,11 +19,17 @@ At `agent-orchestrator/scripts/orchestrate.js:1208-1218`, manifest `schema_versi
 
 ## Proposed Solutions
 
-_(To be drafted during coord triage round; the /ce:review doc's brief format does not include solution options for these.)_
+### Option A — Major-version match; minor warns (recommended)
+- Parse `schema_version` as semver-ish (`MAJOR` or `MAJOR.MINOR`). Major-mismatch hard fails. Minor mismatch (newer than orchestrator's known) warns + proceeds.
+- Pros: forward-compat by design; V1.5 minor bumps don't break V1 manifests. Effort: small. Risk: low.
+
+### Option B — Strict version match
+- Current behavior; document as deliberate.
+- Cons: every minor bump breaks every existing manifest.
 
 ## Recommended Action
 
-_Pending triage._
+**Option A — approved 2026-05-04 by coord.** Parse as semver; major-only strict; minor warn-not-fail. Document the soft-band in `--help` and in the schema_version comment. Bundle in PR #23 cleanup wave.
 
 ## Technical Details
 
@@ -31,7 +37,11 @@ _Pending triage._
 
 ## Acceptance Criteria
 
-- [ ] _(To be drafted during coord triage round.)_
+- [ ] `schema_version: 1` accepted (V1 baseline).
+- [ ] `schema_version: 1.1` accepted with warning.
+- [ ] `schema_version: 2` rejected as hard major mismatch with structured error.
+- [ ] `schema_version: "1.0.x"` parsed as major=1; accepted.
+- [ ] Soft-band documented in `--help` text.
 
 ## Work Log
 

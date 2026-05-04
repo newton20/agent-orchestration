@@ -1,5 +1,5 @@
 ---
-status: pending
+status: ready
 priority: p2
 issue_id: "099"
 tags: [unit-11, orchestrate, post-pr-19, ce-review, reliability, security, eflagtimeout, flag-consume, cross-tick]
@@ -19,11 +19,18 @@ At `agent-orchestrator/scripts/orchestrate.js:2456`, the EFLAGTIMEOUT handling t
 
 ## Proposed Solutions
 
-_(To be drafted during coord triage round; the /ce:review doc's brief format does not include solution options for these.)_
+### Option A — Delete the .pending-* flag on EFLAGTIMEOUT (recommended)
+- On EFLAGTIMEOUT, immediately unlink the `.pending-<name>` flag. Slow tab consuming an empty/missing file gets nothing; orchestrator's next tick re-issues a fresh flag if the spawn is still warranted.
+- Pros: fits the file-protocol model (delete = orphan); no sidecar metadata. Effort: small.
+- Cons: if the slow tab eventually does start and consumes a *next-tick* flag for the SAME (phase, role), it gets the right prompt — but it's a different invocation. Acceptable: the flag content for a re-issue is correct for the new spawn.
+
+### Option B — Sidecar consumption metadata
+- Persist consumption attempt in `.pending-<name>.consuming-<pid>-<ts>` so cross-tick continuation can detect the orphan and abort.
+- Pros: more defensive. Cons: more file-protocol surface; more failure modes.
 
 ## Recommended Action
 
-_Pending triage._
+**Option A — approved 2026-05-04 by coord.** Delete the flag on EFLAGTIMEOUT; orchestrator's existing flag-write path on next tick handles re-issue. Bundle with 111 (shared spawning-marker rollback).
 
 ## Technical Details
 
@@ -31,7 +38,10 @@ _Pending triage._
 
 ## Acceptance Criteria
 
-- [ ] _(To be drafted during coord triage round.)_
+- [ ] Test: EFLAGTIMEOUT → `.pending-<name>` flag is deleted.
+- [ ] Test: orphan slow tab consumed previous tick's now-deleted flag → no prompt delivered (file missing); session terminates.
+- [ ] Test: next tick after EFLAGTIMEOUT re-issues a fresh flag if spawn still warranted.
+- [ ] Cross-tick wrong-prompt-to-wrong-agent eliminated.
 
 ## Work Log
 
