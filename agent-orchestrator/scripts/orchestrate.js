@@ -1231,16 +1231,19 @@ function decideTickActions(tickState, runState, opts) {
     }
     let reconciledRole = null;
     let snapshotPid = null;
-    // Codex round 6 P2: also detect "wrapper-alive + flag-still-present"
-    // cases. The pidSnapshot here excludes wrappers (the production
-    // health-check semantic), so a tab whose inner Claude hasn't
-    // registered yet but whose cmd/powershell wrapper IS alive shows
-    // as no-PID. If the .pending-<name> flag still exists, the tab
-    // is waiting for the SessionStart hook to fire — don't roll
-    // back to 'pending' (which would orphan the live wrapper). Defer
-    // the decision to the next tick when either the flag will be
-    // consumed (transitioning to a normal alive PID) or the tab
-    // genuinely died (no wrapper either).
+    // Codex round 6 P2 + round 7 P2: detect "wrapper-alive + flag-
+    // still-present" cases AND bound the deferral so an orphaned
+    // flag (no live process + no flag-consumer) doesn't defer
+    // forever. The pidSnapshot here excludes wrappers (production
+    // health-check semantic). A tab whose inner Claude hasn't
+    // registered yet but whose wrapper is alive shows as no-PID;
+    // if its .pending-<name> flag is FRESH (younger than the hook's
+    // FLAG_TTL_MS = 60s), the tab is still waiting for its hook
+    // to fire — defer reconciliation. If the flag is OLDER than
+    // FLAG_TTL_MS, the hook would itself skip it (per
+    // hooks/session-start.js soft TTL); the flag is orphaned and
+    // we proceed with the rollback so the phase doesn't stay
+    // stuck.
     let waitingTabFlag = false;
     const phaseHookOrchDir = (function () {
       // Resolve the workdir-side orchDir for this phase. executeSpawn
@@ -1262,22 +1265,39 @@ function decideTickActions(tickState, runState, opts) {
         break;
       }
       // No primary-snapshot hit — check if a .pending-* flag still
-      // exists for this role. If yes, the tab may be the wrapper-only
-      // case the resume sweep preserved (cell 1).
+      // exists AND is fresh (younger than the hook's FLAG_TTL_MS).
+      // An orphaned older flag is treated as "no waiting tab" so
+      // the rollback path runs and the phase doesn't stay stuck.
       const fp = path.join(phaseHookOrchDir, `.pending-${sessionName}`);
-      if ((opts._existsSync || fs.existsSync)(fp)) {
-        waitingTabFlag = true;
+      const existsFn = opts._existsSync || fs.existsSync;
+      const statFn = opts._statSync || fs.statSync;
+      if (existsFn(fp)) {
+        try {
+          const st = statFn(fp);
+          // Match the hook's FLAG_TTL_MS = 60_000. Anything older
+          // the hook would skip; we treat as orphaned for
+          // reconciliation purposes. The hard-TTL unlinker in the
+          // hook (10× soft TTL) will eventually remove the file.
+          const FLAG_TTL_MS_LOCAL = 60_000;
+          const ageMs = now - (typeof st.mtimeMs === 'number' ? st.mtimeMs : 0);
+          if (ageMs <= FLAG_TTL_MS_LOCAL) {
+            waitingTabFlag = true;
+          }
+        } catch (_) {
+          /* statSync race: treat as no waiting flag, proceed */
+        }
       }
     }
     if (reconciledRole === null && waitingTabFlag) {
       // Defer reconciliation — the resume sweep's cell-1 preservation
       // (or a same-tick spawn that hasn't propagated to WMI yet)
-      // means a tab is still waiting for its prompt.
+      // means a tab is still waiting for its prompt. Bounded by
+      // FLAG_TTL_MS above so an orphaned flag doesn't defer forever.
       actions.push({
         type: 'log',
         level: 'info',
         message:
-          `phase ${phase.id} reconciliation deferred: spawning marker + .pending-* flag present ` +
+          `phase ${phase.id} reconciliation deferred: spawning marker + fresh .pending-* flag ` +
           `but no inner-Claude PID yet (wrapper-only or pre-WMI-registration window); ` +
           `next tick will re-check`,
         phaseId: phase.id,
@@ -2934,10 +2954,21 @@ function executeSpawn(action, tickState, runState, opts, deps) {
       }
     }
     const ourFlagBasename = `.pending-${sessionName}`;
+    // Codex round 7 P2: honor cell-1-preserved flags from the resume
+    // sweep. opts._preservedResumeFlags is a Set of flag basenames
+    // that the resume sweep determined are still-valid prompts for
+    // live waiting tabs. Without this guard, an UNRELATED spawn in
+    // the same first-tick window would delete the preserved flag
+    // and orphan the waiting tab.
+    const preservedResumeFlags =
+      opts._preservedResumeFlags instanceof Set
+        ? opts._preservedResumeFlags
+        : null;
     for (const name of entries) {
       if (typeof name !== 'string') continue;
       if (!name.startsWith('.pending-')) continue;
       if (name === ourFlagBasename) continue; // we'll rename over it
+      if (preservedResumeFlags && preservedResumeFlags.has(name)) continue;
       // The new `.flagtmp-` prefix doesn't start with `.pending-`,
       // so it's already excluded. Legacy `.pending-*.tmp-*` from
       // older orchestrator versions: skip via substring check.
@@ -3920,6 +3951,16 @@ async function runOrchestrator(opts) {
               fs.unlinkSync(p);
               swept += 1;
             } catch (_) { /* best-effort */ }
+          }
+          // Codex round 7 P2: carry the cell-1-preserved set forward
+          // so executeSpawn's own stale-flag sweep (in the same
+          // first-tick window) doesn't delete the preserved flag.
+          // executeSpawn's sweep iterates ALL `.pending-*` in the
+          // hook orch dir except its own session — without this
+          // carry, a subsequent spawn this tick would clobber the
+          // waiting tab's flag and the tab would lose its prompt.
+          if (preservedFlags.size > 0) {
+            opts._preservedResumeFlags = preservedFlags;
           }
           logger(
             'info',
