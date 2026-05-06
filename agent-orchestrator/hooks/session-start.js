@@ -248,16 +248,35 @@ function runHook(opts) {
       }
       const postToken = extractSpawnToken(postContent);
       if (postToken !== tabToken) {
-        // Best-effort restore: rename consuming back to pending so
-        // the intended new tab's hook still finds the fresh prompt.
-        try {
-          fsLib.renameSync(consumingPath, cand.path);
-        } catch (err) {
-          // Restore failed (target may already exist from a yet-
-          // newer flag, or FS error). Log loudly — this is the
-          // protocol-corruption window. Cleanup the consuming-*
-          // sidecar so no stale file lingers.
-          logErr(`post-rename token mismatch + restore failed for ${cand.name}: ${err.message}`);
+        // Codex round 18 + 21 P2: best-effort restore the fresh
+        // flag, but DO NOT clobber a yet-newer pending flag. Node's
+        // renameSync replaces an existing target on most platforms
+        // — without the existsSync guard, restore could overwrite
+        // a third-tick fresh flag with our stale .consuming-* file
+        // (older than what's on disk), corrupting the protocol.
+        //
+        // Race window: existsSync → renameSync is not atomic; a
+        // brand-new flag could be written between the check and
+        // the rename. The window is narrow in practice (orchestrator
+        // writes flags with `.flagtmp-` prefix, then renames atomically;
+        // the prompt-write+rename happens entirely under the
+        // orchestrator lock). If we lose the race, log loudly and
+        // unlink — surfacing a missing prompt is better than silent
+        // corruption.
+        let restored = false;
+        if (!fsLib.existsSync(cand.path)) {
+          try {
+            fsLib.renameSync(consumingPath, cand.path);
+            restored = true;
+          } catch (err) {
+            logErr(`post-rename token mismatch + restore failed for ${cand.name}: ${err.message}`);
+          }
+        } else {
+          logErr(
+            `post-rename token mismatch on ${cand.name}: a newer flag is already on disk; cannot restore stale .consuming-* (likely cross-tick race)`
+          );
+        }
+        if (!restored) {
           tryUnlink(fsLib, consumingPath);
         }
         continue;
