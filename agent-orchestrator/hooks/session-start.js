@@ -199,11 +199,35 @@ function runHook(opts) {
       continue;
     }
 
+    // Re-stat via the consuming path for the size guard. Avoids TOCTOU on
+    // the original flag name (rename is atomic, so the inode is ours now).
+    //
+    // Codex round 2 P2: stat MUST happen BEFORE the post-rename
+    // revalidation read. Pre-fix the revalidation called readFileSync
+    // unconditionally — a swapped-content attack could replace the
+    // tiny token-prefixed flag with a multi-MB blob between peek and
+    // rename, and the revalidation would OOM-read it before the
+    // size check ran. Stat first; reject oversize; only then
+    // proceed to revalidation reads.
+    let sizeBytes;
+    try { sizeBytes = fsLib.statSync(consumingPath).size; }
+    catch (err) {
+      logErr(`stat ${consumingPath}: ${err.message}`);
+      tryUnlink(fsLib, consumingPath);
+      continue;
+    }
+    if (sizeBytes > MAX_FLAG_BYTES) {
+      logErr(`flag ${cand.name} exceeds ${MAX_FLAG_BYTES} bytes (got ${sizeBytes})`);
+      tryUnlink(fsLib, consumingPath);
+      return '{}';
+    }
+
     // Todo 099: post-rename revalidation. A race between peek and
     // rename could swap the file content (extremely unlikely, but
     // the existing protocol assumes atomic-rename guarantees only
     // on the rename itself). Re-read post-rename and bail if the
-    // token no longer matches the tab-bound token.
+    // token no longer matches the tab-bound token. Now bounded by
+    // the size guard above.
     if (tabToken) {
       let postContent;
       try {
@@ -223,21 +247,6 @@ function runHook(opts) {
         tryUnlink(fsLib, consumingPath);
         continue;
       }
-    }
-
-    // Re-stat via the consuming path for the size guard. Avoids TOCTOU on
-    // the original flag name (rename is atomic, so the inode is ours now).
-    let sizeBytes;
-    try { sizeBytes = fsLib.statSync(consumingPath).size; }
-    catch (err) {
-      logErr(`stat ${consumingPath}: ${err.message}`);
-      tryUnlink(fsLib, consumingPath);
-      continue;
-    }
-    if (sizeBytes > MAX_FLAG_BYTES) {
-      logErr(`flag ${cand.name} exceeds ${MAX_FLAG_BYTES} bytes (got ${sizeBytes})`);
-      tryUnlink(fsLib, consumingPath);
-      return '{}';
     }
 
     let content;

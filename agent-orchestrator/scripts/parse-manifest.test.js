@@ -918,11 +918,11 @@ test('runUpdate [todo 102] warns on truly-unknown fields (defense-in-depth)', ()
 
 // -------------------- Todo 100: permission_mode enum --------------------
 
-test('VALID_PERMISSION_MODES [todo 100] is exported + frozen + contains documented enum', () => {
+test('VALID_PERMISSION_MODES [todo 100 + codex round 2 P2] is exported + frozen + includes auto for compat', () => {
   assert.ok(Array.isArray(VALID_PERMISSION_MODES));
   assert.deepStrictEqual(
     [...VALID_PERMISSION_MODES],
-    ['plan', 'default', 'acceptEdits', 'bypassPermissions']
+    ['auto', 'plan', 'default', 'acceptEdits', 'bypassPermissions']
   );
   assert.ok(Object.isFrozen(VALID_PERMISSION_MODES));
 });

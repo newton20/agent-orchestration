@@ -3037,12 +3037,15 @@ function executeSpawn(action, tickState, runState, opts, deps) {
       // (codex round 7 P1).
       if (flagPath) bestEffortUnlink(unlinkSync, flagPath);
       // Todo 090 + 110: roll back the pre-spawn `'spawning'` marker via
-      // the shared helper so the next tick sees the phase as pending
-      // (not stuck in 'spawning' with no matching live PID). This is
-      // the pre-spawnFn-launch failure path 110's RA codifies — the
-      // spawn never produced a live tab, so rollback is safe (no
-      // orphan tab to worry about).
+      // the shared helper so the next tick sees the phase as the
+      // PRE-SPAWN state (not stuck in 'spawning' with no matching
+      // live PID). Codex round 2 P1: the prior status depends on
+      // dispatch mode — initial spawns came from 'pending', but
+      // recovery and review_retry came from 'running' and rolling
+      // back to 'pending' would lose review state and bypass retry
+      // accounting.
       if (!dryRun) {
+        const priorStatus = isRecovery || isReviewRetry ? 'running' : 'pending';
         rollbackSpawningMarker({
           manifestPath,
           phaseId: phase.id,
@@ -3050,6 +3053,7 @@ function executeSpawn(action, tickState, runState, opts, deps) {
           runUpdateFn,
           logger,
           reason: 'spawnFn_threw',
+          priorStatus,
         });
       }
       throw e;
@@ -3137,6 +3141,11 @@ function executeSpawn(action, tickState, runState, opts, deps) {
         // tab's hook reads its bound AGENT_FLAG_TOKEN, sees
         // mismatch, and skips without consuming the fresh flag.
         if (!dryRun) {
+          // Codex round 2 P1: preserve the pre-spawn state on rollback.
+          // For recovery / review_retry dispatches the phase was
+          // 'running' before the marker was written; rolling back to
+          // 'pending' would corrupt review state.
+          const priorStatus = isRecovery || isReviewRetry ? 'running' : 'pending';
           rollbackSpawningMarker({
             manifestPath,
             phaseId: phase.id,
@@ -3144,6 +3153,7 @@ function executeSpawn(action, tickState, runState, opts, deps) {
             runUpdateFn,
             logger,
             reason: 'EFLAGTIMEOUT',
+            priorStatus,
           });
         }
         const err = new Error(
@@ -4028,11 +4038,29 @@ function rollbackSpawningMarker({
   runUpdateFn,
   logger,
   reason,
+  // Codex round 2 P1: callers passing a non-initial dispatch
+  // (`recovery` or `review_retry`) MUST supply `priorStatus: 'running'`
+  // so the rollback restores the pre-spawn `running` state instead
+  // of corrupting it to `pending`. Pre-fix the helper unconditionally
+  // wrote `pending`, which made the next tick treat a recovery /
+  // review_retry phase as fresh pending work — losing review_stage /
+  // review_iteration and bypassing retry accounting.
+  //
+  // Default 'pending' preserves the existing contract for the initial
+  // dispatch path (which is the only call site that doesn't pass a
+  // prior status).
+  priorStatus = 'pending',
+  // Pass `priorDispatchedAt: <iso>` to keep the original dispatch
+  // breadcrumb when the marker is rolled back to a non-initial
+  // state. Default empty string clears it (matches the initial-
+  // dispatch contract).
+  priorDispatchedAt = '',
 }) {
-  const r = runUpdateFn(manifestPath, phaseId, {
-    status: 'pending',
-    dispatched_at: '',
-  });
+  const updates = {
+    status: priorStatus,
+    dispatched_at: priorDispatchedAt,
+  };
+  const r = runUpdateFn(manifestPath, phaseId, updates);
   if (!r || !r.ok) {
     logger('warn', `pre-spawn marker rollback failed (${reason}): ${(r && r.error) || 'unknown error'}`, {
       phaseId,

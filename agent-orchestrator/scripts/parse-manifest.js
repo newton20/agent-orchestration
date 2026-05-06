@@ -70,8 +70,18 @@ const KNOWN_UPDATE_FIELDS = [
 // orchestrate.js when it forwards permission_mode into the inner Claude
 // command line. Whitespace / multi-token strings would otherwise inject
 // arbitrary flags into the spawned process; the enum guarantees only
-// the documented Claude Code modes survive the validator.
+// known modes survive the validator.
+//
+// Codex round 2 P2: include 'auto' as a backward-compat value. The
+// repo's docs (docs/manifest-reference.md) and the default launcher
+// (`--permission-mode auto`) historically used 'auto'; existing
+// manifests that explicitly spelled the default would otherwise fail
+// validation. The four documented Claude Code modes (plan | default |
+// acceptEdits | bypassPermissions) remain — 'auto' is the legacy
+// passthrough that spawn-session emits when permission_mode is
+// omitted; keeping it accepted preserves the existing contract.
 const VALID_PERMISSION_MODES = Object.freeze([
+  'auto',
   'plan',
   'default',
   'acceptEdits',
