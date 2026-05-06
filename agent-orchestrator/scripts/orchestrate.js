@@ -3024,6 +3024,11 @@ function executeSpawn(action, tickState, runState, opts, deps) {
         title: `${sessionName} — ${phase.title || phase.id}`,
         pluginDir: effectivePluginDir,
         launcher: effectiveLauncher,
+        // Todo 099: propagate the per-spawn token so the spawned tab
+        // sees AGENT_FLAG_TOKEN in its environment. The hook's
+        // pre-rename token filter then rejects any flag whose
+        // embedded token doesn't match.
+        spawnToken,
       });
     } catch (e) {
       // Spawn failed AFTER the flag was written. Clean up the flag
@@ -3121,20 +3126,16 @@ function executeSpawn(action, tickState, runState, opts, deps) {
         bestEffortUnlink(unlinkSync, flagPath);
         // Todo 111: roll back the pre-spawn 'spawning' marker on
         // EFLAGTIMEOUT so the next tick is eligible to re-dispatch.
-        // Pre-fix the marker stayed stranded; the existing
-        // reconciliation eventually classified it as crashed but
-        // wasted a retry-count increment.
         //
-        // Critical 099 sequencing: this rollback is SAFE only when
-        // 099's out-of-band token binding is in place. Pre-099, an
-        // orphan tab from the timed-out spawn was still alive and
-        // would consume the next-tick fresh `.pending-*` flag. Now
-        // that the orchestrator stamps the flag content with a
-        // per-spawn token (the `# spawn_token: <uuid>` header) and
-        // the SessionStart hook does pre-rename token filtering,
-        // an orphan tab whose argv-token was bound to the OLD
-        // spawn's token cannot consume the next-tick fresh flag —
-        // safe to roll back and re-dispatch.
+        // Codex round 1 (P1) confirmed: this rollback is SAFE only
+        // when 099's spawn-session env propagation is in place. We
+        // now (codex round 1 fix) prepend the AGENT_FLAG_TOKEN
+        // env-set to the inner cmd / powershell command line in
+        // buildSpawnCommand, so the orphan tab from a timed-out
+        // spawn carries the OLD spawn's token. The orchestrator's
+        // next-tick fresh flag carries a NEW token; the orphan
+        // tab's hook reads its bound AGENT_FLAG_TOKEN, sees
+        // mismatch, and skips without consuming the fresh flag.
         if (!dryRun) {
           rollbackSpawningMarker({
             manifestPath,
@@ -3555,6 +3556,21 @@ async function runOrchestrator(opts) {
       const statusFn = opts._loadStatus || loadStatus;
       const ml = loadFn(opts.manifestPath);
       const sl = statusFn(opts.manifestPath);
+      // Codex round 1 P2 fix: resolve the HOOK orch dir, NOT the
+      // manifest-dir orch dir. executeSpawn writes flags under
+      // orchDirFor(resolvedWorkdir); for manifests with a separate
+      // workdir, those two paths diverge. Pre-fix the resume sweep
+      // checked/swept the manifest-dir orchDir and missed the
+      // workdir-side flags entirely — misclassifying every
+      // spawning-with-flag case as cell 4 (no flag) and adopting
+      // every spawning-with-no-flag-on-disk case as cell 2.
+      let resumeOrchDir = orchDir;
+      if (ml.ok && ml.manifest && typeof ml.manifest.workdir === 'string') {
+        const wd = path.isAbsolute(ml.manifest.workdir)
+          ? ml.manifest.workdir
+          : path.resolve(manifestDir, ml.manifest.workdir);
+        resumeOrchDir = orchDirFor(wd);
+      }
       if (ml.ok && sl.ok && sl.status && sl.status.phases) {
         // Build a pidSnapshot for every spawning (phase, role).
         const spawningEntries = [];
@@ -3596,7 +3612,7 @@ async function runOrchestrator(opts) {
           for (const { phaseId, role } of spawningEntries) {
             const sessionName = defaultSessionName(phaseId, role);
             const flagBasename = `.pending-${sessionName}`;
-            const flagAbsPath = path.join(orchDir, flagBasename);
+            const flagAbsPath = path.join(resumeOrchDir, flagBasename);
             const snap = pidSnapshot.get(sessionName);
             const liveAlive = !!(snap && Number.isInteger(snap.pid) && snap.pid > 0);
             const existsSync = opts._existsSync || fs.existsSync;
@@ -3655,14 +3671,17 @@ async function runOrchestrator(opts) {
               );
             }
           }
-          // Sweep all .pending-* in the orch dir EXCEPT preservedFlags.
-          // Each subsequent spawn writes its own flag after the sweep.
+          // Sweep all .pending-* in the (workdir-side) orch dir EXCEPT
+          // preservedFlags. Each subsequent spawn writes its own flag
+          // after the sweep. Use resumeOrchDir (= workdir's orchDir
+          // when manifest declares a separate workdir) — codex round 1
+          // P2 caught the misalignment with executeSpawn's write site.
           let entries = [];
           try {
-            entries = (opts._readdirSync || fs.readdirSync)(orchDir);
+            entries = (opts._readdirSync || fs.readdirSync)(resumeOrchDir);
           } catch (e) {
             if (e && e.code !== 'ENOENT') {
-              logger('warn', `resume sweep readdir failed at ${orchDir}: ${e.message}`);
+              logger('warn', `resume sweep readdir failed at ${resumeOrchDir}: ${e.message}`);
             }
           }
           let swept = 0;
@@ -3671,7 +3690,7 @@ async function runOrchestrator(opts) {
             if (!name.startsWith('.pending-')) continue;
             if (preservedFlags.has(name)) continue;
             if (name.includes('.tmp-')) continue;
-            const p = path.join(orchDir, name);
+            const p = path.join(resumeOrchDir, name);
             try {
               fs.unlinkSync(p);
               swept += 1;

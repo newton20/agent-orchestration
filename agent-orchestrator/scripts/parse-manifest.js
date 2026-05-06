@@ -999,7 +999,23 @@ function runUpdate(manifestPath, phaseId, updates, opts = {}) {
     statusPath = loadResult.statusPath;
   }
 
-  const existing = status.phases[phaseId] || {};
+  // Todo 103 + codex round 1 P2: snapshot the prior in-memory state
+  // BEFORE the mutation, so a failed atomic write can roll the
+  // shared cache back to match disk. Pre-fix, when the tick-level
+  // _loadedStatus seam was used, a failed write for phase A would
+  // leave the cache reflecting the would-be-written state; a later
+  // successful write for phase B would then serialize the entire
+  // cache (including A's failed mutation) — silently persisting A's
+  // 'spawning' marker even though no tab launched.
+  //
+  // Snapshot the per-phase entry and the prior `updated_at`. On
+  // write failure, restore both. The snapshot only matters when
+  // `_loadedStatus` is shared across calls; with the disk-load path
+  // each call gets a fresh `status` so a failed write naturally
+  // discards the mutation when the function returns.
+  const priorEntry = status.phases[phaseId];
+  const priorUpdatedAt = status.updated_at;
+  const existing = priorEntry || {};
   status.phases[phaseId] = { ...existing, ...updates };
   status.updated_at = new Date().toISOString();
 
@@ -1025,6 +1041,19 @@ function runUpdate(manifestPath, phaseId, updates, opts = {}) {
   } catch (e) {
     // Best-effort cleanup of the tmp if the rename failed.
     try { unlinkSync(tmpPath); } catch (_) { /* ignore */ }
+    // Codex round 1 P2 fix: restore the shared cache to its
+    // pre-mutation state so a later successful runUpdate doesn't
+    // serialize this failed attempt's mutation.
+    if (priorEntry === undefined) {
+      delete status.phases[phaseId];
+    } else {
+      status.phases[phaseId] = priorEntry;
+    }
+    if (priorUpdatedAt === undefined) {
+      delete status.updated_at;
+    } else {
+      status.updated_at = priorUpdatedAt;
+    }
     return {
       ok: false,
       error: `failed to persist manifest-status at ${statusPath}: ${e.message}`,
