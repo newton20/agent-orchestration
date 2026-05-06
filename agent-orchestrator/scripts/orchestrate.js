@@ -2786,22 +2786,21 @@ function executeSpawn(action, tickState, runState, opts, deps) {
       // soft-TTL elapses) doesn't pick up this dead session's prompt
       // (codex round 7 P1).
       if (flagPath) bestEffortUnlink(unlinkSync, flagPath);
-      // Todo 090: also reset the pre-spawn marker so the next tick
-      // sees the phase as pending (not stuck in 'spawning' with no
-      // matching live session). Best-effort — failure to roll back
-      // is non-fatal because the resume reconciliation path also
-      // handles 'spawning' + no live PID.
+      // Todo 090 + 110: roll back the pre-spawn `'spawning'` marker via
+      // the shared helper so the next tick sees the phase as pending
+      // (not stuck in 'spawning' with no matching live PID). This is
+      // the pre-spawnFn-launch failure path 110's RA codifies — the
+      // spawn never produced a live tab, so rollback is safe (no
+      // orphan tab to worry about).
       if (!dryRun) {
-        const rollbackR = runUpdateFn(manifestPath, phase.id, {
-          status: 'pending',
-          dispatched_at: '',
+        rollbackSpawningMarker({
+          manifestPath,
+          phaseId: phase.id,
+          role,
+          runUpdateFn,
+          logger,
+          reason: 'spawnFn_threw',
         });
-        if (!rollbackR.ok) {
-          logger('warn', `pre-spawn marker rollback failed: ${rollbackR.error}`, {
-            phaseId: phase.id,
-            role,
-          });
-        }
       }
       throw e;
     }
@@ -2942,10 +2941,36 @@ function executeSpawn(action, tickState, runState, opts, deps) {
       // — both are non-recovery starts of the role's session).
       updates.retry_count = 0;
     }
-    const r = runUpdateFn(manifestPath, phase.id, updates);
-    if (!r.ok) {
-      // Don't throw — the spawn already happened. Surface for triage.
-      logger('error', `runUpdate post-spawn failed: ${r.error}`, {
+    // Todo 096: wrap the post-spawn runUpdate in try/catch. The
+    // spawnFn ALREADY RETURNED — the wt tab is live. If runUpdate
+    // throws (FS error, validation drift, etc.) we MUST NOT touch the
+    // manifest-status: leaving the `'spawning'` marker intact lets
+    // the next tick's reconciliation pass (orchestrate.js's spawning-
+    // marker loop in decideTickActions) detect `'spawning'` + a live
+    // PID match and adopt the session — transitioning to 'running'
+    // and persisting pid lazily.
+    //
+    // **DO NOT call rollbackSpawningMarker here.** That helper is for
+    // pre-spawnFn-launch failures only (todo 110). At THIS catch
+    // site the spawn launched and the tab is alive; rolling the
+    // marker back to 'pending' would orphan the live tab AND make
+    // the phase eligible for re-dispatch on the next tick — exactly
+    // the duplicate-spawn bug 088 / 093 / 096 are designed to close.
+    //
+    // {ok: false} return + thrown errors are both handled here so
+    // a future runUpdate refactor that converts soft-fails to
+    // throws can't reintroduce the bug.
+    try {
+      const r = runUpdateFn(manifestPath, phase.id, updates);
+      if (!r || !r.ok) {
+        logger('error', `runUpdate post-spawn failed: ${(r && r.error) || 'unknown error'}`, {
+          phaseId: phase.id,
+          role,
+        });
+      }
+    } catch (e) {
+      // Marker stays as 'spawning'; reconciliation adopts next tick.
+      logger('error', `runUpdate post-spawn threw (marker left 'spawning' for reconciliation): ${e && e.message ? e.message : String(e)}`, {
         phaseId: phase.id,
         role,
       });
@@ -3514,6 +3539,62 @@ async function runOrchestrator(opts) {
  * orchestrator survives a failed cleanup, and a stale signal will
  * surface as a noisy log next tick rather than crashing the loop.
  */
+/**
+ * Todo 110: shared rollback helper for the pre-spawnFn-launch failure
+ * paths in `executeSpawn`. Reverts the `'spawning'` marker (written
+ * before the spawn launches) back to `'pending'` + clears
+ * `dispatched_at` so the next tick is eligible to re-dispatch the
+ * phase fresh.
+ *
+ * **Scope discipline (codex round 1+10 corrections to PR #22 RA):**
+ *
+ *   - Call from `executeSpawn`'s spawnFn-throws catch — the spawn
+ *     never produced a live tab, so rolling the marker back is safe.
+ *   - Call from the EFLAGTIMEOUT branch ONLY when todo 099's
+ *     out-of-band token binding is in place. Pre-099, an orphan tab
+ *     from the timed-out spawn is still alive and would consume the
+ *     next tick's fresh `.pending-<name>` flag, restoring the cross-
+ *     tick wrong-prompt-to-wrong-agent bug. Post-099, the orphan's
+ *     argv-token can't match the new flag's file-token, so the
+ *     orphan's hook filters the fresh flag out.
+ *   - DO NOT call from the post-spawn `runUpdate`-throw path
+ *     (todo 096). When `spawnFn` already returned successfully,
+ *     the wt tab is live; rolling back the marker would orphan the
+ *     tab and trigger duplicate dispatch on the next tick (the
+ *     opposite of the intended fix). The reconciliation pass at
+ *     `decideTickActions` (orchestrate.js's spawning-marker loop)
+ *     adopts the live session next tick, so leaving the marker
+ *     intact is the correct behavior there.
+ *
+ * Failure to roll back is logged and swallowed — the resume
+ * reconciliation path also handles `'spawning'` + no-live-PID, so
+ * a missed rollback is recoverable, just one tick of churn.
+ *
+ * Returns `true` on success, `false` if the rollback runUpdate failed
+ * (logged via the supplied logger).
+ */
+function rollbackSpawningMarker({
+  manifestPath,
+  phaseId,
+  role,
+  runUpdateFn,
+  logger,
+  reason,
+}) {
+  const r = runUpdateFn(manifestPath, phaseId, {
+    status: 'pending',
+    dispatched_at: '',
+  });
+  if (!r || !r.ok) {
+    logger('warn', `pre-spawn marker rollback failed (${reason}): ${(r && r.error) || 'unknown error'}`, {
+      phaseId,
+      role,
+    });
+    return false;
+  }
+  return true;
+}
+
 function bestEffortUnlink(unlinkSync, p) {
   try {
     unlinkSync(p);

@@ -3714,6 +3714,105 @@ test('W4 [codex round 6 P2] --max-ticks with running phases left → ok=false su
 // X — codex round 7 regression tests
 // =========================================================================
 
+test('X1b [todo 110] spawn failure rolls back the spawning marker to pending (calls rollbackSpawningMarker helper)', () => {
+  const dir = mkTmp('orch-X1b');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const updates = [];
+    const trackingRunUpdate = (manifestPath, phaseId, u) => {
+      updates.push({ phaseId, ...u });
+      return { ok: true };
+    };
+    O.executeActions(
+      [{ type: 'spawn', phaseId: 'phase-1', role: 'impl', mode: 'initial', iteration: 1 }],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: () => {
+          throw new Error('wt unavailable');
+        },
+        _generatePrompt: makeFakeGenerate(),
+        _runUpdate: trackingRunUpdate,
+        logger: silentLogger(),
+        projectName: 'p',
+      }
+    );
+    // The spawn-throw path writes (1) the pre-spawn 'spawning' marker
+    // and then (2) the rollback to 'pending' via the shared helper.
+    const markerWrites = updates.filter((u) => u.status === 'spawning');
+    const rollbackWrites = updates.filter(
+      (u) => u.status === 'pending' && u.dispatched_at === ''
+    );
+    assert.strictEqual(markerWrites.length, 1, 'pre-spawn marker written exactly once');
+    assert.strictEqual(rollbackWrites.length, 1, 'rollback to pending written exactly once');
+    // Order matters — rollback must come AFTER marker.
+    const markerIdx = updates.findIndex((u) => u.status === 'spawning');
+    const rollbackIdx = updates.findIndex(
+      (u) => u.status === 'pending' && u.dispatched_at === ''
+    );
+    assert.ok(markerIdx < rollbackIdx, 'rollback follows marker write');
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('X1c [todo 096] post-spawn runUpdate throw LEAVES the spawning marker intact (NOT rolled back)', () => {
+  // 096's contract: when spawnFn already returned successfully (the wt
+  // tab is live), a thrown post-spawn runUpdate must NOT touch the
+  // manifest-status. The 'spawning' marker stays so the next tick's
+  // reconciliation pass can adopt the live session via PID match.
+  // Rolling back here would orphan the live tab and re-introduce the
+  // duplicate-spawn class todo 088 / 093 / 096 are designed to close.
+  const dir = mkTmp('orch-X1c');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const updates = [];
+    let runUpdateCalls = 0;
+    const trackingRunUpdate = (manifestPath, phaseId, u) => {
+      runUpdateCalls += 1;
+      updates.push({ phaseId, ...u });
+      // First call = pre-spawn marker (write 'spawning'). Succeed.
+      // Second call = post-spawn runUpdate (transition to 'running'
+      //   + persist pid/started_at). THROW.
+      if (runUpdateCalls === 2) {
+        throw new Error('post-spawn runUpdate FS error');
+      }
+      return { ok: true };
+    };
+    O.executeActions(
+      [{ type: 'spawn', phaseId: 'phase-1', role: 'impl', mode: 'initial', iteration: 1 }],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: makeFakeSpawnSession(),
+        _generatePrompt: makeFakeGenerate(),
+        _runUpdate: trackingRunUpdate,
+        logger: silentLogger(),
+        projectName: 'p',
+      }
+    );
+    // Marker write succeeded (first runUpdate call).
+    const markerWrites = updates.filter((u) => u.status === 'spawning');
+    assert.strictEqual(markerWrites.length, 1, 'pre-spawn marker written once');
+    // CRITICAL: NO rollback to 'pending' — the marker must remain
+    // 'spawning' so reconciliation adopts on the next tick.
+    const rollbackWrites = updates.filter(
+      (u) => u.status === 'pending' && u.dispatched_at === ''
+    );
+    assert.strictEqual(
+      rollbackWrites.length,
+      0,
+      'post-spawn runUpdate throw must NOT roll back the spawning marker'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
 test('X1 [codex round 7 P1] spawn failure unlinks the flag file (no leak)', () => {
   const dir = mkTmp('orch-X1');
   try {
@@ -3775,14 +3874,45 @@ test('X2 [codex round 7 P2] terminal completion observed same-tick (mark_phase_c
   }
 });
 
-test('X3 [codex round 7 P1] flag-consume serialization defaults to 0ms when test seam injects spawn', () => {
-  // Documented contract: tests pass `_spawnSession` and the flag
-  // wait collapses to 0ms so the suite stays fast. This test
-  // exercises the path indirectly by asserting the suite doesn't
-  // hang; total test runtime is monitored at the npm-test level.
-  // The presence of the seam is the contract; no functional check
-  // beyond "tests don't hang."
-  assert.ok(true);
+test('X3 [codex round 7 P1 + todo 107.a] flag-consume defaults to 0ms when test seam injects spawn (no explicit override)', () => {
+  // Todo 107.a: pre-fix this test was vacuous (`assert.ok(true)`)
+  // and over-stated coverage by 1. The actual contract: when
+  // tests pass `_spawnSession` AND don't override `flagConsumeTimeoutMs`,
+  // the flag-consume busy-wait collapses to 0ms so the suite stays
+  // fast. We verify functionally by running executeActions through
+  // the fake-spawn path with no explicit timeout and asserting the
+  // call returns quickly even though the production default would
+  // have been 10s.
+  const dir = mkTmp('orch-X3');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const fakeSpawn = makeFakeSpawnSession();
+    const t0 = Date.now();
+    O.executeActions(
+      [{ type: 'spawn', phaseId: 'phase-1', role: 'impl', mode: 'initial', iteration: 1 }],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: fakeSpawn,
+        _generatePrompt: makeFakeGenerate(),
+        _runUpdate: makeFakeRunUpdate(),
+        // No flagConsumeTimeoutMs override — the fake-spawn detection
+        // collapses to 0; production default is 10_000.
+        logger: silentLogger(),
+        projectName: 'p',
+      }
+    );
+    const elapsed = Date.now() - t0;
+    assert.ok(
+      elapsed < 1000,
+      `fake-spawn flag-consume must collapse to 0ms (production default would be 10000ms); took ${elapsed}ms`
+    );
+    assert.strictEqual(fakeSpawn.calls.length, 1, 'fake spawn ran exactly once');
+  } finally {
+    rmrf(dir);
+  }
 });
 
 // =========================================================================
@@ -5172,10 +5302,16 @@ test('AK2 [codex round 20 P2] flag for THIS dispatch is not deleted by the sweep
 // AL — codex round 21 regression tests
 // =========================================================================
 
-test('AL1 [codex round 21 P2] tmp flag basename does NOT match the hook FLAG_NAME_RE', () => {
-  // The hook's FLAG_NAME_RE is /^\.pending-[A-Za-z0-9._-]+$/.
-  // Our tmp prefix is `.flagtmp-` which must NOT match.
-  const FLAG_NAME_RE = /^\.pending-[A-Za-z0-9._-]+$/;
+test('AL1 [codex round 21 P2 + todo 107.b] tmp flag basename does NOT match the hook FLAG_NAME_RE (imported from source-of-truth)', () => {
+  // Todo 107.b: import FLAG_NAME_RE from `../hooks/session-start`
+  // instead of duplicating the regex literal here. If the source-of-
+  // truth regex changes (e.g. to add a new ID character class),
+  // this test must follow automatically — copying the literal
+  // silently de-syncs invariant coverage from the source. The hook
+  // and parse-manifest's VALID_ID_RE already share the class via
+  // the docs/todos/006 / 027 contract; this test is the
+  // orchestrator-side mirror.
+  const { FLAG_NAME_RE } = require('../hooks/session-start');
   const goodTmp = '.flagtmp-orch-phase-1-impl-1234-5678';
   const badLegacyTmp = '.pending-orch-phase-1-impl.tmp-1234-5678';
   assert.strictEqual(FLAG_NAME_RE.test(goodTmp), false);
