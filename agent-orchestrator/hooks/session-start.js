@@ -259,7 +259,21 @@ function runHook(opts) {
 
     tryUnlink(fsLib, consumingPath);  // best-effort; warn-only on failure
 
-    return JSON.stringify({ additionalContext: content });
+    // Todo 099 + codex round 9 P2: strip the spawn-token header
+    // before delivery. The orchestrator embeds `# spawn_token: <uuid>`
+    // as the first line for cross-tick poison-pill protection; the
+    // hook validates it (above) but the AGENT should never see it
+    // — the header is internal control metadata, not part of the
+    // prompt. Without stripping, every token-bound orchestrated
+    // agent's prompt would start with an internal-only line.
+    let deliveredContent = content;
+    if (extractSpawnToken(deliveredContent) !== null) {
+      const newlineIdx = deliveredContent.indexOf('\n');
+      deliveredContent =
+        newlineIdx === -1 ? '' : deliveredContent.slice(newlineIdx + 1);
+    }
+
+    return JSON.stringify({ additionalContext: deliveredContent });
   }
 
   return '{}';
