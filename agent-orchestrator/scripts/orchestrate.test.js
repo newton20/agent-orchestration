@@ -2604,17 +2604,27 @@ test('O6c [todo 106] --project-name followed by another flag → error', () => {
   );
 });
 
-test('O6d [todo 106] --plugin-dir=<--special-path> escape hatch via `=` form', () => {
-  const a = O.parseCliArgs([
-    'node',
-    's.js',
-    '--plugin-dir=--special-path',
-    '--resume',
-    'bar.yaml',
-  ]);
-  assert.strictEqual(a.pluginDir, '--special-path');
-  assert.strictEqual(a.resume, true);
-  assert.strictEqual(a.manifestPath, 'bar.yaml');
+test('O6d [todo 106 + codex round 12 P3] --plugin-dir=<path> escape hatch via `=` form (still validates existence)', () => {
+  // The `=` form is the escape hatch for paths that begin with `-`.
+  // Codex round 12 P3 made the `=` form ALSO validate existence
+  // (parity with the bare form). To exercise both, use a real path
+  // that starts with `-` would require creating one — instead use
+  // the existing test-tmp dir as the value.
+  const dir = mkTmp('orch-O6d');
+  try {
+    const a = O.parseCliArgs([
+      'node',
+      's.js',
+      `--plugin-dir=${dir}`,
+      '--resume',
+      'bar.yaml',
+    ]);
+    assert.strictEqual(a.pluginDir, dir);
+    assert.strictEqual(a.resume, true);
+    assert.strictEqual(a.manifestPath, 'bar.yaml');
+  } finally {
+    rmrf(dir);
+  }
 });
 
 test('O6e [todo 106] --project-name=<value> escape hatch', () => {

@@ -3926,10 +3926,19 @@ async function runOrchestrator(opts) {
                   reason: 'resume_orphan_with_flag',
                   priorStatus: inferredPriorStatus,
                 });
+                // Codex round 12 P2: charge the failed mid-spawn
+                // attempt against retry_count — symmetric with
+                // decideTickActions's reconciliation rollback. A
+                // phase that repeatedly crashes mid-spawn across
+                // restarts must consume the recovery budget; pre-
+                // fix it could be retried indefinitely.
+                const shape = validateRetryCountShape(phaseEntry);
+                const cur = shape.ok ? shape.value : 0;
+                runUpdateFn(opts.manifestPath, phaseId, { retry_count: cur + 1 });
                 try { fs.unlinkSync(flagAbsPath); } catch (_) { /* ignore */ }
                 logger(
                   'info',
-                  `resume reconciliation [cell 3]: rolled back marker, swept orphan ${flagBasename}`,
+                  `resume reconciliation [cell 3]: rolled back marker (retry_count ${cur} → ${cur + 1}), swept orphan ${flagBasename}`,
                   { phaseId, role }
                 );
                 phaseDecided.add(phaseId);
@@ -3954,9 +3963,16 @@ async function runOrchestrator(opts) {
                   reason: 'resume_clean_rollback',
                   priorStatus: inferredPriorStatus,
                 });
+                // Codex round 12 P2: same retry_count increment as
+                // cell 3. A phase whose pre-spawn marker was written
+                // but whose tab never started counts as one
+                // recovery-budget attempt.
+                const shape = validateRetryCountShape(phaseEntry);
+                const cur = shape.ok ? shape.value : 0;
+                runUpdateFn(opts.manifestPath, phaseId, { retry_count: cur + 1 });
                 logger(
                   'info',
-                  'resume reconciliation [cell 4]: rolled back marker (no live PID, no flag)',
+                  `resume reconciliation [cell 4]: rolled back marker (retry_count ${cur} → ${cur + 1}; no live PID, no flag)`,
                   { phaseId, role }
                 );
                 phaseDecided.add(phaseId);
@@ -4507,6 +4523,15 @@ function parseCliArgs(argv) {
     if (a.startsWith('--plugin-dir=')) {
       const v = a.slice('--plugin-dir='.length);
       if (v === '') throw new CliError('--plugin-dir= requires a value');
+      // Codex round 12 P3: parity with the bare `--plugin-dir <path>`
+      // form — verify the path exists at the CLI boundary so a typo
+      // surfaces with the offending flag named, not deep inside
+      // scaffold-protocol.
+      if (!fs.existsSync(v)) {
+        throw new CliError(
+          `--plugin-dir path does not exist: ${JSON.stringify(v)}`
+        );
+      }
       out.pluginDir = v;
       continue;
     }
