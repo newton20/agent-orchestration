@@ -3210,7 +3210,21 @@ function executeSpawn(action, tickState, runState, opts, deps) {
       manifest.defaults && typeof manifest.defaults.permission_mode === 'string'
         ? manifest.defaults.permission_mode.trim()
         : '';
-    if (permissionMode !== '') {
+    // Codex round 15 P2: legacy 'auto' must NOT override the
+    // launcher's auto_mode_flag. The launcher (e.g. agency baseline,
+    // custom wrapper) may emit a different shape like
+    // `--enable-auto-mode`; clobbering it with `--permission-mode auto`
+    // turns valid invocations into unsupported commands. Only the
+    // four documented Claude Code modes (plan | default | acceptEdits
+    // | bypassPermissions) override; legacy 'auto' preserves the
+    // launcher default.
+    const PERMISSION_MODE_OVERRIDES = new Set([
+      'plan',
+      'default',
+      'acceptEdits',
+      'bypassPermissions',
+    ]);
+    if (permissionMode !== '' && PERMISSION_MODE_OVERRIDES.has(permissionMode)) {
       const baseLauncher = effectiveLauncher || {};
       effectiveLauncher = {
         ...baseLauncher,
@@ -4003,10 +4017,22 @@ async function runOrchestrator(opts) {
               // P2: gate on innerAlive specifically (NOT liveAlive),
               // so a wrapper-only post-mortem doesn't get adopted as
               // a fresh running phase.
+              //
+              // Codex round 15 P2: preserve the original
+              // dispatched_at as started_at (mirrors the normal
+              // reconciliation path at decideTickActions). Pre-fix
+              // this used resume-time, giving an old session a
+              // fresh startup-grace and phase-timeout window —
+              // hiding sessions that should have already timed out
+              // or triggered recovery.
+              const startedAt =
+                phaseEntry && typeof phaseEntry.dispatched_at === 'string' && phaseEntry.dispatched_at !== ''
+                  ? phaseEntry.dispatched_at
+                  : new Date(opts._now ? opts._now() : Date.now()).toISOString();
               const r = runUpdateFn(opts.manifestPath, phaseId, {
                 status: 'running',
                 pid: adoptedPid,
-                started_at: new Date(opts._now ? opts._now() : Date.now()).toISOString(),
+                started_at: startedAt,
                 dispatched_at: '',
               });
               if (r && r.ok) phaseDecided.add(phaseId);
