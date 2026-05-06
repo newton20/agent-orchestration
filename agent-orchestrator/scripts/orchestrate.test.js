@@ -2003,7 +2003,10 @@ test('L1 executeActions translates spawnedAt → started_at on persist (todo 087
   }
 });
 
-test('L2 executeActions writes flag file atomically with prompt content', () => {
+test('L2 executeActions writes flag file atomically with prompt content (todo 099: spawn-token header prepended)', () => {
+  // Todo 099: every flag now starts with `# spawn_token: <uuid>` so
+  // the SessionStart hook can do pre-rename token filtering. Inject
+  // a deterministic _spawnToken so the test asserts on a known value.
   const dir = mkTmp('orch-L2');
   try {
     const mp = writeManifest(dir, makeBaseManifest());
@@ -2019,6 +2022,7 @@ test('L2 executeActions writes flag file atomically with prompt content', () => 
       _spawnSession: fakeSpawn,
       _generatePrompt: fakeGen,
       _runUpdate: fakeUpdate,
+      _spawnToken: 'test-token-abc',
       logger: silentLogger(),
       projectName: 'p',
     });
@@ -2027,7 +2031,10 @@ test('L2 executeActions writes flag file atomically with prompt content', () => 
       'orch-phase-1-impl'
     );
     assert.ok(fs.existsSync(flagPath));
-    assert.strictEqual(fs.readFileSync(flagPath, 'utf8'), '# hello prompt');
+    assert.strictEqual(
+      fs.readFileSync(flagPath, 'utf8'),
+      '# spawn_token: test-token-abc\n# hello prompt'
+    );
   } finally {
     rmrf(dir);
   }
@@ -5865,12 +5872,17 @@ test('AK2 [codex round 20 P2] flag for THIS dispatch is not deleted by the sweep
         _spawnSession: makeFakeSpawnSession(),
         _generatePrompt: makeFakeGenerate({ promptText: '# new prompt' }),
         _runUpdate: makeFakeRunUpdate(),
+        _spawnToken: 'ak2-token',
         logger: silentLogger(),
         projectName: 'p',
       }
     );
     // The flag must be the NEW prompt (rename overwrote the same-name flag).
-    assert.strictEqual(fs.readFileSync(samePath, 'utf8'), '# new prompt');
+    // Todo 099: every flag now carries a spawn-token header.
+    assert.strictEqual(
+      fs.readFileSync(samePath, 'utf8'),
+      '# spawn_token: ak2-token\n# new prompt'
+    );
   } finally {
     rmrf(dir);
   }

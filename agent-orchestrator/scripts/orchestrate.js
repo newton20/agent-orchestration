@@ -2803,6 +2803,24 @@ function executeSpawn(action, tickState, runState, opts, deps) {
   // proceed to the next spawn. If the wait times out, log and
   // continue — a slow tab is a recovery candidate, not a fatal.
   const hookOrchDir = orchDirFor(resolvedWorkdir);
+  // Todo 099: per-spawn token for cross-tick poison-pill protection.
+  // The SessionStart hook reads AGENT_FLAG_TOKEN from process.env and
+  // compares against the .pending-*'s first-line `# spawn_token: <uuid>`
+  // header BEFORE the destructive `.consuming-*` rename. Mismatch ⇒
+  // skip without consuming, so an orphan tab whose argv-token was
+  // bound at spawn-time can't consume the next-tick fresh flag.
+  //
+  // **Spawn-session env propagation is wired separately (out-of-scope
+  // for this site).** This site (1) generates the token, (2) embeds
+  // it in the flag content. Closing the cross-tick gap end-to-end
+  // requires spawn-session.js to also propagate AGENT_FLAG_TOKEN to
+  // the spawned tab — see todo 099's RA "out-of-band token binding"
+  // for the channel choices (env var via cmd /k prefix, argv via
+  // launcher passthrough, or per-tab manifest entry).
+  const spawnToken =
+    typeof opts._spawnToken === 'string' && opts._spawnToken !== ''
+      ? opts._spawnToken
+      : `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   let flagPath = null;
   if (!dryRun) {
     let promptText;
@@ -2813,11 +2831,17 @@ function executeSpawn(action, tickState, runState, opts, deps) {
         `cannot read rendered prompt at ${renderResult.promptPath}: ${e.message}`
       );
     }
-    if (Buffer.byteLength(promptText, 'utf8') > MAX_FLAG_BYTES) {
+    // Todo 099: prepend the spawn-token header. The hook reads the
+    // first line and skips candidates whose token doesn't match the
+    // tab-bound AGENT_FLAG_TOKEN. Header shape MUST match
+    // SPAWN_TOKEN_HEADER_RE in hooks/session-start.js.
+    const tokenHeader = `# spawn_token: ${spawnToken}\n`;
+    const flagContent = tokenHeader + promptText;
+    if (Buffer.byteLength(flagContent, 'utf8') > MAX_FLAG_BYTES) {
       throw new Error(
-        `prompt for ${sessionName} is ${Buffer.byteLength(promptText, 'utf8')} bytes — ` +
-          `exceeds MAX_FLAG_BYTES=${MAX_FLAG_BYTES} (the SessionStart hook would refuse it). ` +
-          `Trim the prompt or split the phase.`
+        `prompt for ${sessionName} is ${Buffer.byteLength(flagContent, 'utf8')} bytes ` +
+          `(including spawn-token header) — exceeds MAX_FLAG_BYTES=${MAX_FLAG_BYTES} ` +
+          `(the SessionStart hook would refuse it). Trim the prompt or split the phase.`
       );
     }
     mkdir(hookOrchDir, { recursive: true });
@@ -2874,7 +2898,7 @@ function executeSpawn(action, tickState, runState, opts, deps) {
       hookOrchDir,
       `.flagtmp-${sessionName}-${process.pid}-${Date.now()}`
     );
-    writeFile(tmpPath, promptText, { encoding: 'utf8' });
+    writeFile(tmpPath, flagContent, { encoding: 'utf8' });
     renameFile(tmpPath, flagPath);
   }
 
@@ -3095,6 +3119,32 @@ function executeSpawn(action, tickState, runState, opts, deps) {
         // (a) would lose the trust chain entirely; (b) loses one
         // tick.
         bestEffortUnlink(unlinkSync, flagPath);
+        // Todo 111: roll back the pre-spawn 'spawning' marker on
+        // EFLAGTIMEOUT so the next tick is eligible to re-dispatch.
+        // Pre-fix the marker stayed stranded; the existing
+        // reconciliation eventually classified it as crashed but
+        // wasted a retry-count increment.
+        //
+        // Critical 099 sequencing: this rollback is SAFE only when
+        // 099's out-of-band token binding is in place. Pre-099, an
+        // orphan tab from the timed-out spawn was still alive and
+        // would consume the next-tick fresh `.pending-*` flag. Now
+        // that the orchestrator stamps the flag content with a
+        // per-spawn token (the `# spawn_token: <uuid>` header) and
+        // the SessionStart hook does pre-rename token filtering,
+        // an orphan tab whose argv-token was bound to the OLD
+        // spawn's token cannot consume the next-tick fresh flag —
+        // safe to roll back and re-dispatch.
+        if (!dryRun) {
+          rollbackSpawningMarker({
+            manifestPath,
+            phaseId: phase.id,
+            role,
+            runUpdateFn,
+            logger,
+            reason: 'EFLAGTIMEOUT',
+          });
+        }
         const err = new Error(
           `flag ${path.basename(flagPath)} not consumed within ` +
             `${consumeTimeoutMs}ms; treating as spawn failure (cross-session ` +
