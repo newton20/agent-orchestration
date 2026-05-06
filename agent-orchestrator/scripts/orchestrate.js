@@ -1375,25 +1375,48 @@ function decideTickActions(tickState, runState, opts) {
         }
       }
     }
-    if (reconciledRole === null && (waitingTabFlag || wrapperOnlyAlive)) {
+    // Codex round 16 P2: wrapper-only defer must be BOUNDED. cmd /k
+    // and powershell -NoExit keep the wrapper alive indefinitely
+    // after the inner Claude exits (so the user can read post-mortem
+    // output). If we deferred on wrapperOnlyAlive forever, a crashed
+    // session would stay stuck in 'spawning' until the user manually
+    // closed the tab.
+    //
+    // Bound: wrapper-only defer is honored only when the spawning
+    // marker's `dispatched_at` is fresh (within FLAG_TTL_MS_LOCAL).
+    // Past that window, the inner Claude should have registered by
+    // now; wrapper-only is treated as a post-mortem and the rollback
+    // path proceeds.
+    let wrapperOnlyFresh = false;
+    if (wrapperOnlyAlive) {
+      const dispatchedAtMs = phaseEntry && typeof phaseEntry.dispatched_at === 'string'
+        ? Date.parse(phaseEntry.dispatched_at)
+        : NaN;
+      if (Number.isFinite(dispatchedAtMs)) {
+        const FLAG_TTL_MS_LOCAL = 60_000;
+        const ageMs = now - dispatchedAtMs;
+        if (ageMs <= FLAG_TTL_MS_LOCAL) {
+          wrapperOnlyFresh = true;
+        }
+      }
+      // If dispatched_at is missing or unparseable, treat as not
+      // fresh — better to roll back than to stay stuck. The
+      // reconciliation path will re-dispatch from a clean slate.
+    }
+    if (reconciledRole === null && (waitingTabFlag || wrapperOnlyFresh)) {
       // Defer reconciliation — either the resume sweep's cell-1
-      // preservation (waitingTabFlag) or a wrapper-only window
-      // (post-EFLAGTIMEOUT or pre-WMI-registration) means a tab
-      // may still come up. Rolling back here would risk a
-      // duplicate-session-name bug. Bounded by FLAG_TTL_MS for
-      // the flag case; the wrapper case is bounded by the
-      // wrapper itself eventually exiting (cmd /k / powershell
-      // -NoExit are kept alive only by the user's window — once
-      // the user closes the tab, the wrapper exits and the next
-      // tick's wrapper-inclusive snapshot reflects the change).
+      // preservation (waitingTabFlag) or a fresh wrapper-only
+      // window (post-EFLAGTIMEOUT or pre-WMI-registration) means
+      // a tab may still come up. Rolling back here would risk a
+      // duplicate-session-name bug.
       actions.push({
         type: 'log',
         level: 'info',
         message:
           `phase ${phase.id} reconciliation deferred: spawning marker + ` +
           `${waitingTabFlag ? 'fresh .pending-* flag' : ''}` +
-          `${waitingTabFlag && wrapperOnlyAlive ? ' + ' : ''}` +
-          `${wrapperOnlyAlive ? 'live wrapper (inner Claude not yet registered)' : ''}` +
+          `${waitingTabFlag && wrapperOnlyFresh ? ' + ' : ''}` +
+          `${wrapperOnlyFresh ? 'fresh live wrapper (inner Claude not yet registered)' : ''}` +
           `; next tick will re-check`,
         phaseId: phase.id,
       });
