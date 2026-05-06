@@ -2330,6 +2330,21 @@ function executeActions(actions, tickState, runState, opts) {
           );
           break;
         }
+        // Codex round 4 P2: skip persist if executeSpawn already
+        // observed a post-spawn runUpdate failure for this phase.
+        // Todo 096's contract requires the 'spawning' marker to
+        // stay intact so reconciliation adopts the live tab next
+        // tick; running a follow-up persist here would overwrite
+        // the marker with 'running' (without pid/started_at).
+        if (
+          runState.postSpawnUpdateFailedThisTick &&
+          runState.postSpawnUpdateFailedThisTick.has(action.phaseId)
+        ) {
+          out.warnings.push(
+            `persist skipped for phase=${action.phaseId}: post-spawn runUpdate failed; marker left 'spawning' for next-tick reconciliation`
+          );
+          break;
+        }
         const r = runUpdateFn(manifestPath, action.phaseId, action.updates);
         if (!r.ok) {
           out.warnings.push(
@@ -3242,9 +3257,11 @@ function executeSpawn(action, tickState, runState, opts, deps) {
     // {ok: false} return + thrown errors are both handled here so
     // a future runUpdate refactor that converts soft-fails to
     // throws can't reintroduce the bug.
+    let postSpawnUpdateFailed = false;
     try {
       const r = runUpdateFn(manifestPath, phase.id, updates);
       if (!r || !r.ok) {
+        postSpawnUpdateFailed = true;
         logger('error', `runUpdate post-spawn failed: ${(r && r.error) || 'unknown error'}`, {
           phaseId: phase.id,
           role,
@@ -3252,10 +3269,24 @@ function executeSpawn(action, tickState, runState, opts, deps) {
       }
     } catch (e) {
       // Marker stays as 'spawning'; reconciliation adopts next tick.
+      postSpawnUpdateFailed = true;
       logger('error', `runUpdate post-spawn threw (marker left 'spawning' for reconciliation): ${e && e.message ? e.message : String(e)}`, {
         phaseId: phase.id,
         role,
       });
+    }
+    // Codex round 4 P2: when the post-spawn runUpdate fails for ANY
+    // reason ({ok:false} or thrown), signal the tick so the follow-
+    // up `persist` action in executeActions SKIPS this phase. Without
+    // this, executeActions would run the persist with stale-or-empty
+    // updates on top of the 'spawning' marker — overwriting it with
+    // 'running' but without pid/started_at, defeating 096's
+    // reconciliation-adopts-next-tick contract.
+    if (postSpawnUpdateFailed) {
+      if (!runState.postSpawnUpdateFailedThisTick) {
+        runState.postSpawnUpdateFailedThisTick = new Set();
+      }
+      runState.postSpawnUpdateFailedThisTick.add(phase.id);
     }
   }
   logger('info', `spawned ${sessionName} pid=${spawnResult.pid}`, {
@@ -3285,6 +3316,10 @@ function runOneTick(runState, opts) {
   runState.spawnFailedThisTick = new Set();
   runState.spawnSucceededThisTick = new Set();
   runState.flagTimeoutThisTick = false;
+  // Codex round 4 P2: track phases whose post-spawn runUpdate
+  // (todo 096) failed this tick so the follow-up persist in
+  // executeActions skips them.
+  runState.postSpawnUpdateFailedThisTick = new Set();
   const tickResult = pollAllPhases(opts);
   if (!tickResult.ok) {
     const logger = opts.logger || makeDefaultLogger();
@@ -3611,6 +3646,50 @@ async function runOrchestrator(opts) {
           defaultSessionName(s.phaseId, s.role)
         );
         const pidSnapshot = buildPidSnapshot(sessionNames, opts);
+        // Codex round 4 P2: build a SECONDARY snapshot that includes
+        // wrappers (cmd/powershell). On --resume immediately after a
+        // crash during dispatch, the only process WMI may show for a
+        // tab that has not consumed its prompt yet is the wrapper.
+        // The primary snapshot above excludes wrappers by design (so
+        // health checks don't report a dead Claude as alive via its
+        // surviving cmd /k wrapper), but for resume reconciliation
+        // we want to know "is ANY process alive for this session" —
+        // wrapper-only counts.
+        let pidSnapshotWithWrappers = null;
+        if (pidSnapshot !== null) {
+          try {
+            const buildWithWrappers = (sn, oo) => {
+              const m = new Map();
+              const runner = (oo && oo._pidRunner) ||
+                ((program, argv) =>
+                  require('child_process').execFileSync(program, argv, {
+                    stdio: ['ignore', 'pipe', 'ignore'],
+                    encoding: 'utf8',
+                  }));
+              let stdout;
+              try {
+                stdout = runner('powershell', require('./spawn-session').buildPidLookupArgs
+                  ? require('./spawn-session').buildPidLookupArgs()
+                  : ['-NoProfile', '-NoLogo', '-Command',
+                    "@(Get-CimInstance Win32_Process -Filter \"CommandLine LIKE '%--name %'\" | Select-Object ProcessId, CommandLine) | ConvertTo-Json -Compress -Depth 1"
+                  ]);
+              } catch (_) {
+                return null;
+              }
+              const { parsePidLookupOutput } = require('./spawn-session');
+              for (const name of sn) {
+                const pid = parsePidLookupOutput(stdout, name, { excludeWrappers: false });
+                if (Number.isInteger(pid) && pid > 0) {
+                  m.set(name, { pid });
+                }
+              }
+              return m;
+            };
+            pidSnapshotWithWrappers = buildWithWrappers(sessionNames, opts);
+          } catch (_) {
+            pidSnapshotWithWrappers = null;
+          }
+        }
         if (pidSnapshot === null) {
           logger(
             'warn',
@@ -3632,30 +3711,49 @@ async function runOrchestrator(opts) {
             const flagBasename = `.pending-${sessionName}`;
             const flagAbsPath = path.join(resumeOrchDir, flagBasename);
             const snap = pidSnapshot.get(sessionName);
-            const liveAlive = !!(snap && Number.isInteger(snap.pid) && snap.pid > 0);
+            // Codex round 4 P2: a tab that hasn't consumed its prompt
+            // yet may only have its wrapper (cmd/powershell) visible
+            // to WMI. The primary snapshot (excludeWrappers:true)
+            // misses the wrapper-only case; the secondary snapshot
+            // (excludeWrappers:false) catches it. For resume
+            // reconciliation we accept ANY live process — wrapper-
+            // only or inner Claude — so we don't sweep a flag whose
+            // intended tab is still waiting for its hook to fire.
+            const wrapperSnap =
+              pidSnapshotWithWrappers && pidSnapshotWithWrappers.get(sessionName);
+            const liveAlive = !!(
+              (snap && Number.isInteger(snap.pid) && snap.pid > 0) ||
+              (wrapperSnap && Number.isInteger(wrapperSnap.pid) && wrapperSnap.pid > 0)
+            );
             const existsSync = opts._existsSync || fs.existsSync;
             const flagPresent = existsSync(flagAbsPath);
+            // Resolve the actual PID for adoption / logging. Prefer
+            // the inner Claude's PID (snap) when available; fall back
+            // to the wrapper's PID when only it is visible.
+            const adoptedPid = snap && Number.isInteger(snap.pid) ? snap.pid
+              : wrapperSnap && Number.isInteger(wrapperSnap.pid) ? wrapperSnap.pid
+              : null;
             if (liveAlive && flagPresent) {
               // Cell 1: tab waiting for prompt — preserve flag.
               preservedFlags.add(flagBasename);
               phaseDecided.add(phaseId);
               logger(
                 'info',
-                `resume reconciliation [cell 1]: preserving ${flagBasename} (tab pid=${snap.pid} waiting for prompt)`,
+                `resume reconciliation [cell 1]: preserving ${flagBasename} (tab pid=${adoptedPid} waiting for prompt)`,
                 { phaseId, role }
               );
             } else if (liveAlive && !flagPresent) {
               // Cell 2: adopt — transition to running.
               const r = runUpdateFn(opts.manifestPath, phaseId, {
                 status: 'running',
-                pid: snap.pid,
+                pid: adoptedPid,
                 started_at: new Date(opts._now ? opts._now() : Date.now()).toISOString(),
                 dispatched_at: '',
               });
               if (r && r.ok) phaseDecided.add(phaseId);
               logger(
                 r && r.ok ? 'info' : 'warn',
-                `resume reconciliation [cell 2]: adopting live session pid=${snap.pid} (no flag — already consumed)${r && r.ok ? '' : ' — runUpdate failed: ' + (r && r.error || 'unknown')}`,
+                `resume reconciliation [cell 2]: adopting live session pid=${adoptedPid} (no flag — already consumed)${r && r.ok ? '' : ' — runUpdate failed: ' + (r && r.error || 'unknown')}`,
                 { phaseId, role }
               );
             } else if (!liveAlive && flagPresent) {
