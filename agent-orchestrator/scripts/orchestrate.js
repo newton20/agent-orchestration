@@ -2950,6 +2950,14 @@ function executeSpawn(action, tickState, runState, opts, deps) {
       // Pre-marker write failed (FS error). Don't proceed to spawn —
       // we'd lose the recovery breadcrumb. Surface as a spawn failure
       // and let the next tick re-attempt.
+      //
+      // Codex round 5 P2: unlink the .pending-* flag we just wrote.
+      // No tab will be spawned for this prompt; leaving the flag on
+      // disk would let the next SessionStart hook (any unrelated
+      // tab launching, cross-tick reconciliation sweep, or even a
+      // later spawn for a different role within this same tick)
+      // consume the stale prompt.
+      if (flagPath) bestEffortUnlink(unlinkSync, flagPath);
       logger('error', `pre-spawn marker write failed: ${preR.error}`, {
         phaseId: phase.id,
         role,
@@ -3711,6 +3719,33 @@ async function runOrchestrator(opts) {
             const flagBasename = `.pending-${sessionName}`;
             const flagAbsPath = path.join(resumeOrchDir, flagBasename);
             const snap = pidSnapshot.get(sessionName);
+            // Codex round 5 P2: infer the pre-marker status from the
+            // phase entry's existing fields. A 'spawning' marker can
+            // come from THREE dispatch modes:
+            //   - initial: phase was 'pending'; rollback to 'pending'.
+            //   - recovery: phase was 'running' before the crash that
+            //     triggered the recovery dispatch; rollback to 'running'
+            //     to preserve retry_count and let the next tick continue
+            //     the recovery rather than restart from initial.
+            //   - review_retry: phase was 'running' (in review_stage:
+            //     review_retry_pending or similar); rollback to 'running'
+            //     preserves review_iteration / review_stage.
+            //
+            // Heuristic: if review_iteration > 0 OR review_stage is set
+            // → was in a review-loop dispatch ('running'). Else if
+            // retry_count > 0 → recovery dispatch ('running'). Else
+            // initial → 'pending'.
+            const phaseEntry = sl.status.phases[phaseId];
+            const inReviewLoop =
+              phaseEntry &&
+              (Number.isInteger(phaseEntry.review_iteration) && phaseEntry.review_iteration > 0 ||
+                (typeof phaseEntry.review_stage === 'string' && phaseEntry.review_stage !== ''));
+            const inRecovery =
+              phaseEntry &&
+              Number.isInteger(phaseEntry.retry_count) &&
+              phaseEntry.retry_count > 0;
+            const inferredPriorStatus =
+              inReviewLoop || inRecovery ? 'running' : 'pending';
             // Codex round 4 P2: a tab that hasn't consumed its prompt
             // yet may only have its wrapper (cmd/powershell) visible
             // to WMI. The primary snapshot (excludeWrappers:true)
@@ -3778,6 +3813,7 @@ async function runOrchestrator(opts) {
                   runUpdateFn,
                   logger,
                   reason: 'resume_orphan_with_flag',
+                  priorStatus: inferredPriorStatus,
                 });
                 try { fs.unlinkSync(flagAbsPath); } catch (_) { /* ignore */ }
                 logger(
@@ -3805,6 +3841,7 @@ async function runOrchestrator(opts) {
                   runUpdateFn,
                   logger,
                   reason: 'resume_clean_rollback',
+                  priorStatus: inferredPriorStatus,
                 });
                 logger(
                   'info',
