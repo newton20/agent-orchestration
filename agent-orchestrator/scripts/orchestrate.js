@@ -3143,7 +3143,30 @@ function executeSpawn(action, tickState, runState, opts, deps) {
       // back to 'pending' would lose review state and bypass retry
       // accounting.
       if (!dryRun) {
-        const priorStatus = isRecovery || isReviewRetry ? 'running' : 'pending';
+        // Codex round 8 P2: review-loop QA handoff is emitted as
+        // mode: 'initial' even though the phase is already 'running'
+        // (the impl-complete signal triggered the QA dispatch). For
+        // those, the prior status is 'running', not 'pending' —
+        // rolling back to 'pending' would let the next tick treat
+        // the phase as fresh and re-dispatch impl, deleting the
+        // existing impl-complete signal. Detect via the manifest's
+        // review_loop block + the phase status entry's review_stage.
+        const reviewEnabledHere =
+          phase.review_loop && phase.review_loop.enabled;
+        const phaseEntryHere =
+          tickState.status &&
+          tickState.status.phases &&
+          tickState.status.phases[phase.id];
+        const inReviewLoopRunning =
+          reviewEnabledHere &&
+          phaseEntryHere &&
+          (typeof phaseEntryHere.review_stage === 'string' ||
+            (Number.isInteger(phaseEntryHere.review_iteration) &&
+              phaseEntryHere.review_iteration > 0));
+        const priorStatus =
+          isRecovery || isReviewRetry || inReviewLoopRunning
+            ? 'running'
+            : 'pending';
         rollbackSpawningMarker({
           manifestPath,
           phaseId: phase.id,
@@ -3243,7 +3266,30 @@ function executeSpawn(action, tickState, runState, opts, deps) {
           // For recovery / review_retry dispatches the phase was
           // 'running' before the marker was written; rolling back to
           // 'pending' would corrupt review state.
-          const priorStatus = isRecovery || isReviewRetry ? 'running' : 'pending';
+          // Codex round 8 P2: review-loop QA handoff is emitted as
+        // mode: 'initial' even though the phase is already 'running'
+        // (the impl-complete signal triggered the QA dispatch). For
+        // those, the prior status is 'running', not 'pending' —
+        // rolling back to 'pending' would let the next tick treat
+        // the phase as fresh and re-dispatch impl, deleting the
+        // existing impl-complete signal. Detect via the manifest's
+        // review_loop block + the phase status entry's review_stage.
+        const reviewEnabledHere =
+          phase.review_loop && phase.review_loop.enabled;
+        const phaseEntryHere =
+          tickState.status &&
+          tickState.status.phases &&
+          tickState.status.phases[phase.id];
+        const inReviewLoopRunning =
+          reviewEnabledHere &&
+          phaseEntryHere &&
+          (typeof phaseEntryHere.review_stage === 'string' ||
+            (Number.isInteger(phaseEntryHere.review_iteration) &&
+              phaseEntryHere.review_iteration > 0));
+        const priorStatus =
+          isRecovery || isReviewRetry || inReviewLoopRunning
+            ? 'running'
+            : 'pending';
           rollbackSpawningMarker({
             manifestPath,
             phaseId: phase.id,
