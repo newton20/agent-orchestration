@@ -336,10 +336,7 @@ function completionSignalFor(phaseDir, role) {
  * conventional `<phaseDir>/<role>-complete.md`.
  */
 function resolveCompletionSignal(manifest, manifestDir, phaseId, role) {
-  const phaseEntry =
-    Array.isArray(manifest.phases)
-      ? manifest.phases.find((p) => p && p.id === phaseId)
-      : null;
+  const phaseEntry = findRawPhase(manifest, phaseId);
   if (
     phaseEntry &&
     typeof phaseEntry.completion_signal === 'string' &&
@@ -753,9 +750,27 @@ function buildPidSnapshot(sessionNames, opts = {}) {
   } catch (_) {
     return null;
   }
+  // Todo 108.p: parse the PowerShell JSON ONCE per snapshot, not
+  // once per session name. Pre-fix, parsePidLookupOutput re-parsed
+  // the same stdout buffer N times — wasteful for fan-out phases
+  // with multiple roles.
+  let parsedRows = null;
+  if (typeof stdout === 'string' && stdout.trim() !== '') {
+    try {
+      const parsed = JSON.parse(stdout);
+      if (parsed !== null && parsed !== undefined) {
+        parsedRows = Array.isArray(parsed) ? parsed : [parsed];
+      }
+    } catch (_) {
+      parsedRows = null; // fall through; parsePidLookupOutput will re-handle
+    }
+  }
   const map = new Map();
   for (const name of sessionNames) {
-    const pid = parsePidLookupOutput(stdout, name, { excludeWrappers: true });
+    const pid = parsePidLookupOutput(stdout, name, {
+      excludeWrappers: true,
+      _parsedRows: parsedRows,
+    });
     if (Number.isInteger(pid) && pid > 0) {
       map.set(name, { pid });
     }
@@ -907,6 +922,20 @@ function depsBlocked(phase, status) {
 
 function isTerminalStatus(s) {
   return s === 'completed' || s === 'failed' || s === 'blocked';
+}
+
+/**
+ * Todo 108.g: lookup the raw phase entry from the parsed manifest.
+ * Several call sites need access to fields parse-manifest's
+ * normalizePhases strips (e.g., review_loop.pr_or_branch /
+ * qa_scope_rows, plan_path / plan_unit_marker). Returning `null`
+ * (rather than `undefined`) keeps the semantics explicit at the
+ * read sites.
+ */
+function findRawPhase(manifest, phaseId) {
+  if (!manifest || !Array.isArray(manifest.phases)) return null;
+  const raw = manifest.phases.find((p) => p && p.id === phaseId);
+  return raw || null;
 }
 
 /**
@@ -1094,9 +1123,8 @@ function parseQaVerdict(phaseDir, role, opts = {}) {
  * a list of actions. No side effects; tests assert on the actions list.
  *
  * Action types:
- *   { type: 'spawn', phaseId, role, mode: 'initial' | 'recovery', context }
+ *   { type: 'spawn', phaseId, role, mode: 'initial' | 'recovery' | 'review_retry', context }
  *   { type: 'persist', phaseId, role?, updates }
- *   { type: 'mark_phase_running', phaseId }
  *   { type: 'mark_phase_completed', phaseId }
  *   { type: 'mark_phase_failed', phaseId, reason }
  *   { type: 'mark_phase_blocked', phaseId, reason }
@@ -1295,10 +1323,8 @@ function decideTickActions(tickState, runState, opts) {
     // field. We instead probe the raw manifest's phase entry for the
     // user-provided value and fall back to the CLI / built-in default
     // chain.
-    const rawPhaseForCap =
-      (Array.isArray(manifest.phases)
-        ? manifest.phases.find((p) => p && p.id === phase.id)
-        : null) || {};
+    // Todo 108.g: use shared findRawPhase helper.
+    const rawPhaseForCap = findRawPhase(manifest, phase.id) || {};
     const rawReviewLoopForCap =
       rawPhaseForCap.review_loop && typeof rawPhaseForCap.review_loop === 'object'
         ? rawPhaseForCap.review_loop
@@ -1324,7 +1350,6 @@ function decideTickActions(tickState, runState, opts) {
       ? [reviewStage]
       : phase.agents.map((a) => a.role);
 
-    let phaseAdvanced = false;
     for (const role of activeRoles) {
       // Find the agent record for this role (defaults).
       const agent = phase.agents.find((a) => a.role === role);
@@ -1439,7 +1464,6 @@ function decideTickActions(tickState, runState, opts) {
             phaseId: phase.id,
             updates: { review_stage: 'qa' },
           });
-          phaseAdvanced = true;
           continue;
         }
         if (reviewEnabled && role === 'qa') {
@@ -1468,8 +1492,7 @@ function decideTickActions(tickState, runState, opts) {
               type: 'mark_phase_completed',
               phaseId: phase.id,
             });
-            phaseAdvanced = true;
-            continue;
+              continue;
           }
           // Verdict failed.
           if (reviewIteration >= reviewMaxIter) {
@@ -1486,8 +1509,7 @@ function decideTickActions(tickState, runState, opts) {
               phaseId: phase.id,
               reason: `review_loop_exceeded:${reviewMaxIter}`,
             });
-            phaseAdvanced = true;
-            continue;
+              continue;
           }
           // Respawn impl with a fresh prompt + the prior verdict's
           // failures inlined. Iteration counter advances.
@@ -1516,7 +1538,6 @@ function decideTickActions(tickState, runState, opts) {
               review_iteration: nextIter,
             },
           });
-          phaseAdvanced = true;
           continue;
         }
         // Non-review phase (or non-impl/qa role on a review phase):
@@ -1542,6 +1563,15 @@ function decideTickActions(tickState, runState, opts) {
         // completed — silently advancing downstream phases.
         // (The current role already passed the parse check above by
         // virtue of reaching this branch; we re-check the others.)
+        //
+        // Todo 108.o (Conf 75, perf): for an N-role phase this loop
+        // runs N×(N-1) parseCompletionSignal calls per tick (each
+        // role iteration re-parses every sibling). For V1 with N≤3
+        // (impl + qa + coord) the absolute cost is bounded; a
+        // per-tick memoization cache keyed by (phaseId, role) would
+        // reduce it to O(N). Deferred behind Conf 75 — acceptable
+        // for V1 scale but flagged for V1.5 if a fan-out pattern
+        // exceeds 3 roles.
         let allRolesComplete = true;
         for (const a of phase.agents) {
           if (a.role === role) continue; // current role is complete
@@ -1559,7 +1589,6 @@ function decideTickActions(tickState, runState, opts) {
             type: 'mark_phase_completed',
             phaseId: phase.id,
           });
-          phaseAdvanced = true;
         }
         continue;
       }
@@ -1656,7 +1685,6 @@ function decideTickActions(tickState, runState, opts) {
             phaseId: phase.id,
             reason: `config_error:${health.error}`,
           });
-          phaseAdvanced = true;
           continue;
         }
         if (health.errorKind === 'runtime') {
@@ -1745,7 +1773,6 @@ function decideTickActions(tickState, runState, opts) {
             status,
             manifest,
           });
-          phaseAdvanced = true;
           continue;
         }
         // Healthy. Continue polling next tick.
@@ -1776,7 +1803,6 @@ function decideTickActions(tickState, runState, opts) {
           status,
           manifest,
         });
-        phaseAdvanced = true;
         continue;
       }
 
@@ -1835,10 +1861,11 @@ function decideTickActions(tickState, runState, opts) {
         status,
         manifest,
       });
-      phaseAdvanced = true;
     }
-    // (silence "unused" warning — phaseAdvanced is informational only)
-    void phaseAdvanced;
+    // Todo 108.c: removed write-only `phaseAdvanced` (9 assignments,
+    // 0 reads, suppressed via `void`). Loop ordering already
+    // guarantees a single-action-per-(phase, role) emission via the
+    // explicit `continue` at each terminal branch.
   }
 
   // -- Second pass: advance pending phases.
@@ -2067,12 +2094,11 @@ function decideRecoveryAction(actions, runState, opts, ctx) {
   // require parsing the plan markdown — deferred to V1.5 where the
   // recovery analyst can read the plan directly. Until then, the
   // hook receives the full plan_units block (or null).
+  // Todo 108.g: use shared findRawPhase helper.
+  const rawPhase094 = findRawPhase(manifest, phase.id);
   let remainingWorkBlock = null;
-  if (manifest && Array.isArray(manifest.phases)) {
-    const raw = manifest.phases.find((p) => p && p.id === phase.id);
-    if (raw && typeof raw.plan_units === 'string' && raw.plan_units !== '') {
-      remainingWorkBlock = raw.plan_units;
-    }
+  if (rawPhase094 && typeof rawPhase094.plan_units === 'string' && rawPhase094.plan_units !== '') {
+    remainingWorkBlock = rawPhase094.plan_units;
   }
 
   // completedCheckpointsBlock — iterate status.phases. Absent / empty
@@ -2223,6 +2249,11 @@ function executeActions(actions, tickState, runState, opts) {
             `spawn skipped for phase=${action.phaseId} role=${action.role}: ` +
               `prior spawn this tick hit a flag-consume timeout; deferring to next tick`
           );
+          // Todo 108.f investigated: runOneTick initializes the Set
+          // at tick start, but the orchestrate.test.js suite calls
+          // executeActions DIRECTLY with a runState that lacks
+          // spawnFailedThisTick — so the lazy guards aren't dead.
+          // Kept the guard but documented intent.
           if (!runState.spawnFailedThisTick) {
             runState.spawnFailedThisTick = new Set();
           }
@@ -2377,12 +2408,12 @@ function executeActions(actions, tickState, runState, opts) {
         );
         break;
       }
-      case 'mark_phase_running': {
-        if (!dryRun) {
-          runUpdateFn(manifestPath, action.phaseId, { status: 'running' });
-        }
-        break;
-      }
+      // Todo 108.b: removed dead `mark_phase_running` handler — the
+      // action type was documented in decideTickActions's JSDoc but
+      // never emitted by any decideTickActions code path. The
+      // post-spawn persist inside executeSpawn writes
+      // `status: 'running'` directly via runUpdate, so the handler
+      // was unreachable.
       default: {
         out.warnings.push(`unknown action type: ${action.type}`);
       }
@@ -2455,10 +2486,8 @@ function executeSpawn(action, tickState, runState, opts, deps) {
   // P1) — these are NOT in parse-manifest's KNOWN_PHASE today; the
   // manifest validator warns on them but accepts the manifest, so
   // the orchestrator reads them from the raw phase.
-  const rawPhase =
-    (Array.isArray(manifest.phases)
-      ? manifest.phases.find((p) => p && p.id === phase.id)
-      : null) || {};
+  // Todo 108.g: use shared findRawPhase helper.
+  const rawPhase = findRawPhase(manifest, phase.id) || {};
   const rawReviewLoop =
     rawPhase.review_loop && typeof rawPhase.review_loop === 'object'
       ? rawPhase.review_loop
@@ -2504,7 +2533,13 @@ function executeSpawn(action, tickState, runState, opts, deps) {
   if (!dryRun) {
     const sigFor = (r) =>
       resolveCompletionSignal(manifest, manifestDir, phase.id, r);
-    if (isRecovery) {
+    // Todo 108.d: isRecovery and isInitial branches were
+    // character-identical pre-fix. Both single-role respawn paths
+    // (recovery after crash, initial dispatch with a leftover
+    // signal) need the same cleanup queue. Merge them into one
+    // branch keyed off `respawnsRole`.
+    const respawnsRole = isRecovery || isInitial;
+    if (respawnsRole) {
       staleUnlinks.push(sigFor(role));
       staleUnlinks.push(completionSignalFor(phaseDir, role));
       if (role === 'qa') {
@@ -2512,18 +2547,13 @@ function executeSpawn(action, tickState, runState, opts, deps) {
       }
     }
     if (isReviewRetry) {
+      // Review-retry cleans BOTH impl and qa signals because the new
+      // impl iteration must observe "neither stage has emitted yet."
       staleUnlinks.push(sigFor('impl'));
       staleUnlinks.push(sigFor('qa'));
       staleUnlinks.push(completionSignalFor(phaseDir, 'impl'));
       staleUnlinks.push(completionSignalFor(phaseDir, 'qa'));
       staleUnlinks.push(qaVerdictFor(phaseDir));
-    }
-    if (isInitial) {
-      staleUnlinks.push(sigFor(role));
-      staleUnlinks.push(completionSignalFor(phaseDir, role));
-      if (role === 'qa') {
-        staleUnlinks.push(qaVerdictFor(phaseDir));
-      }
     }
     // Snapshot pre-spawn mtimes. Files that don't exist now are
     // recorded as `existed: false`; the post-spawn cleanup skips
@@ -2583,12 +2613,15 @@ function executeSpawn(action, tickState, runState, opts, deps) {
   // Manifest-declared custom paths flow through resolveCompletionSignal
   // (codex round 5 P2). For non-impl roles whose role doesn't match
   // the manifest's basename, the convention default applies.
-  const effectiveRoleForSignal = isRecovery ? role : role;
+  // Todo 108.a: removed no-op `isRecovery ? role : role` ternary —
+  // both branches resolved to the same value. Recovery dispatches
+  // already render to the role's canonical signal path; nothing in
+  // this scope needs to differentiate the two.
   const dispatchCompletionSignal = resolveCompletionSignal(
     manifest,
     manifestDir,
     phase.id,
-    effectiveRoleForSignal
+    role
   );
   // Codex round 13 P2: ensure the parent directory of the custom
   // completion path exists before the agent runs. If the manifest
@@ -2803,8 +2836,19 @@ function executeSpawn(action, tickState, runState, opts, deps) {
     let entries = [];
     try {
       entries = readdirSync(hookOrchDir);
-    } catch (_) {
-      /* dir might not exist on first sweep — mkdir above handles it */
+    } catch (e) {
+      // Todo 108.i: differentiate ENOENT (dir doesn't exist yet —
+      // mkdir above handles it; expected) from EACCES / EPERM
+      // (cross-user perms or read-only mount — stale flags may
+      // persist and re-introduce the codex-round-20 cross-tick
+      // wrong-prompt bug). Surface non-ENOENT failures so the
+      // operator sees the missing-sweep risk.
+      if (e && e.code !== 'ENOENT') {
+        logger('warn', `stale-flag sweep readdir failed at ${hookOrchDir}: ${e.message}`, {
+          phaseId: phase.id,
+          role,
+        });
+      }
     }
     const ourFlagBasename = `.pending-${sessionName}`;
     for (const name of entries) {
@@ -3826,7 +3870,11 @@ function printHelp() {
       '',
       'Options:',
       '  --resume                          read manifest-status, skip completed phases, respawn crashed',
-      '  --once                            run a single tick then exit (testing aid)',
+      '  --once                            run a single tick then exit (testing aid).',
+      '                                    Equivalent to `--max-ticks 1`. When both flags',
+      '                                    are passed, the LATER flag on the command line',
+      '                                    wins (parser is left-to-right; --once 0 is',
+      '                                    not allowed because --once takes no value).',
       '  --max-ticks <n>                   exit after N ticks (default: unlimited)',
       '  --active-interval-ms <n>          poll cadence when at least one phase is running (default 30000)',
       '  --idle-interval-ms <n>            poll cadence when nothing is running (default 120000)',
@@ -3863,7 +3911,8 @@ function parseCliArgs(argv) {
   const out = {
     manifestPath: null,
     resume: false,
-    once: false,
+    // Todo 108.e: removed `once: false` default — the field was set
+    // by --once but never read; maxTicks is the canonical signal.
     maxTicks: null,
     activeIntervalMs: null,
     idleIntervalMs: null,
@@ -3929,7 +3978,13 @@ function parseCliArgs(argv) {
         out.resume = true;
         break;
       case '--once':
-        out.once = true;
+        // Todo 108.e: removed write-only `out.once = true`. The
+        // documented contract is "--once sets maxTicks to 1"; the
+        // separate `once` field was set but never consumed by
+        // runOrchestrator. maxTicks is the canonical signal.
+        // Todo 108.n: --help (above) now documents the maxTicks=1
+        // equivalence so operators don't expect a separate
+        // semantic.
         out.maxTicks = 1;
         break;
       case '--max-ticks':
@@ -3955,6 +4010,19 @@ function parseCliArgs(argv) {
         break;
       case '--plugin-dir':
         out.pluginDir = nextNonFlag();
+        // Todo 108.m: cheap existence check at the CLI boundary.
+        // Pre-fix `--plugin-dir /nonexistent` only failed deep inside
+        // scaffold-protocol's templates copy, with a stack-traceish
+        // error that didn't name the offending flag. fs.existsSync
+        // is a fast read; failure surfaces as a clean parser error
+        // pointing at --plugin-dir. We DON'T check the directory's
+        // shape (templates/ subdir, etc.) — that's scaffold's job;
+        // we just confirm the path is reachable.
+        if (out.pluginDir && !fs.existsSync(out.pluginDir)) {
+          throw new CliError(
+            `--plugin-dir path does not exist: ${JSON.stringify(out.pluginDir)}`
+          );
+        }
         break;
       case '--project-name':
         out.projectName = nextNonFlag();
@@ -4063,6 +4131,14 @@ async function main() {
   try {
     result = await runOrchestrator(opts);
   } catch (e) {
+    // Todo 108.q: remove SIGINT / SIGTERM listeners on the error
+    // path too. Cosmetic in practice (process.exit(1) below tears
+    // the process down regardless), but removing them satisfies
+    // the symmetry-with-the-success-path expectation a future
+    // refactor that promotes the catch into a non-fatal handler
+    // would otherwise miss.
+    process.removeListener('SIGINT', onSignal);
+    process.removeListener('SIGTERM', onSignal);
     process.stderr.write(`orchestrate: fatal — ${e.message}\n`);
     process.exit(1);
   }

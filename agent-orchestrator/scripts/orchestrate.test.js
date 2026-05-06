@@ -1323,6 +1323,62 @@ test('I4c [todo 098] flap pattern under custom --converge-n=2 also honors startu
   }
 });
 
+test('I4d [todo 108.j] convergence counter: unknown / null pidAliveReason still counts toward convergence', () => {
+  // The dispatcher comment at orchestrate.js documents:
+  //   "'lookup_failed' OR 'session_not_found' OR null reason ⇒ count."
+  // The null-reason branch was untested pre-fix; a refactor that
+  // accidentally short-circuited unknown reasons would have left
+  // recovery dispatch buggy. Verify counter increments for each
+  // null-reason call below the threshold, and that the threshold
+  // call still triggers recovery.
+  const dir = mkTmp('orch-I4d');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, { phases: { 'phase-1': { status: 'running', retry_count: 0 } } });
+    makePhaseDir(mp, 'phase-1');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const counters = new Map();
+    // Two below-threshold calls increment counter to 1, 2.
+    O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: counters },
+      {
+        _checkHealth: () =>
+          makeStubHealth({ pidAlive: null, pidAliveReason: null }),
+        lookupFailedConvergeN: 3,
+      }
+    );
+    assert.strictEqual(counters.get('phase-1:impl'), 1);
+    O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: counters },
+      {
+        _checkHealth: () =>
+          makeStubHealth({ pidAlive: null, pidAliveReason: null }),
+        lookupFailedConvergeN: 3,
+      }
+    );
+    assert.strictEqual(counters.get('phase-1:impl'), 2);
+    // Third call hits convergence threshold → recovery action emitted
+    // and counter is deleted.
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: counters },
+      {
+        _checkHealth: () =>
+          makeStubHealth({ pidAlive: null, pidAliveReason: null }),
+        lookupFailedConvergeN: 3,
+      }
+    );
+    assert.ok(
+      actions.some((a) => a.type === 'spawn' && a.mode === 'recovery'),
+      'null pidAliveReason must converge to recovery on the Nth call'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
 test('I5 first non-null reading clears the counter', () => {
   const dir = mkTmp('orch-I5');
   try {
@@ -2423,10 +2479,10 @@ test('O2 parseCliArgs: --resume', () => {
   assert.strictEqual(a.resume, true);
 });
 
-test('O3 parseCliArgs: --once sets maxTicks to 1', () => {
+test('O3 parseCliArgs: --once sets maxTicks to 1 (todo 108.e: no separate `once` field)', () => {
   const a = O.parseCliArgs(['node', 's.js', '--once', 'm.yaml']);
   assert.strictEqual(a.maxTicks, 1);
-  assert.strictEqual(a.once, true);
+  assert.strictEqual(a.once, undefined);
 });
 
 test('O4 parseCliArgs: integer flags accept positive ints', () => {
@@ -2489,18 +2545,39 @@ test('O5g parseCliArgs --help sets showHelp; main path skips manifest required',
   assert.strictEqual(a.manifestPath, null);
 });
 
-test('O6 parseCliArgs: --plugin-dir + --project-name capture string args', () => {
-  const a = O.parseCliArgs([
-    'node',
-    's.js',
-    '--plugin-dir',
-    '/p',
-    '--project-name',
-    'demo',
-    'm.yaml',
-  ]);
-  assert.strictEqual(a.pluginDir, '/p');
-  assert.strictEqual(a.projectName, 'demo');
+test('O6 parseCliArgs: --plugin-dir + --project-name capture string args (todo 108.m: path must exist)', () => {
+  // Todo 108.m: --plugin-dir now validates the path exists at the
+  // CLI boundary. Use the test directory itself to satisfy the check.
+  const dir = mkTmp('orch-O6');
+  try {
+    const a = O.parseCliArgs([
+      'node',
+      's.js',
+      '--plugin-dir',
+      dir,
+      '--project-name',
+      'demo',
+      'm.yaml',
+    ]);
+    assert.strictEqual(a.pluginDir, dir);
+    assert.strictEqual(a.projectName, 'demo');
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('O6a [todo 108.m] --plugin-dir nonexistent path → CliError', () => {
+  assert.throws(
+    () =>
+      O.parseCliArgs([
+        'node',
+        's.js',
+        '--plugin-dir',
+        '/nonexistent-plugin-dir-' + Date.now(),
+        'm.yaml',
+      ]),
+    /--plugin-dir path does not exist/
+  );
 });
 
 test('O6b [todo 106] --plugin-dir followed by another flag → error (no greedy consume)', () => {
@@ -2545,17 +2622,23 @@ test('O6e [todo 106] --project-name=<value> escape hatch', () => {
 
 test('O6f [todo 106] non-flag value continues to work normally', () => {
   // Sanity check: the existing happy path is preserved — only
-  // `-`-prefixed values trip the new check.
-  const a = O.parseCliArgs([
-    'node',
-    's.js',
-    '--plugin-dir',
-    'foo',
-    '--resume',
-    'bar.yaml',
-  ]);
-  assert.strictEqual(a.pluginDir, 'foo');
-  assert.strictEqual(a.resume, true);
+  // `-`-prefixed values trip the new check. Use the cwd as a
+  // path that always exists (todo 108.m's existence check).
+  const dir = mkTmp('orch-O6f');
+  try {
+    const a = O.parseCliArgs([
+      'node',
+      's.js',
+      '--plugin-dir',
+      dir,
+      '--resume',
+      'bar.yaml',
+    ]);
+    assert.strictEqual(a.pluginDir, dir);
+    assert.strictEqual(a.resume, true);
+  } finally {
+    rmrf(dir);
+  }
 });
 
 test('O7 parseCliArgs: --dry-run + --skip-scaffold are flags', () => {
@@ -4751,6 +4834,54 @@ test('AC1b [todo 107.c] stale-lock reclaim ENOENT (rename loser) falls through t
     assert.ok(typeof lockedPath === 'string');
     assert.ok(fs.existsSync(lockedPath), 'fresh lockfile must exist after fall-through');
     O.releaseLock(lockedPath);
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AC1c [todo 108.k] stale-signal post-spawn cleanup tolerates statSync throws (file vanished mid-cleanup)', () => {
+  // The post-spawn cleanup at executeSpawn iterates staleUnlinks and
+  // calls statSync to compare current mtime vs pre-spawn snapshot.
+  // If the file vanished between snapshot and cleanup (e.g., another
+  // process unlinked it), statSync throws ENOENT — pre-fix the
+  // catch-all silently swallowed without coverage. Test that the
+  // happy path tolerates a synthetic statSync throw.
+  const dir = mkTmp('orch-AC1c');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    const phaseDir = makePhaseDir(mp, 'phase-1');
+    // Plant a stale signal that the cleanup pass will try to inspect.
+    writeCompletionSignal(phaseDir, 'impl', 'complete');
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    let statSyncCalls = 0;
+    const throwingStatSync = (p) => {
+      // First call (pre-spawn snapshot): use real fs.statSync.
+      // Subsequent calls (post-spawn cleanup): throw ENOENT to
+      // simulate the file vanishing mid-cleanup.
+      statSyncCalls += 1;
+      if (statSyncCalls === 1) return fs.statSync(p);
+      const e = new Error('ENOENT: file vanished');
+      e.code = 'ENOENT';
+      throw e;
+    };
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    // Recovery dispatch triggers stale-signal cleanup.
+    const result = O.executeActions(
+      [{ type: 'spawn', phaseId: 'phase-1', role: 'impl', mode: 'recovery', iteration: 1 }],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: makeFakeSpawnSession(),
+        _generatePrompt: makeFakeGenerate(),
+        _runUpdate: makeFakeRunUpdate(),
+        _statSync: throwingStatSync,
+        logger: silentLogger(),
+        projectName: 'p',
+      }
+    );
+    // Should NOT crash — the throwing statSync is tolerated.
+    assert.strictEqual(result.fatal, null);
+    assert.strictEqual(result.spawned, 1);
   } finally {
     rmrf(dir);
   }

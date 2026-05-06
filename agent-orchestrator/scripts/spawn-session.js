@@ -541,17 +541,26 @@ function isShellWrapperCmdline(cmdline) {
   return SHELL_WRAPPERS.has(bare);
 }
 
-function parsePidLookupOutput(stdout, name, { excludeWrappers = false } = {}) {
-  if (typeof stdout !== 'string' || stdout.trim() === '') return null;
+function parsePidLookupOutput(stdout, name, { excludeWrappers = false, _parsedRows } = {}) {
   if (!name || typeof name !== 'string') return null;
-  let parsed;
-  try {
-    parsed = JSON.parse(stdout);
-  } catch (_) {
-    return null;
+  // Todo 108.p: caller can pre-parse the PowerShell JSON once and
+  // pass `_parsedRows` directly to avoid N JSON.parse calls in a
+  // fan-out tick (buildPidSnapshot iterates over N session names
+  // and previously re-parsed the same stdout each time).
+  let rows;
+  if (Array.isArray(_parsedRows)) {
+    rows = _parsedRows;
+  } else {
+    if (typeof stdout !== 'string' || stdout.trim() === '') return null;
+    let parsed;
+    try {
+      parsed = JSON.parse(stdout);
+    } catch (_) {
+      return null;
+    }
+    if (parsed === null || parsed === undefined) return null;
+    rows = Array.isArray(parsed) ? parsed : [parsed];
   }
-  if (parsed === null || parsed === undefined) return null;
-  const rows = Array.isArray(parsed) ? parsed : [parsed];
   // Boundary check on both sides: the leading group accepts an
   // optional opening single- or double-quote so quoted forms in WMI
   // CommandLine output (`--name "orch phase 0"`, `--name 'orch phase 0'`)
