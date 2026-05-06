@@ -3619,6 +3619,14 @@ async function runOrchestrator(opts) {
         } else {
           const preservedFlags = new Set();
           const runUpdateFn = opts._runUpdate || runUpdate;
+          // Codex round 3 P2: the manifest-status `'spawning'` marker
+          // is PHASE-SCOPED (single status per phase), but
+          // spawningEntries iterates over ROLES. For multi-role /
+          // review-loop phases we MUST track which phases have
+          // already been adopted (cell 2) or had a flag preserved
+          // (cell 1) so a sibling role's cell-4 rollback doesn't
+          // clobber the phase-level adoption back to 'pending'.
+          const phaseDecided = new Set();
           for (const { phaseId, role } of spawningEntries) {
             const sessionName = defaultSessionName(phaseId, role);
             const flagBasename = `.pending-${sessionName}`;
@@ -3630,6 +3638,7 @@ async function runOrchestrator(opts) {
             if (liveAlive && flagPresent) {
               // Cell 1: tab waiting for prompt — preserve flag.
               preservedFlags.add(flagBasename);
+              phaseDecided.add(phaseId);
               logger(
                 'info',
                 `resume reconciliation [cell 1]: preserving ${flagBasename} (tab pid=${snap.pid} waiting for prompt)`,
@@ -3643,6 +3652,7 @@ async function runOrchestrator(opts) {
                 started_at: new Date(opts._now ? opts._now() : Date.now()).toISOString(),
                 dispatched_at: '',
               });
+              if (r && r.ok) phaseDecided.add(phaseId);
               logger(
                 r && r.ok ? 'info' : 'warn',
                 `resume reconciliation [cell 2]: adopting live session pid=${snap.pid} (no flag — already consumed)${r && r.ok ? '' : ' — runUpdate failed: ' + (r && r.error || 'unknown')}`,
@@ -3650,35 +3660,61 @@ async function runOrchestrator(opts) {
               );
             } else if (!liveAlive && flagPresent) {
               // Cell 3: orphan — rollback marker, sweep flag.
-              rollbackSpawningMarker({
-                manifestPath: opts.manifestPath,
-                phaseId,
-                role,
-                runUpdateFn,
-                logger,
-                reason: 'resume_orphan_with_flag',
-              });
-              try { fs.unlinkSync(flagAbsPath); } catch (_) { /* ignore */ }
-              logger(
-                'info',
-                `resume reconciliation [cell 3]: rolled back marker, swept orphan ${flagBasename}`,
-                { phaseId, role }
-              );
+              // Codex round 3 P2: skip the rollback if a sibling role
+              // for the same phase already adopted (cell 1/2). The
+              // 'spawning' marker is phase-scoped, so the adoption
+              // already overwrote it with 'running'; rolling back here
+              // would undo the adoption.
+              if (phaseDecided.has(phaseId)) {
+                try { fs.unlinkSync(flagAbsPath); } catch (_) { /* ignore */ }
+                logger(
+                  'info',
+                  `resume reconciliation [cell 3, sibling-skip]: phase already adopted via another role — sweeping ${flagBasename} only`,
+                  { phaseId, role }
+                );
+              } else {
+                rollbackSpawningMarker({
+                  manifestPath: opts.manifestPath,
+                  phaseId,
+                  role,
+                  runUpdateFn,
+                  logger,
+                  reason: 'resume_orphan_with_flag',
+                });
+                try { fs.unlinkSync(flagAbsPath); } catch (_) { /* ignore */ }
+                logger(
+                  'info',
+                  `resume reconciliation [cell 3]: rolled back marker, swept orphan ${flagBasename}`,
+                  { phaseId, role }
+                );
+                phaseDecided.add(phaseId);
+              }
             } else {
               // Cell 4: clean rollback.
-              rollbackSpawningMarker({
-                manifestPath: opts.manifestPath,
-                phaseId,
-                role,
-                runUpdateFn,
-                logger,
-                reason: 'resume_clean_rollback',
-              });
-              logger(
-                'info',
-                'resume reconciliation [cell 4]: rolled back marker (no live PID, no flag)',
-                { phaseId, role }
-              );
+              // Codex round 3 P2: same sibling-skip discipline as
+              // cell 3 — don't undo a sibling's adoption.
+              if (phaseDecided.has(phaseId)) {
+                logger(
+                  'info',
+                  'resume reconciliation [cell 4, sibling-skip]: phase already adopted via another role',
+                  { phaseId, role }
+                );
+              } else {
+                rollbackSpawningMarker({
+                  manifestPath: opts.manifestPath,
+                  phaseId,
+                  role,
+                  runUpdateFn,
+                  logger,
+                  reason: 'resume_clean_rollback',
+                });
+                logger(
+                  'info',
+                  'resume reconciliation [cell 4]: rolled back marker (no live PID, no flag)',
+                  { phaseId, role }
+                );
+                phaseDecided.add(phaseId);
+              }
             }
           }
           // Sweep all .pending-* in the (workdir-side) orch dir EXCEPT
