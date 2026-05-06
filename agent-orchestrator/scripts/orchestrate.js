@@ -3249,57 +3249,31 @@ function executeSpawn(action, tickState, runState, opts, deps) {
         // (a) would lose the trust chain entirely; (b) loses one
         // tick.
         bestEffortUnlink(unlinkSync, flagPath);
-        // Todo 111: roll back the pre-spawn 'spawning' marker on
-        // EFLAGTIMEOUT so the next tick is eligible to re-dispatch.
+        // Todo 111 — REVERTED post-codex round 10 P1.
         //
-        // Codex round 1 (P1) confirmed: this rollback is SAFE only
-        // when 099's spawn-session env propagation is in place. We
-        // now (codex round 1 fix) prepend the AGENT_FLAG_TOKEN
-        // env-set to the inner cmd / powershell command line in
-        // buildSpawnCommand, so the orphan tab from a timed-out
-        // spawn carries the OLD spawn's token. The orchestrator's
-        // next-tick fresh flag carries a NEW token; the orphan
-        // tab's hook reads its bound AGENT_FLAG_TOKEN, sees
-        // mismatch, and skips without consuming the fresh flag.
-        if (!dryRun) {
-          // Codex round 2 P1: preserve the pre-spawn state on rollback.
-          // For recovery / review_retry dispatches the phase was
-          // 'running' before the marker was written; rolling back to
-          // 'pending' would corrupt review state.
-          // Codex round 8 P2: review-loop QA handoff is emitted as
-        // mode: 'initial' even though the phase is already 'running'
-        // (the impl-complete signal triggered the QA dispatch). For
-        // those, the prior status is 'running', not 'pending' —
-        // rolling back to 'pending' would let the next tick treat
-        // the phase as fresh and re-dispatch impl, deleting the
-        // existing impl-complete signal. Detect via the manifest's
-        // review_loop block + the phase status entry's review_stage.
-        const reviewEnabledHere =
-          phase.review_loop && phase.review_loop.enabled;
-        const phaseEntryHere =
-          tickState.status &&
-          tickState.status.phases &&
-          tickState.status.phases[phase.id];
-        const inReviewLoopRunning =
-          reviewEnabledHere &&
-          phaseEntryHere &&
-          (typeof phaseEntryHere.review_stage === 'string' ||
-            (Number.isInteger(phaseEntryHere.review_iteration) &&
-              phaseEntryHere.review_iteration > 0));
-        const priorStatus =
-          isRecovery || isReviewRetry || inReviewLoopRunning
-            ? 'running'
-            : 'pending';
-          rollbackSpawningMarker({
-            manifestPath,
-            phaseId: phase.id,
-            role,
-            runUpdateFn,
-            logger,
-            reason: 'EFLAGTIMEOUT',
-            priorStatus,
-          });
-        }
+        // Codex caught: rolling the marker back to 'pending' lets the
+        // next tick re-dispatch a fresh tab WITH THE SAME SESSION
+        // NAME (orch-<phase>-<role>) while the original timed-out
+        // tab may still be alive. 099's token-binding prevents
+        // wrong-prompt delivery, but PID lookup is keyed by --name
+        // and cannot tell which of two same-named processes is
+        // ours — the orchestrator could end up monitoring the wrong
+        // PID, breaking the per-(phase, role) uniqueness invariant
+        // the rest of the orchestrator depends on.
+        //
+        // Safer path: leave the 'spawning' marker intact. The next
+        // tick's reconciliation pass (decideTickActions, with the
+        // wrapper-inclusive defer logic from codex round 6/7)
+        // verifies whether the timed-out tab is genuinely dead
+        // before allowing a respawn. If it dies → marker rolls back
+        // there. If it lives → reconciliation adopts. Either way,
+        // session-name uniqueness is preserved.
+        //
+        // The wasted retry-count increment that 111's RA wanted to
+        // save is a smaller cost than the duplicate-session-name
+        // bug. Surface in V1.5 design if a more aggressive rollback
+        // is needed once spawn-session learns to verify session-
+        // name uniqueness before launching.
         const err = new Error(
           `flag ${path.basename(flagPath)} not consumed within ` +
             `${consumeTimeoutMs}ms; treating as spawn failure (cross-session ` +
@@ -3784,7 +3758,14 @@ async function runOrchestrator(opts) {
         // surviving cmd /k wrapper), but for resume reconciliation
         // we want to know "is ANY process alive for this session" —
         // wrapper-only counts.
+        //
+        // Codex round 10 P2: pidSnapshotWithWrappers === null means
+        // the secondary lookup failed. Without it we'd misclassify
+        // wrapper-only waiting tabs as cell 3 (sweep flag) and
+        // orphan them. Treat this as "snapshot unavailable" for
+        // the entire sweep — defer like the primary-null case.
         let pidSnapshotWithWrappers = null;
+        let wrapperSnapshotFailed = false;
         if (pidSnapshot !== null) {
           try {
             const buildWithWrappers = (sn, oo) => {
@@ -3815,14 +3796,16 @@ async function runOrchestrator(opts) {
               return m;
             };
             pidSnapshotWithWrappers = buildWithWrappers(sessionNames, opts);
+            if (pidSnapshotWithWrappers === null) wrapperSnapshotFailed = true;
           } catch (_) {
             pidSnapshotWithWrappers = null;
+            wrapperSnapshotFailed = true;
           }
         }
-        if (pidSnapshot === null) {
+        if (pidSnapshot === null || wrapperSnapshotFailed) {
           logger(
             'warn',
-            'resume sweep deferred: pid snapshot unavailable (PowerShell/WMI failure); next tick will retry'
+            `resume sweep deferred: pid snapshot unavailable (${pidSnapshot === null ? 'primary' : 'wrapper-inclusive'} PowerShell/WMI failure); next tick will retry`
           );
         } else {
           const preservedFlags = new Set();
