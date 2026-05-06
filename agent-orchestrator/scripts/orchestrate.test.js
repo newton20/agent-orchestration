@@ -5465,6 +5465,121 @@ test('AG3 [todo 095] abort listener stays at 1 across many ticks (no MaxListener
 });
 
 // =========================================================================
+// AG4 — todo 105 resume reconciliation-aware sweep
+// =========================================================================
+
+test('AG4a [todo 105 cell 1] resume preserves .pending-<name> when tab is alive (waiting for prompt)', async () => {
+  const dir = mkTmp('orch-AG4a');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, {
+      phases: { 'phase-1': { status: 'spawning', dispatched_at: '2026-01-01T00:00:00Z' } },
+    });
+    const orchDir = path.join(dir, 'docs', 'orchestration');
+    fs.mkdirSync(orchDir, { recursive: true });
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const flagPath = path.join(orchDir, '.pending-orch-phase-1-impl');
+    fs.writeFileSync(flagPath, 'prompt-content');
+    // Inject a pid runner that reports the session as live.
+    const fakePidRunner = () =>
+      JSON.stringify([
+        {
+          ProcessId: 12345,
+          CommandLine: 'claude --name orch-phase-1-impl',
+        },
+      ]);
+    await O.runOrchestrator({
+      manifestPath: mp,
+      resume: true,
+      _spawnSession: makeFakeSpawnSession(),
+      _generatePrompt: makeFakeGenerate(),
+      _checkHealth: () => makeStubHealth({ pidAlive: true }),
+      _pidRunner: fakePidRunner,
+      _sleep: () => Promise.resolve(),
+      logger: silentLogger(),
+      projectName: 't',
+      maxTicks: 0,
+    });
+    assert.ok(
+      fs.existsSync(flagPath),
+      'cell 1: live PID + flag present → flag must be preserved'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AG4b [todo 105 cell 3] resume sweeps orphan .pending-<name> when no live PID', async () => {
+  const dir = mkTmp('orch-AG4b');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, {
+      phases: { 'phase-1': { status: 'spawning', dispatched_at: '2026-01-01T00:00:00Z' } },
+    });
+    const orchDir = path.join(dir, 'docs', 'orchestration');
+    fs.mkdirSync(orchDir, { recursive: true });
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const flagPath = path.join(orchDir, '.pending-orch-phase-1-impl');
+    fs.writeFileSync(flagPath, 'stale-prompt');
+    // pid runner returns no matching session.
+    await O.runOrchestrator({
+      manifestPath: mp,
+      resume: true,
+      _spawnSession: makeFakeSpawnSession(),
+      _generatePrompt: makeFakeGenerate(),
+      _checkHealth: () => makeStubHealth({ pidAlive: false }),
+      _pidRunner: () => '[]',
+      _sleep: () => Promise.resolve(),
+      logger: silentLogger(),
+      projectName: 't',
+      maxTicks: 0,
+    });
+    assert.ok(
+      !fs.existsSync(flagPath),
+      'cell 3: no live PID + orphan flag → flag must be swept'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AG4c [todo 105 null-pidSnapshot] resume DEFERS sweep entirely when buildPidSnapshot returns null', async () => {
+  const dir = mkTmp('orch-AG4c');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, {
+      phases: { 'phase-1': { status: 'spawning', dispatched_at: '2026-01-01T00:00:00Z' } },
+    });
+    const orchDir = path.join(dir, 'docs', 'orchestration');
+    fs.mkdirSync(orchDir, { recursive: true });
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const flagPath = path.join(orchDir, '.pending-orch-phase-1-impl');
+    fs.writeFileSync(flagPath, 'prompt');
+    // pid runner THROWS → buildPidSnapshot returns null → sweep defers.
+    await O.runOrchestrator({
+      manifestPath: mp,
+      resume: true,
+      _spawnSession: makeFakeSpawnSession(),
+      _generatePrompt: makeFakeGenerate(),
+      _checkHealth: () => makeStubHealth({ pidAlive: true }),
+      _pidRunner: () => {
+        throw new Error('WMI unavailable');
+      },
+      _sleep: () => Promise.resolve(),
+      logger: silentLogger(),
+      projectName: 't',
+      maxTicks: 0,
+    });
+    assert.ok(
+      fs.existsSync(flagPath),
+      'null pidSnapshot must DEFER the sweep — flag remains'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+// =========================================================================
 // AH — codex round 17 regression tests
 // =========================================================================
 

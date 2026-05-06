@@ -3480,6 +3480,164 @@ async function runOrchestrator(opts) {
     }
   }
 
+  // Todo 105: --resume reconciliation-aware sweep with the four-cell
+  // decision table.
+  //
+  // Cells (live PID? × matching .pending-<name> present?):
+  //   1. PID alive + flag present  → preserve flag (tab is waiting).
+  //   2. PID alive + no flag       → adopt: 'spawning' → 'running' now.
+  //   3. No PID + flag present     → orphan: rollback marker, sweep flag.
+  //   4. No PID + no flag          → rollback marker (no flag to sweep).
+  //
+  // After the per-phase reconciliation, sweep every .pending-* in the
+  // orch dir EXCEPT the preserved set (cell 1 flags). Each subsequent
+  // spawn from this resume's main loop writes its own .pending-<name>
+  // after the sweep — no tick-1 leakage.
+  //
+  // Degenerate case: when buildPidSnapshot returns null (PowerShell /
+  // WMI failure on this resume entry), the preserved set can't be
+  // computed reliably. The sweep DEFERS entirely — no flags swept,
+  // no markers rolled back. Matches the existing 090 reconciliation's
+  // skip-on-null behavior at decideTickActions.
+  if (opts.resume && !dryRun) {
+    try {
+      const loadFn = opts._loadManifest || loadManifest;
+      const statusFn = opts._loadStatus || loadStatus;
+      const ml = loadFn(opts.manifestPath);
+      const sl = statusFn(opts.manifestPath);
+      if (ml.ok && sl.ok && sl.status && sl.status.phases) {
+        // Build a pidSnapshot for every spawning (phase, role).
+        const spawningEntries = [];
+        for (const phaseId of Object.keys(sl.status.phases)) {
+          const e = sl.status.phases[phaseId];
+          if (!e || typeof e !== 'object' || e.status !== 'spawning') continue;
+          // Determine candidate roles: declared agents in the manifest,
+          // plus review-loop synthesized roles.
+          const phase = ml.manifest && Array.isArray(ml.manifest.phases)
+            ? ml.manifest.phases.find((p) => p && p.id === phaseId)
+            : null;
+          const declaredRoles = new Set(
+            Array.isArray(phase && phase.agents)
+              ? phase.agents.map((a) => a && a.role).filter((r) => typeof r === 'string')
+              : phase && phase.agent && typeof phase.agent.role === 'string'
+                ? [phase.agent.role]
+                : []
+          );
+          if (phase && phase.review_loop && phase.review_loop.enabled) {
+            declaredRoles.add('impl');
+            declaredRoles.add('qa');
+          }
+          for (const role of declaredRoles) {
+            spawningEntries.push({ phaseId, role });
+          }
+        }
+        const sessionNames = spawningEntries.map((s) =>
+          defaultSessionName(s.phaseId, s.role)
+        );
+        const pidSnapshot = buildPidSnapshot(sessionNames, opts);
+        if (pidSnapshot === null) {
+          logger(
+            'warn',
+            'resume sweep deferred: pid snapshot unavailable (PowerShell/WMI failure); next tick will retry'
+          );
+        } else {
+          const preservedFlags = new Set();
+          const runUpdateFn = opts._runUpdate || runUpdate;
+          for (const { phaseId, role } of spawningEntries) {
+            const sessionName = defaultSessionName(phaseId, role);
+            const flagBasename = `.pending-${sessionName}`;
+            const flagAbsPath = path.join(orchDir, flagBasename);
+            const snap = pidSnapshot.get(sessionName);
+            const liveAlive = !!(snap && Number.isInteger(snap.pid) && snap.pid > 0);
+            const existsSync = opts._existsSync || fs.existsSync;
+            const flagPresent = existsSync(flagAbsPath);
+            if (liveAlive && flagPresent) {
+              // Cell 1: tab waiting for prompt — preserve flag.
+              preservedFlags.add(flagBasename);
+              logger(
+                'info',
+                `resume reconciliation [cell 1]: preserving ${flagBasename} (tab pid=${snap.pid} waiting for prompt)`,
+                { phaseId, role }
+              );
+            } else if (liveAlive && !flagPresent) {
+              // Cell 2: adopt — transition to running.
+              const r = runUpdateFn(opts.manifestPath, phaseId, {
+                status: 'running',
+                pid: snap.pid,
+                started_at: new Date(opts._now ? opts._now() : Date.now()).toISOString(),
+                dispatched_at: '',
+              });
+              logger(
+                r && r.ok ? 'info' : 'warn',
+                `resume reconciliation [cell 2]: adopting live session pid=${snap.pid} (no flag — already consumed)${r && r.ok ? '' : ' — runUpdate failed: ' + (r && r.error || 'unknown')}`,
+                { phaseId, role }
+              );
+            } else if (!liveAlive && flagPresent) {
+              // Cell 3: orphan — rollback marker, sweep flag.
+              rollbackSpawningMarker({
+                manifestPath: opts.manifestPath,
+                phaseId,
+                role,
+                runUpdateFn,
+                logger,
+                reason: 'resume_orphan_with_flag',
+              });
+              try { fs.unlinkSync(flagAbsPath); } catch (_) { /* ignore */ }
+              logger(
+                'info',
+                `resume reconciliation [cell 3]: rolled back marker, swept orphan ${flagBasename}`,
+                { phaseId, role }
+              );
+            } else {
+              // Cell 4: clean rollback.
+              rollbackSpawningMarker({
+                manifestPath: opts.manifestPath,
+                phaseId,
+                role,
+                runUpdateFn,
+                logger,
+                reason: 'resume_clean_rollback',
+              });
+              logger(
+                'info',
+                'resume reconciliation [cell 4]: rolled back marker (no live PID, no flag)',
+                { phaseId, role }
+              );
+            }
+          }
+          // Sweep all .pending-* in the orch dir EXCEPT preservedFlags.
+          // Each subsequent spawn writes its own flag after the sweep.
+          let entries = [];
+          try {
+            entries = (opts._readdirSync || fs.readdirSync)(orchDir);
+          } catch (e) {
+            if (e && e.code !== 'ENOENT') {
+              logger('warn', `resume sweep readdir failed at ${orchDir}: ${e.message}`);
+            }
+          }
+          let swept = 0;
+          for (const name of entries) {
+            if (typeof name !== 'string') continue;
+            if (!name.startsWith('.pending-')) continue;
+            if (preservedFlags.has(name)) continue;
+            if (name.includes('.tmp-')) continue;
+            const p = path.join(orchDir, name);
+            try {
+              fs.unlinkSync(p);
+              swept += 1;
+            } catch (_) { /* best-effort */ }
+          }
+          logger(
+            'info',
+            `resume sweep complete: preserved=${preservedFlags.size}, swept=${swept}, adopted=${spawningEntries.length}`
+          );
+        }
+      }
+    } catch (e) {
+      logger('warn', `resume reconciliation failed: ${e && e.message ? e.message : String(e)}`);
+    }
+  }
+
   const runState = {
     convergenceCounters: new Map(),
     tickIndex: 0,
