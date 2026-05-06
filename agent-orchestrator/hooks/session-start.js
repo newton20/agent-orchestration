@@ -223,11 +223,20 @@ function runHook(opts) {
     }
 
     // Todo 099: post-rename revalidation. A race between peek and
-    // rename could swap the file content (extremely unlikely, but
-    // the existing protocol assumes atomic-rename guarantees only
-    // on the rename itself). Re-read post-rename and bail if the
-    // token no longer matches the tab-bound token. Now bounded by
-    // the size guard above.
+    // rename could swap the file content. The codex round 18 P2
+    // race: an OLD tab peeks `.pending-<name>` (token T1, matches),
+    // then the orchestrator deletes it (EFLAGTIMEOUT), then writes
+    // a FRESH `.pending-<name>` (token T2), then the old tab's
+    // renameSync runs and steals the FRESH flag. Post-rename peek
+    // sees T2 → mismatch.
+    //
+    // Pre-round-18, this path unlinked the .consuming-* file —
+    // losing the fresh prompt for the intended new tab. Now we
+    // try to RESTORE it: rename `.consuming-*` back to
+    // `.pending-<name>` so the intended tab's hook can find it.
+    // Best-effort; if restore fails (target exists, FS error), we
+    // log loudly and unlink — better to surface a missing prompt
+    // than silently corrupt the protocol.
     if (tabToken) {
       let postContent;
       try {
@@ -239,12 +248,18 @@ function runHook(opts) {
       }
       const postToken = extractSpawnToken(postContent);
       if (postToken !== tabToken) {
-        // Renaming back is unnecessary — the file is now `.consuming-*`
-        // and orphan to whichever tab thought it was renaming for
-        // itself. Best-effort cleanup; the intended-tab's flag is
-        // unaffected because this rename happened on a DIFFERENT
-        // candidate (the one whose post-rename content didn't match).
-        tryUnlink(fsLib, consumingPath);
+        // Best-effort restore: rename consuming back to pending so
+        // the intended new tab's hook still finds the fresh prompt.
+        try {
+          fsLib.renameSync(consumingPath, cand.path);
+        } catch (err) {
+          // Restore failed (target may already exist from a yet-
+          // newer flag, or FS error). Log loudly — this is the
+          // protocol-corruption window. Cleanup the consuming-*
+          // sidecar so no stale file lingers.
+          logErr(`post-rename token mismatch + restore failed for ${cand.name}: ${err.message}`);
+          tryUnlink(fsLib, consumingPath);
+        }
         continue;
       }
     }
