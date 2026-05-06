@@ -3873,14 +3873,29 @@ async function runOrchestrator(opts) {
             );
             const existsSync = opts._existsSync || fs.existsSync;
             const flagPresent = existsSync(flagAbsPath);
+            // Codex round 13 P2: differentiate inner-Claude alive vs
+            // wrapper-only. Cell 1 (preserve flag) accepts wrapper-
+            // only as evidence the tab is still launching. Cell 2
+            // (adopt as running) requires INNER Claude alive — a
+            // wrapper-only with no flag means Claude exited and the
+            // wrapper is post-mortem; adopting it would mark a dead
+            // session 'running' with a fresh started_at grace window.
+            const innerAlive = !!(snap && Number.isInteger(snap.pid) && snap.pid > 0);
+            const wrapperAlive = !!(
+              wrapperSnap && Number.isInteger(wrapperSnap.pid) && wrapperSnap.pid > 0
+            );
             // Resolve the actual PID for adoption / logging. Prefer
-            // the inner Claude's PID (snap) when available; fall back
-            // to the wrapper's PID when only it is visible.
-            const adoptedPid = snap && Number.isInteger(snap.pid) ? snap.pid
-              : wrapperSnap && Number.isInteger(wrapperSnap.pid) ? wrapperSnap.pid
+            // the inner Claude's PID; fall back to the wrapper's PID
+            // when only it is visible (used for logs / cell 1).
+            const adoptedPid = innerAlive ? snap.pid
+              : wrapperAlive ? wrapperSnap.pid
               : null;
             if (liveAlive && flagPresent) {
               // Cell 1: tab waiting for prompt — preserve flag.
+              // Wrapper-only is fine here; the SessionStart hook
+              // will fire when Claude eventually starts, consume
+              // the flag, and the next tick's reconciliation will
+              // adopt via the normal inner-Claude PID match.
               preservedFlags.add(flagBasename);
               phaseDecided.add(phaseId);
               logger(
@@ -3888,8 +3903,11 @@ async function runOrchestrator(opts) {
                 `resume reconciliation [cell 1]: preserving ${flagBasename} (tab pid=${adoptedPid} waiting for prompt)`,
                 { phaseId, role }
               );
-            } else if (liveAlive && !flagPresent) {
-              // Cell 2: adopt — transition to running.
+            } else if (innerAlive && !flagPresent) {
+              // Cell 2: adopt — transition to running. Codex round 13
+              // P2: gate on innerAlive specifically (NOT liveAlive),
+              // so a wrapper-only post-mortem doesn't get adopted as
+              // a fresh running phase.
               const r = runUpdateFn(opts.manifestPath, phaseId, {
                 status: 'running',
                 pid: adoptedPid,
@@ -3902,8 +3920,10 @@ async function runOrchestrator(opts) {
                 `resume reconciliation [cell 2]: adopting live session pid=${adoptedPid} (no flag — already consumed)${r && r.ok ? '' : ' — runUpdate failed: ' + (r && r.error || 'unknown')}`,
                 { phaseId, role }
               );
-            } else if (!liveAlive && flagPresent) {
-              // Cell 3: orphan — rollback marker, sweep flag.
+            } else if (flagPresent) {
+              // Cell 3: orphan — flag without an inner-Claude PID
+              // (and either no wrapper alive, or the wrapper-only
+              // window has elapsed). Rollback marker, sweep flag.
               // Codex round 3 P2: skip the rollback if a sibling role
               // for the same phase already adopted (cell 1/2). The
               // 'spawning' marker is phase-scoped, so the adoption
@@ -3928,23 +3948,33 @@ async function runOrchestrator(opts) {
                 });
                 // Codex round 12 P2: charge the failed mid-spawn
                 // attempt against retry_count — symmetric with
-                // decideTickActions's reconciliation rollback. A
-                // phase that repeatedly crashes mid-spawn across
-                // restarts must consume the recovery budget; pre-
-                // fix it could be retried indefinitely.
+                // decideTickActions's reconciliation rollback.
+                // Codex round 13 P2: ONLY increment if the existing
+                // retry_count has a well-formed shape. A corrupt
+                // value (e.g. "two") would otherwise be silently
+                // coerced to 0 and overwritten with 1, defeating
+                // the next-tick shape-validation pre-pass that
+                // would have blocked the phase. Leave corrupt
+                // values in place so the pre-pass surfaces them.
                 const shape = validateRetryCountShape(phaseEntry);
-                const cur = shape.ok ? shape.value : 0;
-                runUpdateFn(opts.manifestPath, phaseId, { retry_count: cur + 1 });
+                if (shape.ok) {
+                  runUpdateFn(opts.manifestPath, phaseId, { retry_count: shape.value + 1 });
+                }
                 try { fs.unlinkSync(flagAbsPath); } catch (_) { /* ignore */ }
                 logger(
                   'info',
-                  `resume reconciliation [cell 3]: rolled back marker (retry_count ${cur} → ${cur + 1}), swept orphan ${flagBasename}`,
+                  `resume reconciliation [cell 3]: rolled back marker (retry_count${shape.ok ? ` ${shape.value} → ${shape.value + 1}` : ' left corrupt for pre-pass to block'}), swept orphan ${flagBasename}`,
                   { phaseId, role }
                 );
                 phaseDecided.add(phaseId);
               }
             } else {
-              // Cell 4: clean rollback.
+              // Cell 4: clean rollback. Includes:
+              //   - !liveAlive && !flagPresent (no process anywhere)
+              //   - wrapperAlive && !innerAlive && !flagPresent
+              //     (wrapper-only post-mortem after Claude exited)
+              // Both warrant rollback so the phase becomes eligible
+              // for re-dispatch / recovery on the next tick.
               // Codex round 3 P2: same sibling-skip discipline as
               // cell 3 — don't undo a sibling's adoption.
               if (phaseDecided.has(phaseId)) {
@@ -3963,16 +3993,17 @@ async function runOrchestrator(opts) {
                   reason: 'resume_clean_rollback',
                   priorStatus: inferredPriorStatus,
                 });
-                // Codex round 12 P2: same retry_count increment as
-                // cell 3. A phase whose pre-spawn marker was written
-                // but whose tab never started counts as one
-                // recovery-budget attempt.
+                // Codex round 13 P2: shape-conditional increment as
+                // in cell 3 — corrupt values stay corrupt so the
+                // next-tick pre-pass blocks them.
                 const shape = validateRetryCountShape(phaseEntry);
-                const cur = shape.ok ? shape.value : 0;
-                runUpdateFn(opts.manifestPath, phaseId, { retry_count: cur + 1 });
+                if (shape.ok) {
+                  runUpdateFn(opts.manifestPath, phaseId, { retry_count: shape.value + 1 });
+                }
+                const wrapperOnly = !innerAlive && wrapperAlive;
                 logger(
                   'info',
-                  `resume reconciliation [cell 4]: rolled back marker (retry_count ${cur} → ${cur + 1}; no live PID, no flag)`,
+                  `resume reconciliation [cell 4]: rolled back marker (retry_count${shape.ok ? ` ${shape.value} → ${shape.value + 1}` : ' left corrupt for pre-pass to block'}; ${wrapperOnly ? 'wrapper-only post-mortem' : 'no live PID'}, no flag)`,
                   { phaseId, role }
                 );
                 phaseDecided.add(phaseId);
