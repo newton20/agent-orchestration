@@ -783,6 +783,156 @@ test('H3 timeout → recovery (treated as crash)', () => {
   }
 });
 
+test('H5 [todo 097] shape-corrupt retry_count="two" blocks the phase (no recovery)', () => {
+  const dir = mkTmp('orch-H5');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, {
+      phases: { 'phase-1': { status: 'running', retry_count: 'two' } },
+    });
+    makePhaseDir(mp, 'phase-1');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      { _checkHealth: () => makeStubHealth({ pidAlive: false }) }
+    );
+    assert.ok(
+      actions.some(
+        (a) => a.type === 'mark_phase_blocked' && /retry_count_shape_corrupt/.test(a.reason || '')
+      ),
+      'shape-corrupt retry_count must emit mark_phase_blocked, not silently coerce to 0'
+    );
+    assert.ok(
+      !actions.some((a) => a.type === 'spawn' && a.mode === 'recovery'),
+      'shape-corrupt phase must not enter the recovery dispatch path'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('H5b [todo 097] shape-corrupt retry_count=2.5 (float) blocks the phase', () => {
+  const dir = mkTmp('orch-H5b');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, {
+      phases: { 'phase-1': { status: 'running', retry_count: 2.5 } },
+    });
+    makePhaseDir(mp, 'phase-1');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      { _checkHealth: () => makeStubHealth({ pidAlive: false }) }
+    );
+    assert.ok(
+      actions.some((a) => a.type === 'mark_phase_blocked'),
+      'float retry_count must emit mark_phase_blocked'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('H5c [todo 097] retry_count=-1 (negative) blocks the phase', () => {
+  const dir = mkTmp('orch-H5c');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, {
+      phases: { 'phase-1': { status: 'running', retry_count: -1 } },
+    });
+    makePhaseDir(mp, 'phase-1');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      { _checkHealth: () => makeStubHealth({ pidAlive: false }) }
+    );
+    assert.ok(actions.some((a) => a.type === 'mark_phase_blocked'));
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('H5d [todo 097] retry_count absent → treated as 0 (legitimate fresh-spawn, NOT blocked)', () => {
+  const dir = mkTmp('orch-H5d');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    // Note: NO retry_count key on the phase entry.
+    writeStatus(mp, { phases: { 'phase-1': { status: 'running' } } });
+    makePhaseDir(mp, 'phase-1');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      { _checkHealth: () => makeStubHealth({ pidAlive: false }) }
+    );
+    assert.ok(
+      !actions.some((a) => a.type === 'mark_phase_blocked'),
+      'absent retry_count is a legitimate fresh-spawn case; must NOT block'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('H5e [todo 097] retry_count present with explicit null blocks the phase', () => {
+  const dir = mkTmp('orch-H5e');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, {
+      phases: { 'phase-1': { status: 'running', retry_count: null } },
+    });
+    makePhaseDir(mp, 'phase-1');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      { _checkHealth: () => makeStubHealth({ pidAlive: false }) }
+    );
+    assert.ok(
+      actions.some((a) => a.type === 'mark_phase_blocked'),
+      'explicit null retry_count is shape-corrupt (vs absence which defaults to 0)'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('H5f [todo 097] retry_count=5 above MAX_RETRIES (3) is NOT shape-corrupt — flows through to budget-exhausted recovery path', () => {
+  const dir = mkTmp('orch-H5f');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, {
+      phases: { 'phase-1': { status: 'running', retry_count: 5 } },
+    });
+    makePhaseDir(mp, 'phase-1');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      { _checkHealth: () => makeStubHealth({ pidAlive: false }) }
+    );
+    // Over-budget integer must NOT be misclassified as shape-corrupt.
+    assert.ok(
+      !actions.some(
+        (a) => a.type === 'mark_phase_blocked' && /retry_count_shape_corrupt/.test(a.reason || '')
+      ),
+      'over-budget integer is legitimate historical state, NOT shape-corrupt'
+    );
+    // The exhausted-budget path emits mark_phase_failed via decideRecoveryAction.
+    assert.ok(
+      actions.some(
+        (a) => a.type === 'mark_phase_failed' && /recovery_budget_exhausted/.test(a.reason || '')
+      ),
+      'over-budget integer triggers the documented recovery-budget-exhausted policy'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
 test('H4 retry_count increments on each recovery dispatch', () => {
   const dir = mkTmp('orch-H4');
   try {
@@ -907,6 +1057,122 @@ test('I4 session_not_found nulls also count toward convergence', () => {
       );
     }
     assert.ok(lastActions.some((a) => a.type === 'spawn' && a.mode === 'recovery'));
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('I4b [todo 098] startup_grace RESETS the counter (flap pattern: lookup_failed → grace → lookup_failed counts 1, not 2)', () => {
+  // The "consecutive" word in todo 071's contract is load-bearing:
+  // recovery only fires after N _consecutive_ failures. Pre-fix,
+  // startup_grace was a skip-the-increment, not a reset — the
+  // pattern lookup_failed → startup_grace → lookup_failed left the
+  // counter at 2 (off-by-one from the contract). The fix resets on
+  // grace so the second null is the second consecutive failure
+  // counted from a fresh start.
+  const dir = mkTmp('orch-I4b');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, { phases: { 'phase-1': { status: 'running', retry_count: 0 } } });
+    makePhaseDir(mp, 'phase-1');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const counters = new Map();
+    O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: counters },
+      {
+        _checkHealth: () =>
+          makeStubHealth({ pidAlive: null, pidAliveReason: 'lookup_failed' }),
+        lookupFailedConvergeN: 3,
+      }
+    );
+    assert.strictEqual(counters.get('phase-1:impl'), 1);
+    O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: counters },
+      {
+        _checkHealth: () =>
+          makeStubHealth({ pidAlive: null, pidAliveReason: 'startup_grace' }),
+        lookupFailedConvergeN: 3,
+      }
+    );
+    assert.strictEqual(
+      counters.has('phase-1:impl'),
+      false,
+      'startup_grace must RESET the counter, not just skip the increment'
+    );
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: counters },
+      {
+        _checkHealth: () =>
+          makeStubHealth({ pidAlive: null, pidAliveReason: 'lookup_failed' }),
+        lookupFailedConvergeN: 3,
+      }
+    );
+    assert.strictEqual(counters.get('phase-1:impl'), 1);
+    assert.ok(
+      !actions.some((a) => a.type === 'spawn' && a.mode === 'recovery'),
+      'should NOT recover on second lookup_failed when grace reset the counter'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('I4c [todo 098] flap pattern under custom --converge-n=2 also honors startup_grace reset', () => {
+  // Verifies the threshold itself is unchanged by 098's fix — the
+  // configured --converge-n is preserved, only the WHEN-to-reset
+  // semantic changed. With converge-n=2: lookup_failed → grace →
+  // lookup_failed → lookup_failed should fire on the third call
+  // (counter sequence: 1, reset to 0, 1, 2 → trigger).
+  const dir = mkTmp('orch-I4c');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, { phases: { 'phase-1': { status: 'running', retry_count: 0 } } });
+    makePhaseDir(mp, 'phase-1');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const counters = new Map();
+    let actions;
+    actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: counters },
+      {
+        _checkHealth: () =>
+          makeStubHealth({ pidAlive: null, pidAliveReason: 'lookup_failed' }),
+        lookupFailedConvergeN: 2,
+      }
+    );
+    assert.ok(!actions.some((a) => a.type === 'spawn' && a.mode === 'recovery'));
+    O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: counters },
+      {
+        _checkHealth: () =>
+          makeStubHealth({ pidAlive: null, pidAliveReason: 'startup_grace' }),
+        lookupFailedConvergeN: 2,
+      }
+    );
+    actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: counters },
+      {
+        _checkHealth: () =>
+          makeStubHealth({ pidAlive: null, pidAliveReason: 'lookup_failed' }),
+        lookupFailedConvergeN: 2,
+      }
+    );
+    assert.ok(!actions.some((a) => a.type === 'spawn' && a.mode === 'recovery'));
+    actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: counters },
+      {
+        _checkHealth: () =>
+          makeStubHealth({ pidAlive: null, pidAliveReason: 'lookup_failed' }),
+        lookupFailedConvergeN: 2,
+      }
+    );
+    assert.ok(actions.some((a) => a.type === 'spawn' && a.mode === 'recovery'));
   } finally {
     rmrf(dir);
   }
@@ -4529,6 +4795,77 @@ test('AG2 [codex round 16 P2] abort during sleep exits without waiting full inte
       elapsed < 3000,
       `aborted run should exit fast; took ${elapsed}ms (interval was 5000ms)`
     );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AG3 [todo 095] abort listener stays at 1 across many ticks (no MaxListenersExceededWarning)', async () => {
+  // Pre-fix, runOrchestrator wired addEventListener('abort', ..., {once:true})
+  // every tick — Node fires MaxListenersExceededWarning at 11. Run 50 ticks
+  // through a fast-resolving _sleep and assert the listener count stays at 1.
+  const dir = mkTmp('orch-AG3');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, { phases: { 'phase-1': { status: 'running' } } });
+    makePhaseDir(mp, 'phase-1');
+    const ac = new AbortController();
+    let warningSeen = false;
+    const onWarning = (w) => {
+      if (
+        w &&
+        (w.name === 'MaxListenersExceededWarning' ||
+          /MaxListenersExceededWarning/.test(String(w.message || w)))
+      ) {
+        warningSeen = true;
+      }
+    };
+    process.on('warning', onWarning);
+    let maxObservedListeners = 0;
+    try {
+      await O.runOrchestrator({
+        manifestPath: mp,
+        resume: true,
+        signal: ac.signal,
+        _spawnSession: makeFakeSpawnSession(),
+        _generatePrompt: makeFakeGenerate(),
+        _checkHealth: () => makeStubHealth({ pidAlive: true }),
+        _pidRunner: () => '[]',
+        _sleep: async () => {
+          // Sample listener count mid-loop. Node EventTarget exposes count
+          // on the underlying [Symbol(events)] map; we count via getMaxListeners
+          // proxy where available, else fall back to N=0 (the assertion
+          // below is conservative — the warning catches the regression).
+          if (typeof ac.signal[Symbol.for('events')] !== 'undefined') {
+            const m = ac.signal[Symbol.for('events')];
+            const handlers = m && m.get && m.get('abort');
+            if (handlers && typeof handlers.length === 'number') {
+              maxObservedListeners = Math.max(maxObservedListeners, handlers.length);
+            }
+          }
+        },
+        logger: silentLogger(),
+        projectName: 't',
+        activeIntervalMs: 1,
+        idleIntervalMs: 1,
+        maxTicks: 50,
+      });
+    } finally {
+      process.removeListener('warning', onWarning);
+    }
+    assert.strictEqual(
+      warningSeen,
+      false,
+      'MaxListenersExceededWarning fired — abort listeners are leaking per tick'
+    );
+    // Listener count cap (when introspection is available) is at most 1
+    // because we register a single run-lifetime listener.
+    if (maxObservedListeners > 0) {
+      assert.ok(
+        maxObservedListeners <= 1,
+        `expected <=1 abort listener, observed ${maxObservedListeners}`
+      );
+    }
   } finally {
     rmrf(dir);
   }

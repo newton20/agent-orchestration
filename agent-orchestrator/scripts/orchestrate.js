@@ -874,6 +874,48 @@ function isTerminalStatus(s) {
   return s === 'completed' || s === 'failed' || s === 'blocked';
 }
 
+/**
+ * Todo 097: validate the SHAPE of `retry_count` on a phase status entry.
+ *
+ * The pre-fix read path silently coerced any non-integer to 0 — a
+ * corrupted `retry_count: "two"` (or `2.5`, `null`, `-1`) would grant
+ * up to 3 fresh retries beyond the documented cap, bypassing the
+ * convergence guard.
+ *
+ * Returns:
+ *   { ok: true, value: 0 }  when the field is absent (legitimate
+ *      fresh-spawn). The caller treats absent as "no retries yet."
+ *   { ok: true, value: n }  when the field is a non-negative integer.
+ *      Over-budget integers (e.g. n=5 with maxRetries=3) are NOT
+ *      corrupt — they're legitimate historical state from a prior
+ *      run with --max-recovery-retries=5; the budget comparison
+ *      happens later in decideRecoveryAction's exhausted path.
+ *   { ok: false, observed }  when the field is present but the SHAPE
+ *      is wrong (string, float, negative integer, explicit null).
+ *      The caller should mark the phase blocked with a structured
+ *      error naming the field + observed value.
+ *
+ * Critical: the absence-vs-explicit-null distinction. The orchestrator
+ * writes manifest-status with `Object.create(null)` phases, so an
+ * unset key shows up as `undefined` (absent → ok). A literal
+ * `retry_count: null` in the YAML shows up as `null` (corrupt-shape →
+ * blocked). Coercing both to 0 the way the pre-fix code did would
+ * accept a corrupted file as fresh state.
+ */
+function validateRetryCountShape(phaseEntry) {
+  if (!phaseEntry || typeof phaseEntry !== 'object') {
+    return { ok: true, value: 0 };
+  }
+  if (!('retry_count' in phaseEntry)) {
+    return { ok: true, value: 0 };
+  }
+  const raw = phaseEntry.retry_count;
+  if (Number.isInteger(raw) && raw >= 0) {
+    return { ok: true, value: raw };
+  }
+  return { ok: false, observed: raw };
+}
+
 // -------------------- Completion-signal parsing --------------------
 
 /**
@@ -1059,6 +1101,37 @@ function decideTickActions(tickState, runState, opts) {
   const checkHealthFn = opts._checkHealth || checkHealth;
   const manifestDir = path.dirname(path.resolve(manifestPath));
 
+  // -- Todo 097 pre-pass: shape-validate retry_count on every non-terminal
+  //    phase entry. Corrupt-shape values (string, float, negative integer,
+  //    explicit null) used to silently coerce to 0, granting fresh retries
+  //    beyond the cap. Block the phase with a structured error so the
+  //    operator sees the corruption in manifest-status.yaml instead of
+  //    a silent budget bypass. Use a guard set so we don't double-block
+  //    the same phase if monitoring loops below also hit it.
+  const shapeBlocked = new Set();
+  for (const phase of phases) {
+    const phaseEntry = getPhaseStatus(status, phase.id);
+    if (phaseEntry && isTerminalStatus(phaseEntry.status)) continue;
+    const shape = validateRetryCountShape(phaseEntry);
+    if (!shape.ok) {
+      actions.push({
+        type: 'log',
+        level: 'error',
+        message:
+          `phase ${phase.id} manifest-status.retry_count is shape-corrupt ` +
+          `(observed: ${JSON.stringify(shape.observed)}); ` +
+          `expected absent OR a non-negative integer. Marking phase blocked.`,
+        phaseId: phase.id,
+      });
+      actions.push({
+        type: 'mark_phase_blocked',
+        phaseId: phase.id,
+        reason: `retry_count_shape_corrupt:${JSON.stringify(shape.observed)}`,
+      });
+      shapeBlocked.add(phase.id);
+    }
+  }
+
   // -- Reconciliation pass (todo 090). Phases with `status: 'spawning'`
   // represent dispatches where the prior orchestrator wrote the
   // pre-spawn marker but died (SIGTERM / Ctrl+C / crash) before the
@@ -1076,6 +1149,7 @@ function decideTickActions(tickState, runState, opts) {
   // failed; in that case skip reconciliation this tick — next tick
   // re-tries with a fresh snapshot.
   for (const phase of phases) {
+    if (shapeBlocked.has(phase.id)) continue;
     const phaseEntry = getPhaseStatus(status, phase.id);
     if (phaseEntry.status !== 'spawning') continue;
     if (pidSnapshot === null) continue; // no snapshot this tick
@@ -1128,9 +1202,12 @@ function decideTickActions(tickState, runState, opts) {
     } else {
       // Reset to pending; budget incremented so the orchestrator's
       // recovery semantics treat this as one of the retry attempts.
-      const cur = Number.isInteger(phaseEntry.retry_count)
-        ? phaseEntry.retry_count
-        : 0;
+      // Todo 097: shape was already validated by the pre-pass above;
+      // this read is guaranteed-safe (shape-corrupt phases exit early
+      // via mark_phase_blocked). Treating absent as 0 is the legitimate
+      // fresh-spawn path validateRetryCountShape codifies.
+      const shape = validateRetryCountShape(phaseEntry);
+      const cur = shape.ok ? shape.value : 0;
       actions.push({
         type: 'log',
         level: 'warn',
@@ -1153,6 +1230,7 @@ function decideTickActions(tickState, runState, opts) {
 
   // -- First pass: monitor each running phase × role.
   for (const phase of phases) {
+    if (shapeBlocked.has(phase.id)) continue;
     const phaseEntry = getPhaseStatus(status, phase.id);
     if (phaseEntry.status !== 'running') continue;
     const phaseDir = phaseDirFor(manifestDir, phase.id);
@@ -1623,8 +1701,17 @@ function decideTickActions(tickState, runState, opts) {
       // pidAlive === null. Check the reason.
       const reason = health.pidAliveReason;
       if (reason === 'startup_grace') {
-        // Do NOT count toward the heuristic. The agent is still
-        // spawning; resolve deterministically next tick.
+        // Todo 098: startup_grace must RESET the counter (not just
+        // skip-the-increment). The convergence contract from todo 071
+        // says "N consecutive lookup_failed/session_not_found past
+        // startup-grace = crash"; the word `consecutive` is
+        // load-bearing. Pre-fix, a flap pattern of `lookup_failed →
+        // startup_grace → lookup_failed` left counter=1 across the
+        // grace tick, so the second null was counted as the second
+        // consecutive failure even though grace interrupted the run.
+        // Resetting on startup_grace makes the counter only fire when
+        // failures are actually consecutive past grace.
+        counters.delete(cKey);
         continue;
       }
       // 'lookup_failed' OR 'session_not_found' OR null reason ⇒ count.
@@ -1671,6 +1758,7 @@ function decideTickActions(tickState, runState, opts) {
 
   // -- Second pass: advance pending phases.
   for (const phase of phases) {
+    if (shapeBlocked.has(phase.id)) continue;
     const phaseEntry = getPhaseStatus(status, phase.id);
     const curStatus = phaseEntry.status || 'pending';
     if (curStatus !== 'pending') continue;
@@ -1831,9 +1919,12 @@ function decideTickActions(tickState, runState, opts) {
 
 function decideRecoveryAction(actions, runState, opts, ctx) {
   const { phase, role, phaseDir, reason, maxRetries, phaseEntry } = ctx;
-  const cur = Number.isInteger(phaseEntry.retry_count)
-    ? phaseEntry.retry_count
-    : 0;
+  // Todo 097: shape is enforced by decideTickActions's pre-pass; when
+  // we reach here the entry is either absent (fresh-spawn path → 0) or
+  // a non-negative integer. Over-budget integers fall through to the
+  // exhausted branch below — that's the documented recovery contract.
+  const shape = validateRetryCountShape(phaseEntry);
+  const cur = shape.ok ? shape.value : 0;
   if (cur >= maxRetries) {
     actions.push({
       type: 'log',
@@ -3158,6 +3249,29 @@ async function runOrchestrator(opts) {
   // `tickRes.failed.length > 0` per-tick so exit code stays correct.
   let sawFailureOrBlocked = false;
   let exitReason = null; // 'completed' | 'aborted' | 'max_ticks_unfinished' | 'max_ticks_failed' | etc.
+
+  // Todo 095: register a SINGLE abort listener for the lifetime of the
+  // run. Pre-fix, the inter-tick sleep wired a fresh `addEventListener`
+  // each tick, and `{once:true}` only auto-removes when the abort
+  // actually fires — so over 24h of idle polling (~720 ticks) we'd
+  // accumulate 720 listeners on the same signal, tripping Node's
+  // MaxListenersExceededWarning at 11 and pinning unbounded references
+  // to closed-over per-tick state.
+  //
+  // Pattern: a shared `pendingSleepAbort` ref points at the current
+  // tick's resolver (or `null` between ticks). The single listener
+  // calls whatever resolver is currently parked on the ref.
+  let pendingSleepAbort = null;
+  let sleepAbortListener = null;
+  if (signal && typeof signal.addEventListener === 'function') {
+    sleepAbortListener = () => {
+      const r = pendingSleepAbort;
+      pendingSleepAbort = null;
+      if (r) r();
+    };
+    signal.addEventListener('abort', sleepAbortListener, { once: true });
+  }
+
   try {
     for (;;) {
       if (signal && signal.aborted) {
@@ -3337,19 +3451,44 @@ async function runOrchestrator(opts) {
       // so SIGINT/SIGTERM mid-poll exits within ~50ms instead of
       // waiting up to idleMs (120s). When tests pass `_sleep` that
       // resolves immediately, this path is a no-op in practice.
+      //
+      // Todo 095: this used to register a fresh `addEventListener`
+      // per tick, leaking ~720 listeners over 24h idle. The single
+      // run-lifetime listener registered above (around the for-loop)
+      // forwards aborts to whichever resolver is parked on the
+      // shared `pendingSleepAbort` ref. We park it before sleep,
+      // clear it after, so the ref points only to the current tick's
+      // sleep — never accumulates.
       if (signal && typeof signal.addEventListener === 'function') {
-        await Promise.race([
-          sleep(sleepMs),
-          new Promise((resolve) => {
-            if (signal.aborted) resolve();
-            else signal.addEventListener('abort', () => resolve(), { once: true });
-          }),
-        ]);
+        await new Promise((resolve) => {
+          if (signal.aborted) {
+            resolve();
+            return;
+          }
+          pendingSleepAbort = resolve;
+          // sleep() resolves on its own; either it wins or the
+          // abort listener wins via pendingSleepAbort.
+          sleep(sleepMs).then(() => {
+            // Clear the parked ref only if this sleep resolved
+            // first; if abort fired the listener already cleared it.
+            if (pendingSleepAbort === resolve) pendingSleepAbort = null;
+            resolve();
+          });
+        });
       } else {
         await sleep(sleepMs);
       }
     }
   } finally {
+    // Todo 095: graceful shutdown removes the single run-lifetime
+    // abort listener. {once:true} would auto-remove on actual abort,
+    // but a clean exit (allTerminal, max_ticks_*, spawn_failure_path)
+    // never fires the abort — without explicit removal the listener
+    // would outlive the run on long-running test harnesses sharing
+    // an AbortController across runs.
+    if (signal && sleepAbortListener && typeof signal.removeEventListener === 'function') {
+      try { signal.removeEventListener('abort', sleepAbortListener); } catch (_) { /* ignore */ }
+    }
     if (lockPath) {
       releaseLock(lockPath, opts);
     }
@@ -3689,4 +3828,5 @@ module.exports = {
   depsMet,
   depsBlocked,
   getPhaseStatus,
+  validateRetryCountShape,
 };
