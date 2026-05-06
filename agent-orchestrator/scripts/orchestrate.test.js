@@ -4413,14 +4413,17 @@ test('AF2 [codex round 15 P2] manifest without permission_mode → launcher unch
   }
 });
 
-test('AF3 [codex round 15 P2] permission_mode merges with manifest launcher block', () => {
+test('AF3 [codex round 15 P2 + todo 100] permission_mode merges with manifest launcher block (enum-validated value)', () => {
   const dir = mkTmp('orch-AF3');
   try {
     const mp = writeManifest(
       dir,
       Object.assign(makeBaseManifest(), {
         launcher: { shell: 'powershell', binary: 'agency claude' },
-        defaults: { permission_mode: 'bypass' },
+        // Todo 100: permission_mode is a strict enum. The legacy free-form
+        // value `'bypass'` no longer validates; use the canonical Claude
+        // Code mode name so the merge path still exercises the same code.
+        defaults: { permission_mode: 'bypassPermissions' },
       })
     );
     fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
@@ -4441,7 +4444,7 @@ test('AF3 [codex round 15 P2] permission_mode merges with manifest launcher bloc
     const launcherArg = fakeSpawn.calls[0].launcher;
     assert.strictEqual(launcherArg.shell, 'powershell');
     assert.strictEqual(launcherArg.binary, 'agency claude');
-    assert.strictEqual(launcherArg.auto_mode_flag, '--permission-mode bypass');
+    assert.strictEqual(launcherArg.auto_mode_flag, '--permission-mode bypassPermissions');
   } finally {
     rmrf(dir);
   }

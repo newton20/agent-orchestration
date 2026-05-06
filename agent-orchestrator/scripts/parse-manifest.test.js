@@ -20,8 +20,10 @@ const {
   statusPathFor,
   loadStatus,
   runUpdate,
+  KNOWN_UPDATE_FIELDS,
   VALID_ID_RE,
   VALID_ROLES,
+  VALID_PERMISSION_MODES,
 } = require('./parse-manifest');
 const { FLAG_NAME_RE } = require('../hooks/session-start');
 
@@ -866,6 +868,152 @@ test('VALID_ROLES is the same reference imported by check-health', () => {
     VALID_ROLES,
     'check-health re-exports the same VALID_ROLES reference; mutations or replacements must propagate'
   );
+});
+
+// -------------------- Todo 102: KNOWN_UPDATE_FIELDS --------------------
+
+test('KNOWN_UPDATE_FIELDS [todo 102] includes review_iteration + review_stage + spawn_id', () => {
+  // Allow-list must contain every field orchestrate.js writes through
+  // runUpdate. Drift between this list and the writers used to silently
+  // strip review_iteration / review_stage; codex caught the same class
+  // for spawn_id (todo 104). Test the membership directly so the next
+  // writer-side addition surfaces here loudly.
+  assert.ok(KNOWN_UPDATE_FIELDS.includes('review_iteration'));
+  assert.ok(KNOWN_UPDATE_FIELDS.includes('review_stage'));
+  assert.ok(KNOWN_UPDATE_FIELDS.includes('spawn_id'));
+});
+
+test('runUpdate [todo 102] persists review_iteration + review_stage to manifest-status', () => {
+  const file = write(validMinimal);
+  const r = runUpdate(file, 'phase-0', {
+    review_iteration: 2,
+    review_stage: 'qa-running',
+  });
+  assert.strictEqual(r.ok, true, r.error);
+  const reload = loadStatus(file);
+  assert.strictEqual(reload.ok, true);
+  assert.strictEqual(reload.status.phases['phase-0'].review_iteration, 2);
+  assert.strictEqual(reload.status.phases['phase-0'].review_stage, 'qa-running');
+});
+
+test('runUpdate [todo 102] warns on truly-unknown fields (defense-in-depth)', () => {
+  const file = write(validMinimal);
+  const origWrite = process.stderr.write.bind(process.stderr);
+  let captured = '';
+  process.stderr.write = (chunk) => {
+    captured += String(chunk);
+    return true;
+  };
+  try {
+    const r = runUpdate(file, 'phase-0', { not_a_real_field: 'x' });
+    assert.strictEqual(r.ok, true, r.error);
+  } finally {
+    process.stderr.write = origWrite;
+  }
+  assert.ok(
+    /unknown update field "not_a_real_field"/.test(captured),
+    `expected stderr warning, got: ${captured}`
+  );
+});
+
+// -------------------- Todo 100: permission_mode enum --------------------
+
+test('VALID_PERMISSION_MODES [todo 100] is exported + frozen + contains documented enum', () => {
+  assert.ok(Array.isArray(VALID_PERMISSION_MODES));
+  assert.deepStrictEqual(
+    [...VALID_PERMISSION_MODES],
+    ['plan', 'default', 'acceptEdits', 'bypassPermissions']
+  );
+  assert.ok(Object.isFrozen(VALID_PERMISSION_MODES));
+});
+
+test('validate [todo 100] accepts every documented permission_mode', () => {
+  for (const mode of VALID_PERMISSION_MODES) {
+    const m = {
+      name: 'pm-ok',
+      defaults: { permission_mode: mode },
+      phases: [
+        { id: 'phase-0', completion_signal: 'x.md', agent: { role: 'impl' } },
+      ],
+    };
+    const r = validate(m);
+    assert.strictEqual(r.valid, true, `mode ${mode} should validate; errors: ${JSON.stringify(r.errors)}`);
+  }
+});
+
+test('validate [todo 100] rejects whitespace-injected permission_mode (flag-injection vector)', () => {
+  const m = {
+    name: 'pm-bad',
+    defaults: {
+      permission_mode: 'acceptEdits --dangerously-skip-permissions',
+    },
+    phases: [
+      { id: 'phase-0', completion_signal: 'x.md', agent: { role: 'impl' } },
+    ],
+  };
+  const r = validate(m);
+  assert.strictEqual(r.valid, false);
+  assert.ok(
+    r.errors.some((e) => e.path === 'defaults.permission_mode'),
+    `errors should include defaults.permission_mode; got ${JSON.stringify(r.errors)}`
+  );
+});
+
+test('validate [todo 100] rejects empty permission_mode', () => {
+  const m = {
+    name: 'pm-empty',
+    defaults: { permission_mode: '' },
+    phases: [
+      { id: 'phase-0', completion_signal: 'x.md', agent: { role: 'impl' } },
+    ],
+  };
+  const r = validate(m);
+  assert.strictEqual(r.valid, false);
+});
+
+test('validate [todo 100] rejects unknown enum value', () => {
+  const m = {
+    name: 'pm-unknown',
+    defaults: { permission_mode: 'unknownValue' },
+    phases: [
+      { id: 'phase-0', completion_signal: 'x.md', agent: { role: 'impl' } },
+    ],
+  };
+  const r = validate(m);
+  assert.strictEqual(r.valid, false);
+});
+
+// -------------------- Todo 097: retry_count strict shape --------------------
+
+test('runUpdate [todo 097] rejects float retry_count', () => {
+  const file = write(validMinimal);
+  const r = runUpdate(file, 'phase-0', { retry_count: 2.5 });
+  assert.strictEqual(r.ok, false);
+  assert.ok(/retry_count/.test(r.error));
+});
+
+test('runUpdate [todo 097] rejects negative retry_count', () => {
+  const file = write(validMinimal);
+  const r = runUpdate(file, 'phase-0', { retry_count: -1 });
+  assert.strictEqual(r.ok, false);
+  assert.ok(/retry_count/.test(r.error));
+});
+
+test('runUpdate [todo 097] rejects string retry_count', () => {
+  const file = write(validMinimal);
+  const r = runUpdate(file, 'phase-0', { retry_count: 'two' });
+  assert.strictEqual(r.ok, false);
+  assert.ok(/retry_count/.test(r.error));
+});
+
+test('runUpdate [todo 097] accepts well-formed integer retry_count above MAX_RETRIES', () => {
+  // Over-budget integer is NOT corrupt — it can be legitimate historical
+  // state from a prior run with --max-recovery-retries=5 that the
+  // operator restarted under the default cap of 3. The shape validator
+  // accepts; the budget comparison happens later in decideRecoveryAction.
+  const file = write(validMinimal);
+  const r = runUpdate(file, 'phase-0', { retry_count: 5 });
+  assert.strictEqual(r.ok, true, r.error);
 });
 
 test('VALID_ID_RE and FLAG_NAME_RE share the same ID character class', () => {
