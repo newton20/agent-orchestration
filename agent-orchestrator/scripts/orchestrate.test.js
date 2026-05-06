@@ -933,6 +933,108 @@ test('H5f [todo 097] retry_count=5 above MAX_RETRIES (3) is NOT shape-corrupt �
   }
 });
 
+test('H6 [todo 094] recovery action populates priorPid + completedCheckpointsBlock from existing data', () => {
+  // Manifest has 3 phases; phase-prev was completed; phase-1 is the
+  // running phase whose pid=4242 just died. The recovery action must
+  // emit priorPid=4242 and a completedCheckpointsBlock that lists
+  // phase-prev sourced from status.phases iteration (NOT from a
+  // top-level completed_phases field — that field does not exist).
+  const dir = mkTmp('orch-H6');
+  try {
+    const mp = writeManifest(
+      dir,
+      makeBaseManifest({
+        phases: [
+          {
+            id: 'phase-prev',
+            completion_signal: 'docs/orchestration/phases/phase-prev/impl-complete.md',
+            agent: { role: 'impl' },
+          },
+          {
+            id: 'phase-1',
+            completion_signal: 'docs/orchestration/phases/phase-1/impl-complete.md',
+            agent: { role: 'impl' },
+            depends_on: ['phase-prev'],
+          },
+        ],
+      })
+    );
+    writeStatus(mp, {
+      phases: {
+        'phase-prev': { status: 'completed' },
+        'phase-1': { status: 'running', pid: 4242, retry_count: 0 },
+      },
+    });
+    makePhaseDir(mp, 'phase-prev');
+    makePhaseDir(mp, 'phase-1');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      { _checkHealth: () => makeStubHealth({ pidAlive: false, heartbeatAge: 30 }) }
+    );
+    const recoverySpawn = actions.find(
+      (a) => a.type === 'spawn' && a.mode === 'recovery'
+    );
+    assert.ok(recoverySpawn, 'recovery spawn must be emitted');
+    assert.strictEqual(
+      recoverySpawn.priorPid,
+      4242,
+      'priorPid sourced from manifest-status pid field'
+    );
+    assert.ok(
+      typeof recoverySpawn.lastHeartbeatTimestamp === 'string',
+      `lastHeartbeatTimestamp derived from heartbeatAge=30; got ${JSON.stringify(recoverySpawn.lastHeartbeatTimestamp)}`
+    );
+    assert.ok(
+      typeof recoverySpawn.completedCheckpointsBlock === 'string' &&
+        /phase-prev/.test(recoverySpawn.completedCheckpointsBlock),
+      `completedCheckpointsBlock must mention phase-prev; got ${JSON.stringify(recoverySpawn.completedCheckpointsBlock)}`
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('H6b [todo 094] recovery action emits explicit null for absent fields (NOT undefined)', () => {
+  // No heartbeat → lastHeartbeatTimestamp: null. No completed phases
+  // → completedCheckpointsBlock: null. No prior pid → priorPid: null.
+  // No plan_units → remainingWorkBlock: null. The dispatch's RA #2
+  // requires explicit null (not undefined / omitted) so the V1.5
+  // hook can distinguish "field not populated" from "field absent
+  // from contract."
+  const dir = mkTmp('orch-H6b');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, {
+      phases: { 'phase-1': { status: 'running', retry_count: 0 } },
+    });
+    makePhaseDir(mp, 'phase-1');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      // No heartbeat record exists; checkHealth returns heartbeatAge=null.
+      { _checkHealth: () => makeStubHealth({ pidAlive: false, heartbeatAge: null }) }
+    );
+    const recoverySpawn = actions.find(
+      (a) => a.type === 'spawn' && a.mode === 'recovery'
+    );
+    assert.ok(recoverySpawn);
+    assert.strictEqual(recoverySpawn.priorPid, null);
+    assert.strictEqual(recoverySpawn.lastHeartbeatTimestamp, null);
+    assert.strictEqual(recoverySpawn.remainingWorkBlock, null);
+    assert.strictEqual(recoverySpawn.completedCheckpointsBlock, null);
+    // Sanity — keys must be PRESENT (not omitted).
+    assert.ok('priorPid' in recoverySpawn);
+    assert.ok('lastHeartbeatTimestamp' in recoverySpawn);
+    assert.ok('remainingWorkBlock' in recoverySpawn);
+    assert.ok('completedCheckpointsBlock' in recoverySpawn);
+  } finally {
+    rmrf(dir);
+  }
+});
+
 test('H4 retry_count increments on each recovery dispatch', () => {
   const dir = mkTmp('orch-H4');
   try {

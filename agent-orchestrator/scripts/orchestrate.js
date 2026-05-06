@@ -1737,6 +1737,13 @@ function decideTickActions(tickState, runState, opts) {
             maxRetries,
             now,
             phaseEntry,
+            // Todo 094: thread health + tick-state into the recovery
+            // action builder so priorPid / lastHeartbeatTimestamp /
+            // remainingWorkBlock / completedCheckpointsBlock can be
+            // populated.
+            health,
+            status,
+            manifest,
           });
           phaseAdvanced = true;
           continue;
@@ -1765,6 +1772,9 @@ function decideTickActions(tickState, runState, opts) {
           maxRetries,
           now,
           phaseEntry,
+          health,
+          status,
+          manifest,
         });
         phaseAdvanced = true;
         continue;
@@ -1821,6 +1831,9 @@ function decideTickActions(tickState, runState, opts) {
         maxRetries,
         now,
         phaseEntry,
+        health,
+        status,
+        manifest,
       });
       phaseAdvanced = true;
     }
@@ -1990,7 +2003,7 @@ function decideTickActions(tickState, runState, opts) {
 }
 
 function decideRecoveryAction(actions, runState, opts, ctx) {
-  const { phase, role, phaseDir, reason, maxRetries, phaseEntry } = ctx;
+  const { phase, role, phaseDir, reason, maxRetries, phaseEntry, health, status, manifest, now } = ctx;
   // Todo 097: shape is enforced by decideTickActions's pre-pass; when
   // we reach here the entry is either absent (fresh-spawn path → 0) or
   // a non-negative integer. Over-budget integers fall through to the
@@ -2014,6 +2027,73 @@ function decideRecoveryAction(actions, runState, opts, ctx) {
     });
     return;
   }
+
+  // Todo 094: populate the V1.5 recovery-analyst hook's diagnostic
+  // context fields. Each field is sourced from the data already in
+  // scope; absent sources land as explicit `null` (NOT omitted /
+  // undefined) per the RA acceptance criteria so the hook can
+  // distinguish "field not populated" from "field absent from
+  // contract."
+  //
+  //   priorPid: phaseEntry.pid is the writer-side breadcrumb the
+  //     prior session persisted before crashing. Integer or null.
+  //   lastHeartbeatTimestamp: derived from check-health's
+  //     `heartbeatAge` (seconds since last heartbeat record). When
+  //     heartbeatAge is null (no record), we emit null.
+  //   remainingWorkBlock: pulled from the manifest's plan_units
+  //     literal (or null when the operator wired plan_path /
+  //     plan_unit_marker — generate-prompt extracts from there at
+  //     spawn time, so the recovery hook sees the rendered prompt
+  //     not a separate block).
+  //   completedCheckpointsBlock: built by ITERATING
+  //     `status.phases` for entries with `status: 'completed'`
+  //     (RA correction post-codex round 9 of PR #22: there is NO
+  //     top-level `completed_phases` field — the canonical source
+  //     is the per-phase status map).
+  const priorPid =
+    phaseEntry && Number.isInteger(phaseEntry.pid) ? phaseEntry.pid : null;
+
+  let lastHeartbeatTimestamp = null;
+  if (
+    health &&
+    Number.isInteger(health.heartbeatAge) &&
+    Number.isFinite(now)
+  ) {
+    lastHeartbeatTimestamp = new Date(now - health.heartbeatAge * 1000).toISOString();
+  }
+
+  // For remainingWorkBlock, the simpler V1 sourcing is the manifest's
+  // raw `plan_units` literal. Filtering to non-completed units would
+  // require parsing the plan markdown — deferred to V1.5 where the
+  // recovery analyst can read the plan directly. Until then, the
+  // hook receives the full plan_units block (or null).
+  let remainingWorkBlock = null;
+  if (manifest && Array.isArray(manifest.phases)) {
+    const raw = manifest.phases.find((p) => p && p.id === phase.id);
+    if (raw && typeof raw.plan_units === 'string' && raw.plan_units !== '') {
+      remainingWorkBlock = raw.plan_units;
+    }
+  }
+
+  // completedCheckpointsBlock — iterate status.phases. Absent / empty
+  // status, or no completed phases, yields explicit null (not the
+  // empty-string fallback executeSpawn defaulted to before).
+  let completedCheckpointsBlock = null;
+  if (status && status.phases && typeof status.phases === 'object') {
+    const completedIds = [];
+    for (const id of Object.keys(status.phases)) {
+      const e = status.phases[id];
+      if (e && typeof e === 'object' && e.status === 'completed') {
+        completedIds.push(id);
+      }
+    }
+    if (completedIds.length > 0) {
+      completedCheckpointsBlock = completedIds
+        .map((id) => `- ${id} (status: completed)`)
+        .join('\n');
+    }
+  }
+
   actions.push({
     type: 'spawn',
     phaseId: phase.id,
@@ -2021,6 +2101,11 @@ function decideRecoveryAction(actions, runState, opts, ctx) {
     mode: 'recovery',
     iteration: cur + 1,
     crashReason: reason,
+    // Todo 094: explicit nulls when source is missing.
+    priorPid,
+    lastHeartbeatTimestamp,
+    remainingWorkBlock,
+    completedCheckpointsBlock,
   });
   actions.push({
     type: 'persist',
