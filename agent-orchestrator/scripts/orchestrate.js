@@ -2394,18 +2394,25 @@ function executeActions(actions, tickState, runState, opts) {
           );
           break;
         }
-        // Codex round 4 P2: skip persist if executeSpawn already
-        // observed a post-spawn runUpdate failure for this phase.
-        // Todo 096's contract requires the 'spawning' marker to
-        // stay intact so reconciliation adopts the live tab next
-        // tick; running a follow-up persist here would overwrite
-        // the marker with 'running' (without pid/started_at).
+        // Codex round 4 P2 + round 11 P2: skip persist if executeSpawn
+        // observed a post-spawn runUpdate failure AND this persist
+        // would overwrite `status` with 'running'. Todo 096's
+        // contract requires the 'spawning' marker to stay intact so
+        // reconciliation adopts the live tab next tick — but ONLY
+        // the status field overwrites the marker. Field-only
+        // persists (review_stage, review_iteration, retry_count)
+        // merge with existing fields and preserve 'spawning';
+        // skipping them would lose review/retry state. Allow them.
+        const wouldOverwriteMarker =
+          action.updates &&
+          (action.updates.status === 'running' || action.updates.status === 'pending');
         if (
+          wouldOverwriteMarker &&
           runState.postSpawnUpdateFailedThisTick &&
           runState.postSpawnUpdateFailedThisTick.has(action.phaseId)
         ) {
           out.warnings.push(
-            `persist skipped for phase=${action.phaseId}: post-spawn runUpdate failed; marker left 'spawning' for next-tick reconciliation`
+            `persist skipped for phase=${action.phaseId}: post-spawn runUpdate failed; status-overwriting persist suppressed (marker left 'spawning' for next-tick reconciliation)`
           );
           break;
         }
