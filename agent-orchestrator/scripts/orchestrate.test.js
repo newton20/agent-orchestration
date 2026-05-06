@@ -386,7 +386,12 @@ test('D5 pollAllPhases surfaces config error for invalid manifest', () => {
   }
 });
 
-test('D6 pollAllPhases threads injected seams (no real WMI call)', () => {
+test('D6 pollAllPhases threads injected seams (no real WMI call) [codex round 14: 2 calls — primary + wrapper-inclusive]', () => {
+  // Codex round 14 P2 added a wrapper-inclusive snapshot for
+  // reconciliation. PID runner is now called twice per tick:
+  // once for the primary (excludeWrappers:true) snapshot used by
+  // health checks and once for the wrapper-inclusive snapshot used
+  // by spawning-marker reconciliation.
   const dir = mkTmp('orch-poll');
   try {
     const mp = writeManifest(dir, makeBaseManifest());
@@ -398,7 +403,7 @@ test('D6 pollAllPhases threads injected seams (no real WMI call)', () => {
         return '[]';
       },
     });
-    assert.strictEqual(runnerCalled, 1, 'PID runner is called exactly once per tick');
+    assert.strictEqual(runnerCalled, 2, 'PID runner is called twice per tick (primary + wrapper-inclusive)');
   } finally {
     rmrf(dir);
   }

@@ -875,6 +875,28 @@ function pollAllPhases(opts) {
     }
   }
   const pidSnapshot = buildPidSnapshot(sessionNames, opts);
+  // Codex round 14 P2: build a wrapper-INCLUSIVE snapshot too. The
+  // primary snapshot above excludes wrappers (standard health-check
+  // semantic — see todo 077 / 109 / buildPidSnapshot's
+  // excludeWrappers: true). A spawning phase whose inner Claude
+  // hasn't registered yet but whose cmd/powershell wrapper IS alive
+  // shows as no-PID in the primary snapshot. Without a wrapper-
+  // inclusive view, the reconciliation pass would roll the marker
+  // back and let the next tick spawn a duplicate session under the
+  // same --name while the original tab may still come up.
+  //
+  // Reuse the same buildPidSnapshot call shape but with
+  // excludeWrappers:false. The marginal cost is one extra JSON
+  // iteration; the WMI call is single-shot inside buildPidSnapshot
+  // (codex round 7 P2 + 108.p batched the JSON parse).
+  let pidSnapshotWithWrappers = null;
+  try {
+    pidSnapshotWithWrappers = buildPidSnapshotInclusive(sessionNames, opts);
+  } catch (_) {
+    // Best-effort. The reconciliation defer logic falls back to
+    // primary-snapshot behavior when this is null.
+    pidSnapshotWithWrappers = null;
+  }
 
   return {
     ok: true,
@@ -882,7 +904,54 @@ function pollAllPhases(opts) {
     phases,
     status,
     pidSnapshot,
+    pidSnapshotWithWrappers,
   };
+}
+
+/**
+ * Codex round 14 P2: same shape as buildPidSnapshot, but excludeWrappers:false.
+ * Used by decideTickActions's spawning-marker reconciliation to detect
+ * wrapper-only-still-launching tabs before rolling back to 'pending'.
+ */
+function buildPidSnapshotInclusive(sessionNames, opts = {}) {
+  if (!Array.isArray(sessionNames) || sessionNames.length === 0) {
+    return new Map();
+  }
+  const runner =
+    opts._pidRunner ||
+    ((program, argv) =>
+      execFileSync(program, argv, {
+        stdio: ['ignore', 'pipe', 'ignore'],
+        encoding: 'utf8',
+      }));
+  let stdout;
+  try {
+    stdout = runner('powershell', buildPidLookupArgs());
+  } catch (_) {
+    return null;
+  }
+  let parsedRows = null;
+  if (typeof stdout === 'string' && stdout.trim() !== '') {
+    try {
+      const parsed = JSON.parse(stdout);
+      if (parsed !== null && parsed !== undefined) {
+        parsedRows = Array.isArray(parsed) ? parsed : [parsed];
+      }
+    } catch (_) {
+      parsedRows = null;
+    }
+  }
+  const map = new Map();
+  for (const name of sessionNames) {
+    const pid = parsePidLookupOutput(stdout, name, {
+      excludeWrappers: false,
+      _parsedRows: parsedRows,
+    });
+    if (Number.isInteger(pid) && pid > 0) {
+      map.set(name, { pid });
+    }
+  }
+  return map;
 }
 
 // -------------------- Status helpers --------------------
@@ -1142,6 +1211,7 @@ function decideTickActions(tickState, runState, opts) {
     phases,
     status,
     pidSnapshot,
+    pidSnapshotWithWrappers,
     manifestPath,
   } = tickState;
   const actions = [];
@@ -1256,6 +1326,7 @@ function decideTickActions(tickState, runState, opts) {
           : manifestDir;
       return orchDirFor(wd);
     })();
+    let wrapperOnlyAlive = false;
     for (const r of candidateRoles) {
       const sessionName = defaultSessionName(phase.id, r);
       const snap = pidSnapshot.get(sessionName);
@@ -1263,6 +1334,22 @@ function decideTickActions(tickState, runState, opts) {
         reconciledRole = r;
         snapshotPid = snap.pid;
         break;
+      }
+      // Codex round 14 P2: also probe the wrapper-inclusive snapshot.
+      // After EFLAGTIMEOUT the .pending-* flag is unlinked and the
+      // marker stays 'spawning'; if the cmd/powershell wrapper is
+      // alive but the inner Claude isn't yet registered, the
+      // primary snapshot misses it. Without this guard the
+      // reconciliation rolls back and the next tick spawns a
+      // duplicate session under the same --name — breaking the
+      // per-(phase, role) uniqueness invariant.
+      if (
+        pidSnapshotWithWrappers &&
+        pidSnapshotWithWrappers.get(sessionName) &&
+        Number.isInteger(pidSnapshotWithWrappers.get(sessionName).pid) &&
+        pidSnapshotWithWrappers.get(sessionName).pid > 0
+      ) {
+        wrapperOnlyAlive = true;
       }
       // No primary-snapshot hit — check if a .pending-* flag still
       // exists AND is fresh (younger than the hook's FLAG_TTL_MS).
@@ -1288,18 +1375,26 @@ function decideTickActions(tickState, runState, opts) {
         }
       }
     }
-    if (reconciledRole === null && waitingTabFlag) {
-      // Defer reconciliation — the resume sweep's cell-1 preservation
-      // (or a same-tick spawn that hasn't propagated to WMI yet)
-      // means a tab is still waiting for its prompt. Bounded by
-      // FLAG_TTL_MS above so an orphaned flag doesn't defer forever.
+    if (reconciledRole === null && (waitingTabFlag || wrapperOnlyAlive)) {
+      // Defer reconciliation — either the resume sweep's cell-1
+      // preservation (waitingTabFlag) or a wrapper-only window
+      // (post-EFLAGTIMEOUT or pre-WMI-registration) means a tab
+      // may still come up. Rolling back here would risk a
+      // duplicate-session-name bug. Bounded by FLAG_TTL_MS for
+      // the flag case; the wrapper case is bounded by the
+      // wrapper itself eventually exiting (cmd /k / powershell
+      // -NoExit are kept alive only by the user's window — once
+      // the user closes the tab, the wrapper exits and the next
+      // tick's wrapper-inclusive snapshot reflects the change).
       actions.push({
         type: 'log',
         level: 'info',
         message:
-          `phase ${phase.id} reconciliation deferred: spawning marker + fresh .pending-* flag ` +
-          `but no inner-Claude PID yet (wrapper-only or pre-WMI-registration window); ` +
-          `next tick will re-check`,
+          `phase ${phase.id} reconciliation deferred: spawning marker + ` +
+          `${waitingTabFlag ? 'fresh .pending-* flag' : ''}` +
+          `${waitingTabFlag && wrapperOnlyAlive ? ' + ' : ''}` +
+          `${wrapperOnlyAlive ? 'live wrapper (inner Claude not yet registered)' : ''}` +
+          `; next tick will re-check`,
         phaseId: phase.id,
       });
       continue;
