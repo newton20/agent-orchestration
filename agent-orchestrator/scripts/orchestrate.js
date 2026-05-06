@@ -3263,18 +3263,36 @@ function executeSpawn(action, tickState, runState, opts, deps) {
       // operator's defaults.permission_mode override.
       let cleanedPassthrough = baseLauncher.passthrough_flags;
       if (Array.isArray(cleanedPassthrough)) {
-        cleanedPassthrough = cleanedPassthrough.filter((f) => {
-          if (typeof f !== 'string') return true;
-          // Match both `--permission-mode=value` and `--permission-mode`
-          // (a bare flag would be followed by a value as a separate
-          // argv element — passthrough_flags is a flat array, so the
-          // bare-and-value pair would be two adjacent entries).
-          return !(
-            f === '--permission-mode' ||
+        // Codex round 19 + 20 P2: handle three shapes:
+        //   - `--permission-mode=value` (single token)
+        //   - `--permission-mode value` (single token; uncommon)
+        //   - `['--permission-mode', 'value']` (paired tokens —
+        //     when we strip the bare flag we MUST also strip its
+        //     value token, else a stray 'auto' lands in the argv
+        //     after our override).
+        const cleaned = [];
+        for (let idx = 0; idx < cleanedPassthrough.length; idx++) {
+          const f = cleanedPassthrough[idx];
+          if (typeof f !== 'string') {
+            cleaned.push(f);
+            continue;
+          }
+          if (f === '--permission-mode') {
+            // Skip this token AND the following value token (if
+            // any). When idx points at the last element, there's
+            // no value to skip — drop just the bare flag.
+            idx += 1;
+            continue;
+          }
+          if (
             f.startsWith('--permission-mode=') ||
             f.startsWith('--permission-mode ')
-          );
-        });
+          ) {
+            continue;
+          }
+          cleaned.push(f);
+        }
+        cleanedPassthrough = cleaned;
       }
       effectiveLauncher = {
         ...baseLauncher,
