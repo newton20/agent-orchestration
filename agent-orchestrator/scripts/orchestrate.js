@@ -1231,6 +1231,28 @@ function decideTickActions(tickState, runState, opts) {
     }
     let reconciledRole = null;
     let snapshotPid = null;
+    // Codex round 6 P2: also detect "wrapper-alive + flag-still-present"
+    // cases. The pidSnapshot here excludes wrappers (the production
+    // health-check semantic), so a tab whose inner Claude hasn't
+    // registered yet but whose cmd/powershell wrapper IS alive shows
+    // as no-PID. If the .pending-<name> flag still exists, the tab
+    // is waiting for the SessionStart hook to fire — don't roll
+    // back to 'pending' (which would orphan the live wrapper). Defer
+    // the decision to the next tick when either the flag will be
+    // consumed (transitioning to a normal alive PID) or the tab
+    // genuinely died (no wrapper either).
+    let waitingTabFlag = false;
+    const phaseHookOrchDir = (function () {
+      // Resolve the workdir-side orchDir for this phase. executeSpawn
+      // writes flags under orchDirFor(resolvedWorkdir).
+      const wd =
+        typeof manifest.workdir === 'string' && manifest.workdir !== ''
+          ? path.isAbsolute(manifest.workdir)
+            ? manifest.workdir
+            : path.resolve(manifestDir, manifest.workdir)
+          : manifestDir;
+      return orchDirFor(wd);
+    })();
     for (const r of candidateRoles) {
       const sessionName = defaultSessionName(phase.id, r);
       const snap = pidSnapshot.get(sessionName);
@@ -1239,6 +1261,28 @@ function decideTickActions(tickState, runState, opts) {
         snapshotPid = snap.pid;
         break;
       }
+      // No primary-snapshot hit — check if a .pending-* flag still
+      // exists for this role. If yes, the tab may be the wrapper-only
+      // case the resume sweep preserved (cell 1).
+      const fp = path.join(phaseHookOrchDir, `.pending-${sessionName}`);
+      if ((opts._existsSync || fs.existsSync)(fp)) {
+        waitingTabFlag = true;
+      }
+    }
+    if (reconciledRole === null && waitingTabFlag) {
+      // Defer reconciliation — the resume sweep's cell-1 preservation
+      // (or a same-tick spawn that hasn't propagated to WMI yet)
+      // means a tab is still waiting for its prompt.
+      actions.push({
+        type: 'log',
+        level: 'info',
+        message:
+          `phase ${phase.id} reconciliation deferred: spawning marker + .pending-* flag present ` +
+          `but no inner-Claude PID yet (wrapper-only or pre-WMI-registration window); ` +
+          `next tick will re-check`,
+        phaseId: phase.id,
+      });
+      continue;
     }
     if (reconciledRole !== null) {
       // Adopt: tab is alive.
