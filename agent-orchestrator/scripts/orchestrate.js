@@ -3254,9 +3254,32 @@ function executeSpawn(action, tickState, runState, opts, deps) {
     ]);
     if (permissionMode !== '' && PERMISSION_MODE_OVERRIDES.has(permissionMode)) {
       const baseLauncher = effectiveLauncher || {};
+      // Codex round 19 P2: also strip any pre-existing
+      // --permission-mode flag from passthrough_flags. Pre-fix, when
+      // a launcher's passthrough_flags already contained
+      // `--permission-mode=auto` (e.g., the bundled example),
+      // spawn-session would emit two --permission-mode flags and
+      // the trailing one (passthrough) would win — defeating the
+      // operator's defaults.permission_mode override.
+      let cleanedPassthrough = baseLauncher.passthrough_flags;
+      if (Array.isArray(cleanedPassthrough)) {
+        cleanedPassthrough = cleanedPassthrough.filter((f) => {
+          if (typeof f !== 'string') return true;
+          // Match both `--permission-mode=value` and `--permission-mode`
+          // (a bare flag would be followed by a value as a separate
+          // argv element — passthrough_flags is a flat array, so the
+          // bare-and-value pair would be two adjacent entries).
+          return !(
+            f === '--permission-mode' ||
+            f.startsWith('--permission-mode=') ||
+            f.startsWith('--permission-mode ')
+          );
+        });
+      }
       effectiveLauncher = {
         ...baseLauncher,
         auto_mode_flag: `--permission-mode ${permissionMode}`,
+        passthrough_flags: cleanedPassthrough,
       };
     }
     spawnResult = spawnFn({
