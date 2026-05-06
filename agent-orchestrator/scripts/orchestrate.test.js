@@ -765,6 +765,49 @@ test('H2 retry budget exhausted (retry_count >= max) → mark_phase_failed', () 
   }
 });
 
+test('H2b [todo 107.d] recovery max-3 INNER boundary asserted (retry_count=2 → spawn iteration=3, NOT exhausted)', () => {
+  // The pre-existing H2 only asserted the outer boundary: retry_count=3
+  // with max=3 → exhausted (no spawn). 107.d closes the inner gap:
+  // retry_count=2 with max=3 must still recover (cur < maxRetries),
+  // and the emitted spawn action's iteration must be cur + 1 = 3. An
+  // off-by-one swap of `>=` → `>` (or `<` → `<=`) would still pass
+  // H1 / H2 / H4 but fail this assertion.
+  const dir = mkTmp('orch-H2b');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, {
+      phases: { 'phase-1': { status: 'running', retry_count: 2 } },
+    });
+    makePhaseDir(mp, 'phase-1');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      { _checkHealth: () => makeStubHealth({ pidAlive: false }) }
+    );
+    const recoverySpawn = actions.find(
+      (a) => a.type === 'spawn' && a.mode === 'recovery'
+    );
+    assert.ok(
+      recoverySpawn,
+      'retry_count=2 must still trigger recovery (inner boundary)'
+    );
+    assert.strictEqual(
+      recoverySpawn.iteration,
+      3,
+      'recovery iteration must be retry_count + 1 = 3'
+    );
+    assert.ok(
+      !actions.some(
+        (a) => a.type === 'mark_phase_failed' && /budget_exhausted/.test(a.reason || '')
+      ),
+      'retry_count=2 must NOT emit budget-exhausted'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
 test('H3 timeout → recovery (treated as crash)', () => {
   const dir = mkTmp('orch-H3');
   try {
@@ -4666,6 +4709,53 @@ test('AC1 [codex round 12 P2] stale lock reclaim uses rename so two starters can
   }
 });
 
+test('AC1b [todo 107.c] stale-lock reclaim ENOENT (rename loser) falls through to exclusive create', () => {
+  // The reclaim path renames the stale lockfile to a sidecar so two
+  // concurrent reclaimers can't both clobber. The LOSER of that race
+  // sees ENOENT on rename — pre-fix this branch was untested and a
+  // refactor that made ENOENT throw could break the orchestrator's
+  // start handshake silently. Inject a renameSync that throws ENOENT
+  // on the stale-rename and verify acquireLock falls through to the
+  // exclusive-create path (which then succeeds because the actual
+  // file no longer exists).
+  const dir = mkTmp('orch-AC1b');
+  try {
+    fs.writeFileSync(
+      path.join(dir, '.orchestrator.lock'),
+      JSON.stringify({ pid: 999, startedAt: 'old', hostname: 'h' })
+    );
+    let renameCalls = 0;
+    const renameENOENT = (from, to) => {
+      renameCalls += 1;
+      // First call: stale-lock rename; the "winner" already moved
+      // the file aside. Simulate ENOENT.
+      if (renameCalls === 1) {
+        // Actually unlink the file ourselves so the subsequent
+        // exclusive-create path finds an empty slot.
+        try { fs.unlinkSync(from); } catch (_) { /* already gone */ }
+        const e = new Error('ENOENT: file vanished');
+        e.code = 'ENOENT';
+        throw e;
+      }
+      return fs.renameSync(from, to);
+    };
+    const lockedPath = O.acquireLock(dir, {
+      _pid: 1,
+      _killer: () => {
+        const e = new Error('no such');
+        e.code = 'ESRCH';
+        throw e;
+      },
+      _renameSync: renameENOENT,
+    });
+    assert.ok(typeof lockedPath === 'string');
+    assert.ok(fs.existsSync(lockedPath), 'fresh lockfile must exist after fall-through');
+    O.releaseLock(lockedPath);
+  } finally {
+    rmrf(dir);
+  }
+});
+
 test('AC2 [codex round 12 P2] initial impl dispatch unlinks stale impl-complete.md', () => {
   const dir = mkTmp('orch-AC2');
   try {
@@ -5683,13 +5773,11 @@ test('AL5 [codex round 21 P2] bare run with all-completed manifest-status procee
 // AM — codex round 22 regression tests
 // =========================================================================
 
-test('AM1 [codex round 22 P2] shared-workdir secondary lock refuses second concurrent orchestrator', async () => {
+test('AM1 [codex round 22 P2 + todo 107.e] shared-workdir secondary lock refuses second concurrent orchestrator (verifies r1 acquired + cleanup + same-path)', async () => {
   const dir = mkTmp('orch-AM1');
   try {
     const sharedWorkdir = path.join(dir, 'shared');
     fs.mkdirSync(sharedWorkdir, { recursive: true });
-    // Manifest 1 lives in dir/m1, manifest 2 in dir/m2; both target
-    // the same workdir.
     fs.mkdirSync(path.join(dir, 'm1'), { recursive: true });
     fs.mkdirSync(path.join(dir, 'm2'), { recursive: true });
     const mp1 = writeManifest(
@@ -5700,7 +5788,16 @@ test('AM1 [codex round 22 P2] shared-workdir secondary lock refuses second concu
       path.join(dir, 'm2'),
       makeBaseManifest({ workdir: path.relative(path.join(dir, 'm2'), sharedWorkdir) })
     );
-    // Manifest 1 starts first and gets BOTH locks (manifestDir + workdir).
+    const sharedLockPath = path.join(
+      sharedWorkdir,
+      'docs',
+      'orchestration',
+      '.orchestrator.lock'
+    );
+    // Todo 107.e: explicit assertion that r1 actually acquired the
+    // shared-workdir lockfile during its pre-flight. Pre-fix the
+    // test never confirmed this — a regression that silently
+    // skipped the workdir-lock acquire would have passed.
     const r1 = await O.runOrchestrator({
       manifestPath: mp1,
       _spawnSession: makeFakeSpawnSession(),
@@ -5710,25 +5807,34 @@ test('AM1 [codex round 22 P2] shared-workdir secondary lock refuses second concu
       _sleep: () => Promise.resolve(),
       logger: silentLogger(),
       projectName: 't',
-      maxTicks: 0, // immediate exit, but locks acquired during pre-flight
+      maxTicks: 0,
     });
-    // Pre-write a `.orchestrator.lock` at the shared workdir so we
-    // can simulate a second orchestrator hitting it. (After r1
-    // completes its locks are released; we need to plant one for
-    // the test.)
-    const sharedLockPath = path.join(
-      sharedWorkdir,
+    void r1;
+    // After r1 exits cleanly, both its locks should be released.
+    // Todo 107.e: explicit cleanup assertion — neither the shared
+    // workdir lockfile nor the manifestDir lockfile may persist.
+    assert.ok(
+      !fs.existsSync(sharedLockPath),
+      'r1 must release the shared-workdir lockfile on clean exit'
+    );
+    const m1LockPath = path.join(
+      path.dirname(mp1),
       'docs',
       'orchestration',
       '.orchestrator.lock'
     );
+    assert.ok(
+      !fs.existsSync(m1LockPath),
+      'r1 must release the manifestDir lockfile on clean exit'
+    );
+
+    // Plant a "live" lock at the shared workdir to simulate a second
+    // concurrent orchestrator.
     fs.mkdirSync(path.dirname(sharedLockPath), { recursive: true });
     fs.writeFileSync(
       sharedLockPath,
       JSON.stringify({ pid: 99999, startedAt: 'now', hostname: 'h' })
     );
-    // m2 should refuse because the workdir lock is held by an
-    // "alive" PID.
     const r2 = await O.runOrchestrator({
       manifestPath: mp2,
       _killer: () => {}, // alive
@@ -5744,6 +5850,45 @@ test('AM1 [codex round 22 P2] shared-workdir secondary lock refuses second concu
     assert.strictEqual(r2.ok, false);
     assert.strictEqual(r2.summary, 'lock_contention');
     assert.match(r2.error, /workdir/);
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AM1b [todo 107.e] same-path workdir (manifestDir IS workdir) does NOT acquire two locks against itself', async () => {
+  // Edge case the pre-fix AM1 test didn't cover: when manifestDir and
+  // workdir resolve to the SAME path (workdir absent or pointing at
+  // manifestDir), the orchestrator must take exactly ONE lock —
+  // re-acquiring the same lockfile would self-conflict. On
+  // case-insensitive filesystems (NTFS, APFS) the comparison should
+  // also collapse path-case differences.
+  const dir = mkTmp('orch-AM1b');
+  try {
+    // No `workdir` field → defaults to manifestDir (same-path case).
+    const mp = writeManifest(dir, makeBaseManifest());
+    const r = await O.runOrchestrator({
+      manifestPath: mp,
+      _spawnSession: makeFakeSpawnSession(),
+      _generatePrompt: makeFakeGenerate(),
+      _checkHealth: () => makeStubHealth({ pidAlive: true }),
+      _pidRunner: () => '[]',
+      _sleep: () => Promise.resolve(),
+      logger: silentLogger(),
+      projectName: 't',
+      maxTicks: 0,
+    });
+    void r;
+    // Neither path's lockfile should remain after a clean exit.
+    const lockPath = path.join(
+      path.dirname(mp),
+      'docs',
+      'orchestration',
+      '.orchestrator.lock'
+    );
+    assert.ok(
+      !fs.existsSync(lockPath),
+      'same-path scenario must release its single lockfile cleanly'
+    );
   } finally {
     rmrf(dir);
   }
