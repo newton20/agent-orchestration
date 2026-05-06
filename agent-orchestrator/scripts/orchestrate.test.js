@@ -386,15 +386,16 @@ test('D5 pollAllPhases surfaces config error for invalid manifest', () => {
   }
 });
 
-test('D6 pollAllPhases threads injected seams (no real WMI call) [codex round 14: 2 calls — primary + wrapper-inclusive]', () => {
-  // Codex round 14 P2 added a wrapper-inclusive snapshot for
-  // reconciliation. PID runner is now called twice per tick:
-  // once for the primary (excludeWrappers:true) snapshot used by
-  // health checks and once for the wrapper-inclusive snapshot used
-  // by spawning-marker reconciliation.
+test('D6 pollAllPhases threads injected seams (no real WMI call) [codex round 17: gated wrapper-inclusive]', () => {
+  // Codex round 14 P2 added a wrapper-inclusive snapshot. Round 17
+  // P2 gated it behind 'is any phase spawning?' — when nothing is
+  // spawning the inclusive snapshot is unnecessary, so PID runner
+  // is called ONCE (only the primary snapshot). With a spawning
+  // phase the inclusive snapshot also fires, totaling 2.
   const dir = mkTmp('orch-poll');
   try {
     const mp = writeManifest(dir, makeBaseManifest());
+    // Case 1: no spawning phase → 1 runner call.
     let runnerCalled = 0;
     O.pollAllPhases({
       manifestPath: mp,
@@ -403,7 +404,19 @@ test('D6 pollAllPhases threads injected seams (no real WMI call) [codex round 14
         return '[]';
       },
     });
-    assert.strictEqual(runnerCalled, 2, 'PID runner is called twice per tick (primary + wrapper-inclusive)');
+    assert.strictEqual(runnerCalled, 1, 'PID runner called once when no phase is spawning');
+
+    // Case 2: a spawning phase → 2 runner calls.
+    writeStatus(mp, { phases: { 'phase-1': { status: 'spawning' } } });
+    runnerCalled = 0;
+    O.pollAllPhases({
+      manifestPath: mp,
+      _pidRunner: () => {
+        runnerCalled += 1;
+        return '[]';
+      },
+    });
+    assert.strictEqual(runnerCalled, 2, 'PID runner called twice when a phase is spawning (primary + wrapper-inclusive)');
   } finally {
     rmrf(dir);
   }

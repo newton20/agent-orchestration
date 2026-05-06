@@ -875,27 +875,32 @@ function pollAllPhases(opts) {
     }
   }
   const pidSnapshot = buildPidSnapshot(sessionNames, opts);
-  // Codex round 14 P2: build a wrapper-INCLUSIVE snapshot too. The
-  // primary snapshot above excludes wrappers (standard health-check
-  // semantic — see todo 077 / 109 / buildPidSnapshot's
-  // excludeWrappers: true). A spawning phase whose inner Claude
-  // hasn't registered yet but whose cmd/powershell wrapper IS alive
-  // shows as no-PID in the primary snapshot. Without a wrapper-
-  // inclusive view, the reconciliation pass would roll the marker
-  // back and let the next tick spawn a duplicate session under the
-  // same --name while the original tab may still come up.
-  //
-  // Reuse the same buildPidSnapshot call shape but with
-  // excludeWrappers:false. The marginal cost is one extra JSON
-  // iteration; the WMI call is single-shot inside buildPidSnapshot
-  // (codex round 7 P2 + 108.p batched the JSON parse).
+  // Codex round 14 P2 + round 17 P2: build a wrapper-INCLUSIVE
+  // snapshot ONLY when there are 'spawning' phases that need the
+  // wrapper-aware reconciliation defer. The primary snapshot
+  // above excludes wrappers; the inclusive snapshot is required
+  // to detect "tab is launching, inner Claude not yet registered"
+  // cases for spawning-marker reconciliation. Pre-round-17, this
+  // ran every tick — doubling WMI subprocess overhead even on
+  // normal running/idle polls where no phase is spawning. Now
+  // gated.
+  const hasSpawningPhase = (function () {
+    if (!status || !status.phases) return false;
+    for (const id of Object.keys(status.phases)) {
+      const e = status.phases[id];
+      if (e && typeof e === 'object' && e.status === 'spawning') return true;
+    }
+    return false;
+  })();
   let pidSnapshotWithWrappers = null;
-  try {
-    pidSnapshotWithWrappers = buildPidSnapshotInclusive(sessionNames, opts);
-  } catch (_) {
-    // Best-effort. The reconciliation defer logic falls back to
-    // primary-snapshot behavior when this is null.
-    pidSnapshotWithWrappers = null;
+  if (hasSpawningPhase) {
+    try {
+      pidSnapshotWithWrappers = buildPidSnapshotInclusive(sessionNames, opts);
+    } catch (_) {
+      // Best-effort. The reconciliation defer logic falls back to
+      // primary-snapshot behavior when this is null.
+      pidSnapshotWithWrappers = null;
+    }
   }
 
   return {
