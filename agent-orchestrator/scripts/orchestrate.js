@@ -242,6 +242,41 @@ const DEFAULT_STARTUP_GRACE_MS = 60_000;
 // newer major (design decision #4).
 const SCHEMA_VERSION_EXPECTED = 1;
 
+/**
+ * Todo 101: parse a checkHealth-output `schema_version` value into
+ * `{ major, minor }`. Accepts:
+ *   - integer N             → { major: N, minor: 0 }
+ *   - string "N"            → { major: N, minor: 0 }
+ *   - string "N.M"          → { major: N, minor: M } (N, M ∈ ℕ₀)
+ * Rejects (returns null):
+ *   - null / undefined / NaN
+ *   - non-integer numbers (1.5)
+ *   - strings with more than one dot ("1.0.x")
+ *   - non-numeric strings ("abc")
+ *   - empty string
+ *
+ * Pre-fix the orchestrator hard-failed on ANY mismatch — a V1.5
+ * minor bump from `1` to `1.1` would have broken every consumer.
+ * The MAJOR / MAJOR.MINOR soft-band lets minor versions advance
+ * compatibly while still fast-failing major bumps that are by
+ * definition breaking.
+ */
+function parseSchemaVersion(v) {
+  if (v === null || v === undefined) return null;
+  if (typeof v === 'number') {
+    if (!Number.isInteger(v) || v < 0) return null;
+    return { major: v, minor: 0 };
+  }
+  if (typeof v !== 'string' || v === '') return null;
+  if (!/^\d+(\.\d+)?$/.test(v)) return null;
+  const parts = v.split('.');
+  const major = parseInt(parts[0], 10);
+  const minor = parts.length === 2 ? parseInt(parts[1], 10) : 0;
+  if (!Number.isFinite(major) || !Number.isFinite(minor)) return null;
+  if (major < 0 || minor < 0) return null;
+  return { major, minor };
+}
+
 // Maximum bytes a flag file may carry. Mirrors session-start.js's
 // MAX_FLAG_BYTES so the writer + reader agree on the cap. Required so a
 // runaway prompt generator can't write a flag larger than the hook will
@@ -1555,16 +1590,53 @@ function decideTickActions(tickState, runState, opts) {
         continue;
       }
 
-      // schema_version guard (design decision #4).
-      if (health.schema_version !== SCHEMA_VERSION_EXPECTED) {
+      // Todo 101: schema_version guard with MAJOR / MAJOR.MINOR soft-
+      // band semantics. Pre-fix any mismatch was a hard fatal — a
+      // V1.5 bump from `1` to `1.1` would have broken every consumer.
+      //
+      // Contract:
+      //   - malformed (non-integer, non-MAJOR or MAJOR.MINOR string,
+      //     null) → fatal (caller can't reason about compat).
+      //   - parsed.major !== SCHEMA_VERSION_EXPECTED → fatal (major
+      //     mismatch is by definition breaking).
+      //   - parsed.major === SCHEMA_VERSION_EXPECTED && parsed.minor > 0
+      //     → warn + proceed (forward-compat: producer is newer than
+      //     consumer's known minor, but the major is unchanged so
+      //     fields the consumer reads still exist with the same
+      //     semantics; new fields are ignored).
+      //   - else → ok.
+      const parsedSchema = parseSchemaVersion(health.schema_version);
+      if (parsedSchema === null) {
         actions.push({
           type: 'fatal',
           message:
-            `checkHealth returned schema_version ${health.schema_version}; ` +
-            `orchestrator expected ${SCHEMA_VERSION_EXPECTED}. ` +
+            `checkHealth returned malformed schema_version ${JSON.stringify(health.schema_version)}; ` +
+            `expected MAJOR (e.g. 1) or MAJOR.MINOR (e.g. 1.1). ` +
+            `Consumer cannot reason about compat — refusing to advance.`,
+        });
+        continue;
+      }
+      if (parsedSchema.major !== SCHEMA_VERSION_EXPECTED) {
+        actions.push({
+          type: 'fatal',
+          message:
+            `checkHealth returned schema_version ${JSON.stringify(health.schema_version)} (major=${parsedSchema.major}); ` +
+            `orchestrator expected major=${SCHEMA_VERSION_EXPECTED}. ` +
             `A check-health upgrade is needed before this orchestrator can advance.`,
         });
         continue;
+      }
+      if (parsedSchema.minor > 0) {
+        actions.push({
+          type: 'log',
+          level: 'warn',
+          message:
+            `checkHealth output declares schema_version ${JSON.stringify(health.schema_version)}; ` +
+            `consumer targets ${SCHEMA_VERSION_EXPECTED} — proceeding under MAJOR/MAJOR.MINOR soft-compat band ` +
+            `(new fields are ignored; existing field semantics unchanged).`,
+          phaseId: phase.id,
+          role,
+        });
       }
 
       // errorKind dispatch (design decision #3).
@@ -1980,7 +2052,27 @@ function executeActions(actions, tickState, runState, opts) {
   const logger = opts.logger || makeDefaultLogger();
   const spawnFn = opts._spawnSession || spawnSession;
   const generateFn = opts._generatePrompt || generatePrompt;
-  const runUpdateFn = opts._runUpdate || runUpdate;
+  const baseRunUpdate = opts._runUpdate || runUpdate;
+  // Todo 103: tick-level cache. tickState.manifest is already
+  // validated by pollAllPhases; tickState.status is the canonical
+  // mutable shared instance the writer-side runUpdates mutate
+  // across this tick. The wrapper threads both through to every
+  // runUpdate call so a 5-role fan-out tick re-loads + re-validates
+  // manifest+status ONCE (not 2N times). Mutation contract: the
+  // shared status object preserves prior call's pid / started_at /
+  // review_stage so the second writer in the same tick doesn't
+  // start from a stale pre-call-1 snapshot.
+  //
+  // Test injection: when opts._runUpdate is set, callers usually
+  // want a fully-stubbed writer (test fakes return ok without
+  // touching disk). We still pass the seam — the fake can ignore
+  // it; the real runUpdate honors it.
+  const runUpdateFn = (manifestPath, phaseId, updates, extraOpts = {}) =>
+    baseRunUpdate(manifestPath, phaseId, updates, {
+      _loadedManifest: tickState.manifest,
+      _loadedStatus: tickState.status,
+      ...extraOpts,
+    });
   const writeFile = opts._writeFileSync || fs.writeFileSync;
   const renameFile = opts._renameSync || fs.renameSync;
   const mkdir = opts._mkdirSync || fs.mkdirSync;
@@ -3709,6 +3801,40 @@ function parseCliArgs(argv) {
       }
       return v;
     };
+    // Todo 106: stricter `next()` for path-typed flags that must NOT
+    // greedily consume the next argv flag as their value.
+    // `--plugin-dir --resume foo.yaml` used to silently parse as
+    // `pluginDir = '--resume'` and drop the `--resume` flag — the
+    // operator had no signal that anything went wrong. Reject any
+    // value that starts with `-`; offer the `--flag=value` form as
+    // an escape hatch for legitimate paths beginning with `-`.
+    const nextNonFlag = () => {
+      const v = argv[++i];
+      if (v === undefined || v === '') {
+        throw new CliError(`${a} requires a value`);
+      }
+      if (v.startsWith('-')) {
+        throw new CliError(
+          `${a} requires a path; got ${JSON.stringify(v)} (looks like another flag — use ${a}=<path> for paths starting with -)`
+        );
+      }
+      return v;
+    };
+    // Todo 106 escape hatch: support `--plugin-dir=<value>` and
+    // `--project-name=<value>` forms so operators with paths that
+    // start with `-` can still pass them.
+    if (a.startsWith('--plugin-dir=')) {
+      const v = a.slice('--plugin-dir='.length);
+      if (v === '') throw new CliError('--plugin-dir= requires a value');
+      out.pluginDir = v;
+      continue;
+    }
+    if (a.startsWith('--project-name=')) {
+      const v = a.slice('--project-name='.length);
+      if (v === '') throw new CliError('--project-name= requires a value');
+      out.projectName = v;
+      continue;
+    }
     switch (a) {
       case '-h':
       case '--help':
@@ -3743,10 +3869,10 @@ function parseCliArgs(argv) {
         out.reviewLoopMaxIterations = parseIntFlag(a, next(), { allowZero: false });
         break;
       case '--plugin-dir':
-        out.pluginDir = next();
+        out.pluginDir = nextNonFlag();
         break;
       case '--project-name':
-        out.projectName = next();
+        out.projectName = nextNonFlag();
         break;
       case '--dry-run':
         out.dryRun = true;

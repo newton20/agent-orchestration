@@ -825,23 +825,66 @@ function loadStatus(manifestPath, { _readFileSync, _existsSync } = {}) {
  * Testable update entry point. Returns { ok: true, status_file, phase,
  * updates } on success, { ok: false, error } on any validation failure.
  * Never calls process.exit — callers (CLI main) do that.
+ *
+ * Todo 103: optional batching seams (`_loadedManifest`, `_loadedStatus`).
+ * When the orchestrator is in a fan-out tick (N runUpdate calls) it
+ * pre-loads manifest + status once and threads them through to skip
+ * 2N redundant disk loads + validation passes. Symmetric with todo
+ * 086's checkHealth seams.
+ *
+ *   - `_loadedManifest`: read-only. The manifest object as
+ *     `loadManifest(...).manifest` produces. When set, skips the
+ *     loadManifest + validate path. Caller MUST have validated the
+ *     object — runUpdate trusts it verbatim. Pass `null` /
+ *     `undefined` to take the disk path.
+ *
+ *   - `_loadedStatus`: SINGLE MUTABLE shared instance across all
+ *     runUpdates within a tick. Each runUpdate mutates this object
+ *     in place and writes the updated YAML to disk. Subsequent
+ *     calls within the same tick read the latest in-memory state,
+ *     NOT a snapshot. Pre-fix RA pivoted to this contract after
+ *     codex round 8 caught that a tick-start snapshot would lose
+ *     mutations from sibling fan-out updates (e.g., role-A's pid
+ *     persisted by call 1, then overwritten when call 2 wrote
+ *     started_at from the stale pre-call-1 snapshot).
+ *
+ *     - `null`: declared "no status file yet" — runUpdate writes
+ *       a fresh shape and the caller's reference points at the
+ *       fresh object after the call.
+ *     - object: mutated in place; same reference across calls.
+ *     - `undefined` (or option absent): take the disk path.
+ *
+ *   - `_writeFileSync` / `_renameSync`: optional write seams for
+ *     tests; default to fs.* equivalents.
  */
-function runUpdate(manifestPath, phaseId, updates) {
-  const loaded = loadManifest(manifestPath);
-  if (!loaded.ok) return { ok: false, error: loaded.error };
+function runUpdate(manifestPath, phaseId, updates, opts = {}) {
+  const writeFileSync = opts._writeFileSync || fs.writeFileSync;
+  const renameSync = opts._renameSync || fs.renameSync;
+  const unlinkSync = opts._unlinkSync || fs.unlinkSync;
 
-  const dangling = findDanglingDeps(
-    Array.isArray(loaded.manifest.phases) ? loaded.manifest.phases : []
-  );
-  const vresult = validate(loaded.manifest);
-  if (dangling.length > 0 || !vresult.valid) {
-    const errs = [...dangling, ...vresult.errors]
-      .map((e) => `${e.path}: ${e.message}`)
-      .join('; ');
-    return {
-      ok: false,
-      error: `manifest is invalid — cannot update status: ${errs}`,
-    };
+  let manifest;
+  if (opts._loadedManifest !== undefined && opts._loadedManifest !== null) {
+    // Trust the caller's pre-validated manifest. Skip the load +
+    // dangling-deps + validate path entirely.
+    manifest = opts._loadedManifest;
+  } else {
+    const loaded = loadManifest(manifestPath);
+    if (!loaded.ok) return { ok: false, error: loaded.error };
+
+    const dangling = findDanglingDeps(
+      Array.isArray(loaded.manifest.phases) ? loaded.manifest.phases : []
+    );
+    const vresult = validate(loaded.manifest);
+    if (dangling.length > 0 || !vresult.valid) {
+      const errs = [...dangling, ...vresult.errors]
+        .map((e) => `${e.path}: ${e.message}`)
+        .join('; ');
+      return {
+        ok: false,
+        error: `manifest is invalid — cannot update status: ${errs}`,
+      };
+    }
+    manifest = loaded.manifest;
   }
 
   if (
@@ -856,7 +899,9 @@ function runUpdate(manifestPath, phaseId, updates) {
         `use [A-Za-z0-9._-]+ and avoid __proto__/prototype/constructor`,
     };
 
-  const ids = new Set(loaded.manifest.phases.map((p) => p.id));
+  const ids = new Set(
+    Array.isArray(manifest.phases) ? manifest.phases.map((p) => p.id) : []
+  );
   if (!ids.has(phaseId))
     return {
       ok: false,
@@ -909,18 +954,50 @@ function runUpdate(manifestPath, phaseId, updates) {
       );
   }
 
-  // Reader is the canonical loadStatus path (todo 069). Errors propagate
-  // verbatim so the pre-refactor "corrupt status file at X: ..." message
-  // shape is preserved. `status === null` covers both "file does not
-  // exist" and "file parses to non-object root" (lenient — fresh write
-  // overwrites the unreadable shape).
-  const loadResult = loadStatus(manifestPath);
-  if (!loadResult.ok) return { ok: false, error: loadResult.error };
-  const status =
-    loadResult.status === null
-      ? { phases: Object.create(null) }
-      : loadResult.status;
-  const statusPath = loadResult.statusPath;
+  // Todo 103: status seam. When the caller threads `_loadedStatus`
+  // through, mutate that single shared object across the tick's
+  // runUpdates so each call sees the prior call's mutations. Without
+  // the shared-instance contract, fan-out runUpdates in the same
+  // tick would each start from the same pre-tick snapshot and the
+  // last writer would overwrite the prior siblings' fields.
+  let status;
+  let statusPath;
+  const usingLoadedStatus = '_loadedStatus' in opts;
+  if (usingLoadedStatus) {
+    statusPath = statusPathFor(path.resolve(manifestPath));
+    if (opts._loadedStatus === null) {
+      // Caller declared "no status file yet". Build a fresh shape
+      // and let the post-write step replace the caller's reference
+      // via the returned status (the caller can re-thread it).
+      status = { phases: Object.create(null) };
+    } else {
+      status = opts._loadedStatus;
+      if (
+        !status ||
+        typeof status !== 'object' ||
+        !status.phases ||
+        typeof status.phases !== 'object'
+      ) {
+        return {
+          ok: false,
+          error: '_loadedStatus must be an object with a `phases` map (or null for fresh)',
+        };
+      }
+    }
+  } else {
+    // Reader is the canonical loadStatus path (todo 069). Errors propagate
+    // verbatim so the pre-refactor "corrupt status file at X: ..." message
+    // shape is preserved. `status === null` covers both "file does not
+    // exist" and "file parses to non-object root" (lenient — fresh write
+    // overwrites the unreadable shape).
+    const loadResult = loadStatus(manifestPath);
+    if (!loadResult.ok) return { ok: false, error: loadResult.error };
+    status =
+      loadResult.status === null
+        ? { phases: Object.create(null) }
+        : loadResult.status;
+    statusPath = loadResult.statusPath;
+  }
 
   const existing = status.phases[phaseId] || {};
   status.phases[phaseId] = { ...existing, ...updates };
@@ -943,17 +1020,17 @@ function runUpdate(manifestPath, phaseId, updates) {
   // of bubbling up and killing the orchestrator's main loop.
   const tmpPath = `${statusPath}.tmp-${process.pid}-${Date.now()}`;
   try {
-    fs.writeFileSync(tmpPath, header + yaml.dump(status));
-    fs.renameSync(tmpPath, statusPath);
+    writeFileSync(tmpPath, header + yaml.dump(status));
+    renameSync(tmpPath, statusPath);
   } catch (e) {
     // Best-effort cleanup of the tmp if the rename failed.
-    try { fs.unlinkSync(tmpPath); } catch (_) { /* ignore */ }
+    try { unlinkSync(tmpPath); } catch (_) { /* ignore */ }
     return {
       ok: false,
       error: `failed to persist manifest-status at ${statusPath}: ${e.message}`,
     };
   }
-  return { ok: true, status_file: statusPath, phase: phaseId, updates };
+  return { ok: true, status_file: statusPath, phase: phaseId, updates, status };
 }
 
 // -------------------- Entry --------------------

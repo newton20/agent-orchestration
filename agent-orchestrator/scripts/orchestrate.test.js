@@ -1584,6 +1584,91 @@ test('K4 schema_version mismatch → fatal', () => {
   }
 });
 
+test('K4b [todo 101] schema_version=1 (V1 baseline) accepted', () => {
+  const dir = mkTmp('orch-K4b');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, { phases: { 'phase-1': { status: 'running' } } });
+    makePhaseDir(mp, 'phase-1');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      { _checkHealth: () => makeStubHealth({ schema_version: 1 }) }
+    );
+    assert.ok(!actions.some((a) => a.type === 'fatal'));
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('K4c [todo 101] schema_version="1.1" accepted with warning (soft-band)', () => {
+  const dir = mkTmp('orch-K4c');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, { phases: { 'phase-1': { status: 'running' } } });
+    makePhaseDir(mp, 'phase-1');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      { _checkHealth: () => makeStubHealth({ schema_version: '1.1' }) }
+    );
+    assert.ok(!actions.some((a) => a.type === 'fatal'), 'minor bump must not fatal');
+    assert.ok(
+      actions.some(
+        (a) => a.type === 'log' && a.level === 'warn' && /soft-compat band/.test(a.message)
+      ),
+      'minor bump must emit a soft-band warning'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('K4d [todo 101] schema_version=2 (major bump) → fatal', () => {
+  const dir = mkTmp('orch-K4d');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, { phases: { 'phase-1': { status: 'running' } } });
+    makePhaseDir(mp, 'phase-1');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      { _checkHealth: () => makeStubHealth({ schema_version: 2 }) }
+    );
+    assert.ok(
+      actions.some((a) => a.type === 'fatal' && /schema_version/.test(a.message))
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('K4e [todo 101] malformed schema_version values rejected as fatal', () => {
+  const dir = mkTmp('orch-K4e');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, { phases: { 'phase-1': { status: 'running' } } });
+    makePhaseDir(mp, 'phase-1');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    for (const bad of ['1.0.x', 'abc', '', null, 1.5]) {
+      const actions = O.decideTickActions(
+        { ...tickRes, manifestPath: mp },
+        { convergenceCounters: new Map() },
+        { _checkHealth: () => makeStubHealth({ schema_version: bad }) }
+      );
+      assert.ok(
+        actions.some((a) => a.type === 'fatal'),
+        `malformed value ${JSON.stringify(bad)} must be rejected as fatal`
+      );
+    }
+  } finally {
+    rmrf(dir);
+  }
+});
+
 test('K5 heartbeatTruncated logs debug but does not trigger recovery', () => {
   const dir = mkTmp('orch-K5');
   try {
@@ -2271,6 +2356,61 @@ test('O6 parseCliArgs: --plugin-dir + --project-name capture string args', () =>
   ]);
   assert.strictEqual(a.pluginDir, '/p');
   assert.strictEqual(a.projectName, 'demo');
+});
+
+test('O6b [todo 106] --plugin-dir followed by another flag → error (no greedy consume)', () => {
+  // Pre-fix `--plugin-dir --resume bar.yaml` parsed as
+  // `pluginDir = '--resume'` and silently dropped `--resume`.
+  // The fix rejects `-`-prefixed values for path-typed flags.
+  assert.throws(
+    () => O.parseCliArgs(['node', 's.js', '--plugin-dir', '--resume', 'bar.yaml']),
+    /--plugin-dir requires a path|use --plugin-dir=/
+  );
+});
+
+test('O6c [todo 106] --project-name followed by another flag → error', () => {
+  assert.throws(
+    () => O.parseCliArgs(['node', 's.js', '--project-name', '--once', 'bar.yaml']),
+    /--project-name requires a path|use --project-name=/
+  );
+});
+
+test('O6d [todo 106] --plugin-dir=<--special-path> escape hatch via `=` form', () => {
+  const a = O.parseCliArgs([
+    'node',
+    's.js',
+    '--plugin-dir=--special-path',
+    '--resume',
+    'bar.yaml',
+  ]);
+  assert.strictEqual(a.pluginDir, '--special-path');
+  assert.strictEqual(a.resume, true);
+  assert.strictEqual(a.manifestPath, 'bar.yaml');
+});
+
+test('O6e [todo 106] --project-name=<value> escape hatch', () => {
+  const a = O.parseCliArgs([
+    'node',
+    's.js',
+    '--project-name=--my-project',
+    'bar.yaml',
+  ]);
+  assert.strictEqual(a.projectName, '--my-project');
+});
+
+test('O6f [todo 106] non-flag value continues to work normally', () => {
+  // Sanity check: the existing happy path is preserved — only
+  // `-`-prefixed values trip the new check.
+  const a = O.parseCliArgs([
+    'node',
+    's.js',
+    '--plugin-dir',
+    'foo',
+    '--resume',
+    'bar.yaml',
+  ]);
+  assert.strictEqual(a.pluginDir, 'foo');
+  assert.strictEqual(a.resume, true);
 });
 
 test('O7 parseCliArgs: --dry-run + --skip-scaffold are flags', () => {

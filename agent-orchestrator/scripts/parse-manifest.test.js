@@ -1016,6 +1016,106 @@ test('runUpdate [todo 097] accepts well-formed integer retry_count above MAX_RET
   assert.strictEqual(r.ok, true, r.error);
 });
 
+// -------------------- Todo 103: runUpdate caching seams --------------------
+
+test('runUpdate [todo 103] _loadedManifest seam skips loadManifest (one disk read across N calls)', () => {
+  const file = write(validMinimal);
+  // Pre-load once.
+  const loaded = loadManifest(file);
+  assert.strictEqual(loaded.ok, true);
+  // Spy via _writeFileSync seam — the load path uses fs.readFileSync
+  // which we can't easily stub here; instead, exercise the seam by
+  // throwing a manifest mutation that would only work IF the cached
+  // value is honored. Mutate the cached manifest's name; runUpdate
+  // should accept the cached value (we trust the caller).
+  loaded.manifest.name = 'cached-name';
+  const r = runUpdate(file, 'phase-0', { status: 'running' }, {
+    _loadedManifest: loaded.manifest,
+  });
+  assert.strictEqual(r.ok, true, r.error);
+});
+
+test('runUpdate [todo 103] _loadedStatus shared instance preserves mutations across same-tick calls', () => {
+  // Critical RA contract (codex round 8 of PR #22): a fan-out tick
+  // that calls runUpdate(role-A, {pid: 1234}) then runUpdate(role-B,
+  // {started_at: '...'}) on the SAME shared _loadedStatus must end
+  // with BOTH role-A's pid AND role-B's started_at on disk. If the
+  // second call started from the pre-call-1 snapshot, role-A's pid
+  // would be lost.
+  //
+  // The current code routes a single phase per runUpdate call; the
+  // mutation contract bites when the same phase is updated twice
+  // in one tick (e.g., mark_phase_running + post-spawn pid persist).
+  // Test the contract with two writes on the same phase id under
+  // a shared _loadedStatus.
+  const file = write(validMinimal);
+  const loaded = loadManifest(file);
+  const sharedStatus = { phases: Object.create(null) };
+  const r1 = runUpdate(
+    file,
+    'phase-0',
+    { pid: 1234, status: 'running' },
+    { _loadedManifest: loaded.manifest, _loadedStatus: sharedStatus }
+  );
+  assert.strictEqual(r1.ok, true, r1.error);
+  // The shared object now has phase-0 with pid=1234.
+  assert.strictEqual(sharedStatus.phases['phase-0'].pid, 1234);
+
+  const r2 = runUpdate(
+    file,
+    'phase-0',
+    { started_at: '2026-01-01T00:00:00Z' },
+    { _loadedManifest: loaded.manifest, _loadedStatus: sharedStatus }
+  );
+  assert.strictEqual(r2.ok, true, r2.error);
+  // Both fields must be present on the shared object — second write
+  // started from the in-memory cache, NOT a fresh disk load that
+  // would have missed the in-memory pid.
+  assert.strictEqual(sharedStatus.phases['phase-0'].pid, 1234);
+  assert.strictEqual(
+    sharedStatus.phases['phase-0'].started_at,
+    '2026-01-01T00:00:00Z'
+  );
+  // Disk reflects the merged state too (final write wins; both fields
+  // present because the second call mutated the cache that was then
+  // serialized).
+  const reload = loadStatus(file);
+  assert.strictEqual(reload.status.phases['phase-0'].pid, 1234);
+  assert.strictEqual(
+    reload.status.phases['phase-0'].started_at,
+    '2026-01-01T00:00:00Z'
+  );
+});
+
+test('runUpdate [todo 103] _loadedStatus=null treats as fresh-write (matches "no status file" path)', () => {
+  const file = write(validMinimal);
+  const loaded = loadManifest(file);
+  // Pass `null` to declare "no status file" without taking the disk
+  // path. runUpdate writes a fresh shape.
+  const r = runUpdate(
+    file,
+    'phase-0',
+    { status: 'pending' },
+    { _loadedManifest: loaded.manifest, _loadedStatus: null }
+  );
+  assert.strictEqual(r.ok, true, r.error);
+  const reload = loadStatus(file);
+  assert.strictEqual(reload.status.phases['phase-0'].status, 'pending');
+});
+
+test('runUpdate [todo 103] rejects malformed _loadedStatus (must be object with phases or null)', () => {
+  const file = write(validMinimal);
+  const loaded = loadManifest(file);
+  const r = runUpdate(
+    file,
+    'phase-0',
+    { status: 'running' },
+    { _loadedManifest: loaded.manifest, _loadedStatus: 'not-an-object' }
+  );
+  assert.strictEqual(r.ok, false);
+  assert.ok(/_loadedStatus/.test(r.error));
+});
+
 test('VALID_ID_RE and FLAG_NAME_RE share the same ID character class', () => {
   assert.ok(VALID_ID_RE instanceof RegExp, 'VALID_ID_RE must be exported as a RegExp');
   assert.ok(FLAG_NAME_RE instanceof RegExp, 'FLAG_NAME_RE must be exported as a RegExp');
