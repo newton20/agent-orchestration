@@ -335,6 +335,17 @@ function buildSpawnCommand({
   pluginDir = null,
   launcher = null,
   windowTarget = '0',
+  // Todo 099: propagate the per-spawn token into the spawned tab's
+  // environment so the SessionStart hook can do pre-rename token
+  // filtering. The token is prepended to the inner cmd / powershell
+  // command line as an env-set + chain so EACH tab gets ONLY ITS OWN
+  // token (orchestrator-level process.env mutation would race in a
+  // fan-out tick that spawns multiple roles back-to-back).
+  //
+  // The token character class is safe to inline verbatim — it's
+  // generated as `<pid>-<ts>-<base36>`, no shell metacharacters.
+  // Validated below as a defensive guard against future caller bugs.
+  spawnToken = null,
 }) {
   if (!name || typeof name !== 'string' || name.trim() === '')
     throw new Error('spawnSession: `name` is required (non-empty string)');
@@ -389,7 +400,39 @@ function buildSpawnCommand({
   if (Array.isArray(passthrough_flags)) {
     for (const f of passthrough_flags) innerTokens.push(f);
   }
-  const innerCmd = innerTokens.filter((t) => t !== '').join(' ');
+  let innerCmd = innerTokens.filter((t) => t !== '').join(' ');
+
+  // Todo 099: prepend the AGENT_FLAG_TOKEN env-set so the spawned tab
+  // sees its own per-spawn token. Each tab launched in the same fan-
+  // out tick gets a distinct token via its OWN cmd/powershell prefix
+  // (no orchestrator-level env-mutation race).
+  if (spawnToken !== null && spawnToken !== undefined && spawnToken !== '') {
+    if (typeof spawnToken !== 'string') {
+      throw new Error(
+        `spawnSession: spawnToken must be a string when provided, got ${typeof spawnToken}`
+      );
+    }
+    // Defensive: reject any character that's a shell metachar in
+    // either cmd or powershell. The orchestrator generates tokens
+    // from `${pid}-${ts}-${base36}` which is safe — this guard
+    // catches future caller bugs that pass user-tainted values.
+    if (!/^[A-Za-z0-9._-]+$/.test(spawnToken)) {
+      throw new Error(
+        `spawnSession: spawnToken contains shell-unsafe characters; allowed [A-Za-z0-9._-]+, got ${JSON.stringify(spawnToken)}`
+      );
+    }
+    if (shell === 'powershell') {
+      // PowerShell: $env:AGENT_FLAG_TOKEN='<token>'; <innerCmd>
+      // The single-quoted form is safe because the token has no
+      // single quotes (validated above).
+      innerCmd = `$env:AGENT_FLAG_TOKEN='${spawnToken}'; ${innerCmd}`;
+    } else {
+      // cmd: set AGENT_FLAG_TOKEN=<token>&&<innerCmd>
+      // No spaces around `&&` — cmd interprets surrounding spaces
+      // as part of the variable value.
+      innerCmd = `set AGENT_FLAG_TOKEN=${spawnToken}&&${innerCmd}`;
+    }
+  }
 
   // Two parallel representations:
   //   `argv` — the argv passed to execFileSync('wt', argv). Each element
@@ -541,17 +584,26 @@ function isShellWrapperCmdline(cmdline) {
   return SHELL_WRAPPERS.has(bare);
 }
 
-function parsePidLookupOutput(stdout, name, { excludeWrappers = false } = {}) {
-  if (typeof stdout !== 'string' || stdout.trim() === '') return null;
+function parsePidLookupOutput(stdout, name, { excludeWrappers = false, _parsedRows } = {}) {
   if (!name || typeof name !== 'string') return null;
-  let parsed;
-  try {
-    parsed = JSON.parse(stdout);
-  } catch (_) {
-    return null;
+  // Todo 108.p: caller can pre-parse the PowerShell JSON once and
+  // pass `_parsedRows` directly to avoid N JSON.parse calls in a
+  // fan-out tick (buildPidSnapshot iterates over N session names
+  // and previously re-parsed the same stdout each time).
+  let rows;
+  if (Array.isArray(_parsedRows)) {
+    rows = _parsedRows;
+  } else {
+    if (typeof stdout !== 'string' || stdout.trim() === '') return null;
+    let parsed;
+    try {
+      parsed = JSON.parse(stdout);
+    } catch (_) {
+      return null;
+    }
+    if (parsed === null || parsed === undefined) return null;
+    rows = Array.isArray(parsed) ? parsed : [parsed];
   }
-  if (parsed === null || parsed === undefined) return null;
-  const rows = Array.isArray(parsed) ? parsed : [parsed];
   // Boundary check on both sides: the leading group accepts an
   // optional opening single- or double-quote so quoted forms in WMI
   // CommandLine output (`--name "orch phase 0"`, `--name 'orch phase 0'`)
@@ -686,6 +738,7 @@ function spawnSession({
   pluginDir = null,
   launcher = null,
   windowTarget = '0',
+  spawnToken = null,
   _runner,
   _tasklistRunner,
   _now,
@@ -698,6 +751,7 @@ function spawnSession({
     pluginDir,
     launcher,
     windowTarget,
+    spawnToken,
   });
 
   // Injectable runner receives (program, argv) so it matches getSessionPid

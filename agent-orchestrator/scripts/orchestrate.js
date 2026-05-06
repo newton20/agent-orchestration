@@ -242,6 +242,41 @@ const DEFAULT_STARTUP_GRACE_MS = 60_000;
 // newer major (design decision #4).
 const SCHEMA_VERSION_EXPECTED = 1;
 
+/**
+ * Todo 101: parse a checkHealth-output `schema_version` value into
+ * `{ major, minor }`. Accepts:
+ *   - integer N             → { major: N, minor: 0 }
+ *   - string "N"            → { major: N, minor: 0 }
+ *   - string "N.M"          → { major: N, minor: M } (N, M ∈ ℕ₀)
+ * Rejects (returns null):
+ *   - null / undefined / NaN
+ *   - non-integer numbers (1.5)
+ *   - strings with more than one dot ("1.0.x")
+ *   - non-numeric strings ("abc")
+ *   - empty string
+ *
+ * Pre-fix the orchestrator hard-failed on ANY mismatch — a V1.5
+ * minor bump from `1` to `1.1` would have broken every consumer.
+ * The MAJOR / MAJOR.MINOR soft-band lets minor versions advance
+ * compatibly while still fast-failing major bumps that are by
+ * definition breaking.
+ */
+function parseSchemaVersion(v) {
+  if (v === null || v === undefined) return null;
+  if (typeof v === 'number') {
+    if (!Number.isInteger(v) || v < 0) return null;
+    return { major: v, minor: 0 };
+  }
+  if (typeof v !== 'string' || v === '') return null;
+  if (!/^\d+(\.\d+)?$/.test(v)) return null;
+  const parts = v.split('.');
+  const major = parseInt(parts[0], 10);
+  const minor = parts.length === 2 ? parseInt(parts[1], 10) : 0;
+  if (!Number.isFinite(major) || !Number.isFinite(minor)) return null;
+  if (major < 0 || minor < 0) return null;
+  return { major, minor };
+}
+
 // Maximum bytes a flag file may carry. Mirrors session-start.js's
 // MAX_FLAG_BYTES so the writer + reader agree on the cap. Required so a
 // runaway prompt generator can't write a flag larger than the hook will
@@ -301,10 +336,7 @@ function completionSignalFor(phaseDir, role) {
  * conventional `<phaseDir>/<role>-complete.md`.
  */
 function resolveCompletionSignal(manifest, manifestDir, phaseId, role) {
-  const phaseEntry =
-    Array.isArray(manifest.phases)
-      ? manifest.phases.find((p) => p && p.id === phaseId)
-      : null;
+  const phaseEntry = findRawPhase(manifest, phaseId);
   if (
     phaseEntry &&
     typeof phaseEntry.completion_signal === 'string' &&
@@ -718,9 +750,27 @@ function buildPidSnapshot(sessionNames, opts = {}) {
   } catch (_) {
     return null;
   }
+  // Todo 108.p: parse the PowerShell JSON ONCE per snapshot, not
+  // once per session name. Pre-fix, parsePidLookupOutput re-parsed
+  // the same stdout buffer N times — wasteful for fan-out phases
+  // with multiple roles.
+  let parsedRows = null;
+  if (typeof stdout === 'string' && stdout.trim() !== '') {
+    try {
+      const parsed = JSON.parse(stdout);
+      if (parsed !== null && parsed !== undefined) {
+        parsedRows = Array.isArray(parsed) ? parsed : [parsed];
+      }
+    } catch (_) {
+      parsedRows = null; // fall through; parsePidLookupOutput will re-handle
+    }
+  }
   const map = new Map();
   for (const name of sessionNames) {
-    const pid = parsePidLookupOutput(stdout, name, { excludeWrappers: true });
+    const pid = parsePidLookupOutput(stdout, name, {
+      excludeWrappers: true,
+      _parsedRows: parsedRows,
+    });
     if (Number.isInteger(pid) && pid > 0) {
       map.set(name, { pid });
     }
@@ -825,6 +875,33 @@ function pollAllPhases(opts) {
     }
   }
   const pidSnapshot = buildPidSnapshot(sessionNames, opts);
+  // Codex round 14 P2 + round 17 P2: build a wrapper-INCLUSIVE
+  // snapshot ONLY when there are 'spawning' phases that need the
+  // wrapper-aware reconciliation defer. The primary snapshot
+  // above excludes wrappers; the inclusive snapshot is required
+  // to detect "tab is launching, inner Claude not yet registered"
+  // cases for spawning-marker reconciliation. Pre-round-17, this
+  // ran every tick — doubling WMI subprocess overhead even on
+  // normal running/idle polls where no phase is spawning. Now
+  // gated.
+  const hasSpawningPhase = (function () {
+    if (!status || !status.phases) return false;
+    for (const id of Object.keys(status.phases)) {
+      const e = status.phases[id];
+      if (e && typeof e === 'object' && e.status === 'spawning') return true;
+    }
+    return false;
+  })();
+  let pidSnapshotWithWrappers = null;
+  if (hasSpawningPhase) {
+    try {
+      pidSnapshotWithWrappers = buildPidSnapshotInclusive(sessionNames, opts);
+    } catch (_) {
+      // Best-effort. The reconciliation defer logic falls back to
+      // primary-snapshot behavior when this is null.
+      pidSnapshotWithWrappers = null;
+    }
+  }
 
   return {
     ok: true,
@@ -832,7 +909,54 @@ function pollAllPhases(opts) {
     phases,
     status,
     pidSnapshot,
+    pidSnapshotWithWrappers,
   };
+}
+
+/**
+ * Codex round 14 P2: same shape as buildPidSnapshot, but excludeWrappers:false.
+ * Used by decideTickActions's spawning-marker reconciliation to detect
+ * wrapper-only-still-launching tabs before rolling back to 'pending'.
+ */
+function buildPidSnapshotInclusive(sessionNames, opts = {}) {
+  if (!Array.isArray(sessionNames) || sessionNames.length === 0) {
+    return new Map();
+  }
+  const runner =
+    opts._pidRunner ||
+    ((program, argv) =>
+      execFileSync(program, argv, {
+        stdio: ['ignore', 'pipe', 'ignore'],
+        encoding: 'utf8',
+      }));
+  let stdout;
+  try {
+    stdout = runner('powershell', buildPidLookupArgs());
+  } catch (_) {
+    return null;
+  }
+  let parsedRows = null;
+  if (typeof stdout === 'string' && stdout.trim() !== '') {
+    try {
+      const parsed = JSON.parse(stdout);
+      if (parsed !== null && parsed !== undefined) {
+        parsedRows = Array.isArray(parsed) ? parsed : [parsed];
+      }
+    } catch (_) {
+      parsedRows = null;
+    }
+  }
+  const map = new Map();
+  for (const name of sessionNames) {
+    const pid = parsePidLookupOutput(stdout, name, {
+      excludeWrappers: false,
+      _parsedRows: parsedRows,
+    });
+    if (Number.isInteger(pid) && pid > 0) {
+      map.set(name, { pid });
+    }
+  }
+  return map;
 }
 
 // -------------------- Status helpers --------------------
@@ -872,6 +996,62 @@ function depsBlocked(phase, status) {
 
 function isTerminalStatus(s) {
   return s === 'completed' || s === 'failed' || s === 'blocked';
+}
+
+/**
+ * Todo 108.g: lookup the raw phase entry from the parsed manifest.
+ * Several call sites need access to fields parse-manifest's
+ * normalizePhases strips (e.g., review_loop.pr_or_branch /
+ * qa_scope_rows, plan_path / plan_unit_marker). Returning `null`
+ * (rather than `undefined`) keeps the semantics explicit at the
+ * read sites.
+ */
+function findRawPhase(manifest, phaseId) {
+  if (!manifest || !Array.isArray(manifest.phases)) return null;
+  const raw = manifest.phases.find((p) => p && p.id === phaseId);
+  return raw || null;
+}
+
+/**
+ * Todo 097: validate the SHAPE of `retry_count` on a phase status entry.
+ *
+ * The pre-fix read path silently coerced any non-integer to 0 — a
+ * corrupted `retry_count: "two"` (or `2.5`, `null`, `-1`) would grant
+ * up to 3 fresh retries beyond the documented cap, bypassing the
+ * convergence guard.
+ *
+ * Returns:
+ *   { ok: true, value: 0 }  when the field is absent (legitimate
+ *      fresh-spawn). The caller treats absent as "no retries yet."
+ *   { ok: true, value: n }  when the field is a non-negative integer.
+ *      Over-budget integers (e.g. n=5 with maxRetries=3) are NOT
+ *      corrupt — they're legitimate historical state from a prior
+ *      run with --max-recovery-retries=5; the budget comparison
+ *      happens later in decideRecoveryAction's exhausted path.
+ *   { ok: false, observed }  when the field is present but the SHAPE
+ *      is wrong (string, float, negative integer, explicit null).
+ *      The caller should mark the phase blocked with a structured
+ *      error naming the field + observed value.
+ *
+ * Critical: the absence-vs-explicit-null distinction. The orchestrator
+ * writes manifest-status with `Object.create(null)` phases, so an
+ * unset key shows up as `undefined` (absent → ok). A literal
+ * `retry_count: null` in the YAML shows up as `null` (corrupt-shape →
+ * blocked). Coercing both to 0 the way the pre-fix code did would
+ * accept a corrupted file as fresh state.
+ */
+function validateRetryCountShape(phaseEntry) {
+  if (!phaseEntry || typeof phaseEntry !== 'object') {
+    return { ok: true, value: 0 };
+  }
+  if (!('retry_count' in phaseEntry)) {
+    return { ok: true, value: 0 };
+  }
+  const raw = phaseEntry.retry_count;
+  if (Number.isInteger(raw) && raw >= 0) {
+    return { ok: true, value: raw };
+  }
+  return { ok: false, observed: raw };
 }
 
 // -------------------- Completion-signal parsing --------------------
@@ -1017,9 +1197,8 @@ function parseQaVerdict(phaseDir, role, opts = {}) {
  * a list of actions. No side effects; tests assert on the actions list.
  *
  * Action types:
- *   { type: 'spawn', phaseId, role, mode: 'initial' | 'recovery', context }
+ *   { type: 'spawn', phaseId, role, mode: 'initial' | 'recovery' | 'review_retry', context }
  *   { type: 'persist', phaseId, role?, updates }
- *   { type: 'mark_phase_running', phaseId }
  *   { type: 'mark_phase_completed', phaseId }
  *   { type: 'mark_phase_failed', phaseId, reason }
  *   { type: 'mark_phase_blocked', phaseId, reason }
@@ -1037,6 +1216,7 @@ function decideTickActions(tickState, runState, opts) {
     phases,
     status,
     pidSnapshot,
+    pidSnapshotWithWrappers,
     manifestPath,
   } = tickState;
   const actions = [];
@@ -1059,6 +1239,37 @@ function decideTickActions(tickState, runState, opts) {
   const checkHealthFn = opts._checkHealth || checkHealth;
   const manifestDir = path.dirname(path.resolve(manifestPath));
 
+  // -- Todo 097 pre-pass: shape-validate retry_count on every non-terminal
+  //    phase entry. Corrupt-shape values (string, float, negative integer,
+  //    explicit null) used to silently coerce to 0, granting fresh retries
+  //    beyond the cap. Block the phase with a structured error so the
+  //    operator sees the corruption in manifest-status.yaml instead of
+  //    a silent budget bypass. Use a guard set so we don't double-block
+  //    the same phase if monitoring loops below also hit it.
+  const shapeBlocked = new Set();
+  for (const phase of phases) {
+    const phaseEntry = getPhaseStatus(status, phase.id);
+    if (phaseEntry && isTerminalStatus(phaseEntry.status)) continue;
+    const shape = validateRetryCountShape(phaseEntry);
+    if (!shape.ok) {
+      actions.push({
+        type: 'log',
+        level: 'error',
+        message:
+          `phase ${phase.id} manifest-status.retry_count is shape-corrupt ` +
+          `(observed: ${JSON.stringify(shape.observed)}); ` +
+          `expected absent OR a non-negative integer. Marking phase blocked.`,
+        phaseId: phase.id,
+      });
+      actions.push({
+        type: 'mark_phase_blocked',
+        phaseId: phase.id,
+        reason: `retry_count_shape_corrupt:${JSON.stringify(shape.observed)}`,
+      });
+      shapeBlocked.add(phase.id);
+    }
+  }
+
   // -- Reconciliation pass (todo 090). Phases with `status: 'spawning'`
   // represent dispatches where the prior orchestrator wrote the
   // pre-spawn marker but died (SIGTERM / Ctrl+C / crash) before the
@@ -1076,6 +1287,7 @@ function decideTickActions(tickState, runState, opts) {
   // failed; in that case skip reconciliation this tick — next tick
   // re-tries with a fresh snapshot.
   for (const phase of phases) {
+    if (shapeBlocked.has(phase.id)) continue;
     const phaseEntry = getPhaseStatus(status, phase.id);
     if (phaseEntry.status !== 'spawning') continue;
     if (pidSnapshot === null) continue; // no snapshot this tick
@@ -1094,6 +1306,32 @@ function decideTickActions(tickState, runState, opts) {
     }
     let reconciledRole = null;
     let snapshotPid = null;
+    // Codex round 6 P2 + round 7 P2: detect "wrapper-alive + flag-
+    // still-present" cases AND bound the deferral so an orphaned
+    // flag (no live process + no flag-consumer) doesn't defer
+    // forever. The pidSnapshot here excludes wrappers (production
+    // health-check semantic). A tab whose inner Claude hasn't
+    // registered yet but whose wrapper is alive shows as no-PID;
+    // if its .pending-<name> flag is FRESH (younger than the hook's
+    // FLAG_TTL_MS = 60s), the tab is still waiting for its hook
+    // to fire — defer reconciliation. If the flag is OLDER than
+    // FLAG_TTL_MS, the hook would itself skip it (per
+    // hooks/session-start.js soft TTL); the flag is orphaned and
+    // we proceed with the rollback so the phase doesn't stay
+    // stuck.
+    let waitingTabFlag = false;
+    const phaseHookOrchDir = (function () {
+      // Resolve the workdir-side orchDir for this phase. executeSpawn
+      // writes flags under orchDirFor(resolvedWorkdir).
+      const wd =
+        typeof manifest.workdir === 'string' && manifest.workdir !== ''
+          ? path.isAbsolute(manifest.workdir)
+            ? manifest.workdir
+            : path.resolve(manifestDir, manifest.workdir)
+          : manifestDir;
+      return orchDirFor(wd);
+    })();
+    let wrapperOnlyAlive = false;
     for (const r of candidateRoles) {
       const sessionName = defaultSessionName(phase.id, r);
       const snap = pidSnapshot.get(sessionName);
@@ -1102,6 +1340,92 @@ function decideTickActions(tickState, runState, opts) {
         snapshotPid = snap.pid;
         break;
       }
+      // Codex round 14 P2: also probe the wrapper-inclusive snapshot.
+      // After EFLAGTIMEOUT the .pending-* flag is unlinked and the
+      // marker stays 'spawning'; if the cmd/powershell wrapper is
+      // alive but the inner Claude isn't yet registered, the
+      // primary snapshot misses it. Without this guard the
+      // reconciliation rolls back and the next tick spawns a
+      // duplicate session under the same --name — breaking the
+      // per-(phase, role) uniqueness invariant.
+      if (
+        pidSnapshotWithWrappers &&
+        pidSnapshotWithWrappers.get(sessionName) &&
+        Number.isInteger(pidSnapshotWithWrappers.get(sessionName).pid) &&
+        pidSnapshotWithWrappers.get(sessionName).pid > 0
+      ) {
+        wrapperOnlyAlive = true;
+      }
+      // No primary-snapshot hit — check if a .pending-* flag still
+      // exists AND is fresh (younger than the hook's FLAG_TTL_MS).
+      // An orphaned older flag is treated as "no waiting tab" so
+      // the rollback path runs and the phase doesn't stay stuck.
+      const fp = path.join(phaseHookOrchDir, `.pending-${sessionName}`);
+      const existsFn = opts._existsSync || fs.existsSync;
+      const statFn = opts._statSync || fs.statSync;
+      if (existsFn(fp)) {
+        try {
+          const st = statFn(fp);
+          // Match the hook's FLAG_TTL_MS = 60_000. Anything older
+          // the hook would skip; we treat as orphaned for
+          // reconciliation purposes. The hard-TTL unlinker in the
+          // hook (10× soft TTL) will eventually remove the file.
+          const FLAG_TTL_MS_LOCAL = 60_000;
+          const ageMs = now - (typeof st.mtimeMs === 'number' ? st.mtimeMs : 0);
+          if (ageMs <= FLAG_TTL_MS_LOCAL) {
+            waitingTabFlag = true;
+          }
+        } catch (_) {
+          /* statSync race: treat as no waiting flag, proceed */
+        }
+      }
+    }
+    // Codex round 16 P2: wrapper-only defer must be BOUNDED. cmd /k
+    // and powershell -NoExit keep the wrapper alive indefinitely
+    // after the inner Claude exits (so the user can read post-mortem
+    // output). If we deferred on wrapperOnlyAlive forever, a crashed
+    // session would stay stuck in 'spawning' until the user manually
+    // closed the tab.
+    //
+    // Bound: wrapper-only defer is honored only when the spawning
+    // marker's `dispatched_at` is fresh (within FLAG_TTL_MS_LOCAL).
+    // Past that window, the inner Claude should have registered by
+    // now; wrapper-only is treated as a post-mortem and the rollback
+    // path proceeds.
+    let wrapperOnlyFresh = false;
+    if (wrapperOnlyAlive) {
+      const dispatchedAtMs = phaseEntry && typeof phaseEntry.dispatched_at === 'string'
+        ? Date.parse(phaseEntry.dispatched_at)
+        : NaN;
+      if (Number.isFinite(dispatchedAtMs)) {
+        const FLAG_TTL_MS_LOCAL = 60_000;
+        const ageMs = now - dispatchedAtMs;
+        if (ageMs <= FLAG_TTL_MS_LOCAL) {
+          wrapperOnlyFresh = true;
+        }
+      }
+      // If dispatched_at is missing or unparseable, treat as not
+      // fresh — better to roll back than to stay stuck. The
+      // reconciliation path will re-dispatch from a clean slate.
+    }
+    if (reconciledRole === null && (waitingTabFlag || wrapperOnlyFresh)) {
+      // Defer reconciliation — either the resume sweep's cell-1
+      // preservation (waitingTabFlag) or a fresh wrapper-only
+      // window (post-EFLAGTIMEOUT or pre-WMI-registration) means
+      // a tab may still come up. Rolling back here would risk a
+      // duplicate-session-name bug.
+      actions.push({
+        type: 'log',
+        level: 'info',
+        message:
+          `phase ${phase.id} reconciliation deferred: spawning marker + ` +
+          `${waitingTabFlag ? 'fresh .pending-* flag' : ''}` +
+          `${waitingTabFlag && wrapperOnlyFresh ? ' + ' : ''}` +
+          `${wrapperOnlyFresh ? 'fresh live wrapper (inner Claude not yet registered)' : ''}` +
+          `; next tick will re-check`,
+        phaseId: phase.id,
+      });
+      continue;
     }
     if (reconciledRole !== null) {
       // Adopt: tab is alive.
@@ -1128,9 +1452,12 @@ function decideTickActions(tickState, runState, opts) {
     } else {
       // Reset to pending; budget incremented so the orchestrator's
       // recovery semantics treat this as one of the retry attempts.
-      const cur = Number.isInteger(phaseEntry.retry_count)
-        ? phaseEntry.retry_count
-        : 0;
+      // Todo 097: shape was already validated by the pre-pass above;
+      // this read is guaranteed-safe (shape-corrupt phases exit early
+      // via mark_phase_blocked). Treating absent as 0 is the legitimate
+      // fresh-spawn path validateRetryCountShape codifies.
+      const shape = validateRetryCountShape(phaseEntry);
+      const cur = shape.ok ? shape.value : 0;
       actions.push({
         type: 'log',
         level: 'warn',
@@ -1153,6 +1480,7 @@ function decideTickActions(tickState, runState, opts) {
 
   // -- First pass: monitor each running phase × role.
   for (const phase of phases) {
+    if (shapeBlocked.has(phase.id)) continue;
     const phaseEntry = getPhaseStatus(status, phase.id);
     if (phaseEntry.status !== 'running') continue;
     const phaseDir = phaseDirFor(manifestDir, phase.id);
@@ -1182,10 +1510,8 @@ function decideTickActions(tickState, runState, opts) {
     // field. We instead probe the raw manifest's phase entry for the
     // user-provided value and fall back to the CLI / built-in default
     // chain.
-    const rawPhaseForCap =
-      (Array.isArray(manifest.phases)
-        ? manifest.phases.find((p) => p && p.id === phase.id)
-        : null) || {};
+    // Todo 108.g: use shared findRawPhase helper.
+    const rawPhaseForCap = findRawPhase(manifest, phase.id) || {};
     const rawReviewLoopForCap =
       rawPhaseForCap.review_loop && typeof rawPhaseForCap.review_loop === 'object'
         ? rawPhaseForCap.review_loop
@@ -1211,7 +1537,6 @@ function decideTickActions(tickState, runState, opts) {
       ? [reviewStage]
       : phase.agents.map((a) => a.role);
 
-    let phaseAdvanced = false;
     for (const role of activeRoles) {
       // Find the agent record for this role (defaults).
       const agent = phase.agents.find((a) => a.role === role);
@@ -1326,7 +1651,6 @@ function decideTickActions(tickState, runState, opts) {
             phaseId: phase.id,
             updates: { review_stage: 'qa' },
           });
-          phaseAdvanced = true;
           continue;
         }
         if (reviewEnabled && role === 'qa') {
@@ -1355,8 +1679,7 @@ function decideTickActions(tickState, runState, opts) {
               type: 'mark_phase_completed',
               phaseId: phase.id,
             });
-            phaseAdvanced = true;
-            continue;
+              continue;
           }
           // Verdict failed.
           if (reviewIteration >= reviewMaxIter) {
@@ -1373,8 +1696,7 @@ function decideTickActions(tickState, runState, opts) {
               phaseId: phase.id,
               reason: `review_loop_exceeded:${reviewMaxIter}`,
             });
-            phaseAdvanced = true;
-            continue;
+              continue;
           }
           // Respawn impl with a fresh prompt + the prior verdict's
           // failures inlined. Iteration counter advances.
@@ -1403,7 +1725,6 @@ function decideTickActions(tickState, runState, opts) {
               review_iteration: nextIter,
             },
           });
-          phaseAdvanced = true;
           continue;
         }
         // Non-review phase (or non-impl/qa role on a review phase):
@@ -1429,6 +1750,15 @@ function decideTickActions(tickState, runState, opts) {
         // completed — silently advancing downstream phases.
         // (The current role already passed the parse check above by
         // virtue of reaching this branch; we re-check the others.)
+        //
+        // Todo 108.o (Conf 75, perf): for an N-role phase this loop
+        // runs N×(N-1) parseCompletionSignal calls per tick (each
+        // role iteration re-parses every sibling). For V1 with N≤3
+        // (impl + qa + coord) the absolute cost is bounded; a
+        // per-tick memoization cache keyed by (phaseId, role) would
+        // reduce it to O(N). Deferred behind Conf 75 — acceptable
+        // for V1 scale but flagged for V1.5 if a fan-out pattern
+        // exceeds 3 roles.
         let allRolesComplete = true;
         for (const a of phase.agents) {
           if (a.role === role) continue; // current role is complete
@@ -1446,7 +1776,6 @@ function decideTickActions(tickState, runState, opts) {
             type: 'mark_phase_completed',
             phaseId: phase.id,
           });
-          phaseAdvanced = true;
         }
         continue;
       }
@@ -1477,16 +1806,53 @@ function decideTickActions(tickState, runState, opts) {
         continue;
       }
 
-      // schema_version guard (design decision #4).
-      if (health.schema_version !== SCHEMA_VERSION_EXPECTED) {
+      // Todo 101: schema_version guard with MAJOR / MAJOR.MINOR soft-
+      // band semantics. Pre-fix any mismatch was a hard fatal — a
+      // V1.5 bump from `1` to `1.1` would have broken every consumer.
+      //
+      // Contract:
+      //   - malformed (non-integer, non-MAJOR or MAJOR.MINOR string,
+      //     null) → fatal (caller can't reason about compat).
+      //   - parsed.major !== SCHEMA_VERSION_EXPECTED → fatal (major
+      //     mismatch is by definition breaking).
+      //   - parsed.major === SCHEMA_VERSION_EXPECTED && parsed.minor > 0
+      //     → warn + proceed (forward-compat: producer is newer than
+      //     consumer's known minor, but the major is unchanged so
+      //     fields the consumer reads still exist with the same
+      //     semantics; new fields are ignored).
+      //   - else → ok.
+      const parsedSchema = parseSchemaVersion(health.schema_version);
+      if (parsedSchema === null) {
         actions.push({
           type: 'fatal',
           message:
-            `checkHealth returned schema_version ${health.schema_version}; ` +
-            `orchestrator expected ${SCHEMA_VERSION_EXPECTED}. ` +
+            `checkHealth returned malformed schema_version ${JSON.stringify(health.schema_version)}; ` +
+            `expected MAJOR (e.g. 1) or MAJOR.MINOR (e.g. 1.1). ` +
+            `Consumer cannot reason about compat — refusing to advance.`,
+        });
+        continue;
+      }
+      if (parsedSchema.major !== SCHEMA_VERSION_EXPECTED) {
+        actions.push({
+          type: 'fatal',
+          message:
+            `checkHealth returned schema_version ${JSON.stringify(health.schema_version)} (major=${parsedSchema.major}); ` +
+            `orchestrator expected major=${SCHEMA_VERSION_EXPECTED}. ` +
             `A check-health upgrade is needed before this orchestrator can advance.`,
         });
         continue;
+      }
+      if (parsedSchema.minor > 0) {
+        actions.push({
+          type: 'log',
+          level: 'warn',
+          message:
+            `checkHealth output declares schema_version ${JSON.stringify(health.schema_version)}; ` +
+            `consumer targets ${SCHEMA_VERSION_EXPECTED} — proceeding under MAJOR/MAJOR.MINOR soft-compat band ` +
+            `(new fields are ignored; existing field semantics unchanged).`,
+          phaseId: phase.id,
+          role,
+        });
       }
 
       // errorKind dispatch (design decision #3).
@@ -1506,7 +1872,6 @@ function decideTickActions(tickState, runState, opts) {
             phaseId: phase.id,
             reason: `config_error:${health.error}`,
           });
-          phaseAdvanced = true;
           continue;
         }
         if (health.errorKind === 'runtime') {
@@ -1587,8 +1952,14 @@ function decideTickActions(tickState, runState, opts) {
             maxRetries,
             now,
             phaseEntry,
+            // Todo 094: thread health + tick-state into the recovery
+            // action builder so priorPid / lastHeartbeatTimestamp /
+            // remainingWorkBlock / completedCheckpointsBlock can be
+            // populated.
+            health,
+            status,
+            manifest,
           });
-          phaseAdvanced = true;
           continue;
         }
         // Healthy. Continue polling next tick.
@@ -1615,16 +1986,27 @@ function decideTickActions(tickState, runState, opts) {
           maxRetries,
           now,
           phaseEntry,
+          health,
+          status,
+          manifest,
         });
-        phaseAdvanced = true;
         continue;
       }
 
       // pidAlive === null. Check the reason.
       const reason = health.pidAliveReason;
       if (reason === 'startup_grace') {
-        // Do NOT count toward the heuristic. The agent is still
-        // spawning; resolve deterministically next tick.
+        // Todo 098: startup_grace must RESET the counter (not just
+        // skip-the-increment). The convergence contract from todo 071
+        // says "N consecutive lookup_failed/session_not_found past
+        // startup-grace = crash"; the word `consecutive` is
+        // load-bearing. Pre-fix, a flap pattern of `lookup_failed →
+        // startup_grace → lookup_failed` left counter=1 across the
+        // grace tick, so the second null was counted as the second
+        // consecutive failure even though grace interrupted the run.
+        // Resetting on startup_grace makes the counter only fire when
+        // failures are actually consecutive past grace.
+        counters.delete(cKey);
         continue;
       }
       // 'lookup_failed' OR 'session_not_found' OR null reason ⇒ count.
@@ -1662,15 +2044,20 @@ function decideTickActions(tickState, runState, opts) {
         maxRetries,
         now,
         phaseEntry,
+        health,
+        status,
+        manifest,
       });
-      phaseAdvanced = true;
     }
-    // (silence "unused" warning — phaseAdvanced is informational only)
-    void phaseAdvanced;
+    // Todo 108.c: removed write-only `phaseAdvanced` (9 assignments,
+    // 0 reads, suppressed via `void`). Loop ordering already
+    // guarantees a single-action-per-(phase, role) emission via the
+    // explicit `continue` at each terminal branch.
   }
 
   // -- Second pass: advance pending phases.
   for (const phase of phases) {
+    if (shapeBlocked.has(phase.id)) continue;
     const phaseEntry = getPhaseStatus(status, phase.id);
     const curStatus = phaseEntry.status || 'pending';
     if (curStatus !== 'pending') continue;
@@ -1830,10 +2217,13 @@ function decideTickActions(tickState, runState, opts) {
 }
 
 function decideRecoveryAction(actions, runState, opts, ctx) {
-  const { phase, role, phaseDir, reason, maxRetries, phaseEntry } = ctx;
-  const cur = Number.isInteger(phaseEntry.retry_count)
-    ? phaseEntry.retry_count
-    : 0;
+  const { phase, role, phaseDir, reason, maxRetries, phaseEntry, health, status, manifest, now } = ctx;
+  // Todo 097: shape is enforced by decideTickActions's pre-pass; when
+  // we reach here the entry is either absent (fresh-spawn path → 0) or
+  // a non-negative integer. Over-budget integers fall through to the
+  // exhausted branch below — that's the documented recovery contract.
+  const shape = validateRetryCountShape(phaseEntry);
+  const cur = shape.ok ? shape.value : 0;
   if (cur >= maxRetries) {
     actions.push({
       type: 'log',
@@ -1851,6 +2241,72 @@ function decideRecoveryAction(actions, runState, opts, ctx) {
     });
     return;
   }
+
+  // Todo 094: populate the V1.5 recovery-analyst hook's diagnostic
+  // context fields. Each field is sourced from the data already in
+  // scope; absent sources land as explicit `null` (NOT omitted /
+  // undefined) per the RA acceptance criteria so the hook can
+  // distinguish "field not populated" from "field absent from
+  // contract."
+  //
+  //   priorPid: phaseEntry.pid is the writer-side breadcrumb the
+  //     prior session persisted before crashing. Integer or null.
+  //   lastHeartbeatTimestamp: derived from check-health's
+  //     `heartbeatAge` (seconds since last heartbeat record). When
+  //     heartbeatAge is null (no record), we emit null.
+  //   remainingWorkBlock: pulled from the manifest's plan_units
+  //     literal (or null when the operator wired plan_path /
+  //     plan_unit_marker — generate-prompt extracts from there at
+  //     spawn time, so the recovery hook sees the rendered prompt
+  //     not a separate block).
+  //   completedCheckpointsBlock: built by ITERATING
+  //     `status.phases` for entries with `status: 'completed'`
+  //     (RA correction post-codex round 9 of PR #22: there is NO
+  //     top-level `completed_phases` field — the canonical source
+  //     is the per-phase status map).
+  const priorPid =
+    phaseEntry && Number.isInteger(phaseEntry.pid) ? phaseEntry.pid : null;
+
+  let lastHeartbeatTimestamp = null;
+  if (
+    health &&
+    Number.isInteger(health.heartbeatAge) &&
+    Number.isFinite(now)
+  ) {
+    lastHeartbeatTimestamp = new Date(now - health.heartbeatAge * 1000).toISOString();
+  }
+
+  // For remainingWorkBlock, the simpler V1 sourcing is the manifest's
+  // raw `plan_units` literal. Filtering to non-completed units would
+  // require parsing the plan markdown — deferred to V1.5 where the
+  // recovery analyst can read the plan directly. Until then, the
+  // hook receives the full plan_units block (or null).
+  // Todo 108.g: use shared findRawPhase helper.
+  const rawPhase094 = findRawPhase(manifest, phase.id);
+  let remainingWorkBlock = null;
+  if (rawPhase094 && typeof rawPhase094.plan_units === 'string' && rawPhase094.plan_units !== '') {
+    remainingWorkBlock = rawPhase094.plan_units;
+  }
+
+  // completedCheckpointsBlock — iterate status.phases. Absent / empty
+  // status, or no completed phases, yields explicit null (not the
+  // empty-string fallback executeSpawn defaulted to before).
+  let completedCheckpointsBlock = null;
+  if (status && status.phases && typeof status.phases === 'object') {
+    const completedIds = [];
+    for (const id of Object.keys(status.phases)) {
+      const e = status.phases[id];
+      if (e && typeof e === 'object' && e.status === 'completed') {
+        completedIds.push(id);
+      }
+    }
+    if (completedIds.length > 0) {
+      completedCheckpointsBlock = completedIds
+        .map((id) => `- ${id} (status: completed)`)
+        .join('\n');
+    }
+  }
+
   actions.push({
     type: 'spawn',
     phaseId: phase.id,
@@ -1858,6 +2314,11 @@ function decideRecoveryAction(actions, runState, opts, ctx) {
     mode: 'recovery',
     iteration: cur + 1,
     crashReason: reason,
+    // Todo 094: explicit nulls when source is missing.
+    priorPid,
+    lastHeartbeatTimestamp,
+    remainingWorkBlock,
+    completedCheckpointsBlock,
   });
   actions.push({
     type: 'persist',
@@ -1889,7 +2350,27 @@ function executeActions(actions, tickState, runState, opts) {
   const logger = opts.logger || makeDefaultLogger();
   const spawnFn = opts._spawnSession || spawnSession;
   const generateFn = opts._generatePrompt || generatePrompt;
-  const runUpdateFn = opts._runUpdate || runUpdate;
+  const baseRunUpdate = opts._runUpdate || runUpdate;
+  // Todo 103: tick-level cache. tickState.manifest is already
+  // validated by pollAllPhases; tickState.status is the canonical
+  // mutable shared instance the writer-side runUpdates mutate
+  // across this tick. The wrapper threads both through to every
+  // runUpdate call so a 5-role fan-out tick re-loads + re-validates
+  // manifest+status ONCE (not 2N times). Mutation contract: the
+  // shared status object preserves prior call's pid / started_at /
+  // review_stage so the second writer in the same tick doesn't
+  // start from a stale pre-call-1 snapshot.
+  //
+  // Test injection: when opts._runUpdate is set, callers usually
+  // want a fully-stubbed writer (test fakes return ok without
+  // touching disk). We still pass the seam — the fake can ignore
+  // it; the real runUpdate honors it.
+  const runUpdateFn = (manifestPath, phaseId, updates, extraOpts = {}) =>
+    baseRunUpdate(manifestPath, phaseId, updates, {
+      _loadedManifest: tickState.manifest,
+      _loadedStatus: tickState.status,
+      ...extraOpts,
+    });
   const writeFile = opts._writeFileSync || fs.writeFileSync;
   const renameFile = opts._renameSync || fs.renameSync;
   const mkdir = opts._mkdirSync || fs.mkdirSync;
@@ -1955,6 +2436,11 @@ function executeActions(actions, tickState, runState, opts) {
             `spawn skipped for phase=${action.phaseId} role=${action.role}: ` +
               `prior spawn this tick hit a flag-consume timeout; deferring to next tick`
           );
+          // Todo 108.f investigated: runOneTick initializes the Set
+          // at tick start, but the orchestrate.test.js suite calls
+          // executeActions DIRECTLY with a runState that lacks
+          // spawnFailedThisTick — so the lazy guards aren't dead.
+          // Kept the guard but documented intent.
           if (!runState.spawnFailedThisTick) {
             runState.spawnFailedThisTick = new Set();
           }
@@ -2028,6 +2514,28 @@ function executeActions(actions, tickState, runState, opts) {
         if (failed && !succeeded) {
           out.warnings.push(
             `persist skipped for phase=${action.phaseId}: all spawns failed this tick`
+          );
+          break;
+        }
+        // Codex round 4 P2 + round 11 P2: skip persist if executeSpawn
+        // observed a post-spawn runUpdate failure AND this persist
+        // would overwrite `status` with 'running'. Todo 096's
+        // contract requires the 'spawning' marker to stay intact so
+        // reconciliation adopts the live tab next tick — but ONLY
+        // the status field overwrites the marker. Field-only
+        // persists (review_stage, review_iteration, retry_count)
+        // merge with existing fields and preserve 'spawning';
+        // skipping them would lose review/retry state. Allow them.
+        const wouldOverwriteMarker =
+          action.updates &&
+          (action.updates.status === 'running' || action.updates.status === 'pending');
+        if (
+          wouldOverwriteMarker &&
+          runState.postSpawnUpdateFailedThisTick &&
+          runState.postSpawnUpdateFailedThisTick.has(action.phaseId)
+        ) {
+          out.warnings.push(
+            `persist skipped for phase=${action.phaseId}: post-spawn runUpdate failed; status-overwriting persist suppressed (marker left 'spawning' for next-tick reconciliation)`
           );
           break;
         }
@@ -2109,12 +2617,12 @@ function executeActions(actions, tickState, runState, opts) {
         );
         break;
       }
-      case 'mark_phase_running': {
-        if (!dryRun) {
-          runUpdateFn(manifestPath, action.phaseId, { status: 'running' });
-        }
-        break;
-      }
+      // Todo 108.b: removed dead `mark_phase_running` handler — the
+      // action type was documented in decideTickActions's JSDoc but
+      // never emitted by any decideTickActions code path. The
+      // post-spawn persist inside executeSpawn writes
+      // `status: 'running'` directly via runUpdate, so the handler
+      // was unreachable.
       default: {
         out.warnings.push(`unknown action type: ${action.type}`);
       }
@@ -2187,10 +2695,8 @@ function executeSpawn(action, tickState, runState, opts, deps) {
   // P1) — these are NOT in parse-manifest's KNOWN_PHASE today; the
   // manifest validator warns on them but accepts the manifest, so
   // the orchestrator reads them from the raw phase.
-  const rawPhase =
-    (Array.isArray(manifest.phases)
-      ? manifest.phases.find((p) => p && p.id === phase.id)
-      : null) || {};
+  // Todo 108.g: use shared findRawPhase helper.
+  const rawPhase = findRawPhase(manifest, phase.id) || {};
   const rawReviewLoop =
     rawPhase.review_loop && typeof rawPhase.review_loop === 'object'
       ? rawPhase.review_loop
@@ -2236,7 +2742,13 @@ function executeSpawn(action, tickState, runState, opts, deps) {
   if (!dryRun) {
     const sigFor = (r) =>
       resolveCompletionSignal(manifest, manifestDir, phase.id, r);
-    if (isRecovery) {
+    // Todo 108.d: isRecovery and isInitial branches were
+    // character-identical pre-fix. Both single-role respawn paths
+    // (recovery after crash, initial dispatch with a leftover
+    // signal) need the same cleanup queue. Merge them into one
+    // branch keyed off `respawnsRole`.
+    const respawnsRole = isRecovery || isInitial;
+    if (respawnsRole) {
       staleUnlinks.push(sigFor(role));
       staleUnlinks.push(completionSignalFor(phaseDir, role));
       if (role === 'qa') {
@@ -2244,18 +2756,13 @@ function executeSpawn(action, tickState, runState, opts, deps) {
       }
     }
     if (isReviewRetry) {
+      // Review-retry cleans BOTH impl and qa signals because the new
+      // impl iteration must observe "neither stage has emitted yet."
       staleUnlinks.push(sigFor('impl'));
       staleUnlinks.push(sigFor('qa'));
       staleUnlinks.push(completionSignalFor(phaseDir, 'impl'));
       staleUnlinks.push(completionSignalFor(phaseDir, 'qa'));
       staleUnlinks.push(qaVerdictFor(phaseDir));
-    }
-    if (isInitial) {
-      staleUnlinks.push(sigFor(role));
-      staleUnlinks.push(completionSignalFor(phaseDir, role));
-      if (role === 'qa') {
-        staleUnlinks.push(qaVerdictFor(phaseDir));
-      }
     }
     // Snapshot pre-spawn mtimes. Files that don't exist now are
     // recorded as `existed: false`; the post-spawn cleanup skips
@@ -2315,12 +2822,15 @@ function executeSpawn(action, tickState, runState, opts, deps) {
   // Manifest-declared custom paths flow through resolveCompletionSignal
   // (codex round 5 P2). For non-impl roles whose role doesn't match
   // the manifest's basename, the convention default applies.
-  const effectiveRoleForSignal = isRecovery ? role : role;
+  // Todo 108.a: removed no-op `isRecovery ? role : role` ternary —
+  // both branches resolved to the same value. Recovery dispatches
+  // already render to the role's canonical signal path; nothing in
+  // this scope needs to differentiate the two.
   const dispatchCompletionSignal = resolveCompletionSignal(
     manifest,
     manifestDir,
     phase.id,
-    effectiveRoleForSignal
+    role
   );
   // Codex round 13 P2: ensure the parent directory of the custom
   // completion path exists before the agent runs. If the manifest
@@ -2502,6 +3012,24 @@ function executeSpawn(action, tickState, runState, opts, deps) {
   // proceed to the next spawn. If the wait times out, log and
   // continue — a slow tab is a recovery candidate, not a fatal.
   const hookOrchDir = orchDirFor(resolvedWorkdir);
+  // Todo 099: per-spawn token for cross-tick poison-pill protection.
+  // The SessionStart hook reads AGENT_FLAG_TOKEN from process.env and
+  // compares against the .pending-*'s first-line `# spawn_token: <uuid>`
+  // header BEFORE the destructive `.consuming-*` rename. Mismatch ⇒
+  // skip without consuming, so an orphan tab whose argv-token was
+  // bound at spawn-time can't consume the next-tick fresh flag.
+  //
+  // **Spawn-session env propagation is wired separately (out-of-scope
+  // for this site).** This site (1) generates the token, (2) embeds
+  // it in the flag content. Closing the cross-tick gap end-to-end
+  // requires spawn-session.js to also propagate AGENT_FLAG_TOKEN to
+  // the spawned tab — see todo 099's RA "out-of-band token binding"
+  // for the channel choices (env var via cmd /k prefix, argv via
+  // launcher passthrough, or per-tab manifest entry).
+  const spawnToken =
+    typeof opts._spawnToken === 'string' && opts._spawnToken !== ''
+      ? opts._spawnToken
+      : `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   let flagPath = null;
   if (!dryRun) {
     let promptText;
@@ -2512,11 +3040,17 @@ function executeSpawn(action, tickState, runState, opts, deps) {
         `cannot read rendered prompt at ${renderResult.promptPath}: ${e.message}`
       );
     }
-    if (Buffer.byteLength(promptText, 'utf8') > MAX_FLAG_BYTES) {
+    // Todo 099: prepend the spawn-token header. The hook reads the
+    // first line and skips candidates whose token doesn't match the
+    // tab-bound AGENT_FLAG_TOKEN. Header shape MUST match
+    // SPAWN_TOKEN_HEADER_RE in hooks/session-start.js.
+    const tokenHeader = `# spawn_token: ${spawnToken}\n`;
+    const flagContent = tokenHeader + promptText;
+    if (Buffer.byteLength(flagContent, 'utf8') > MAX_FLAG_BYTES) {
       throw new Error(
-        `prompt for ${sessionName} is ${Buffer.byteLength(promptText, 'utf8')} bytes — ` +
-          `exceeds MAX_FLAG_BYTES=${MAX_FLAG_BYTES} (the SessionStart hook would refuse it). ` +
-          `Trim the prompt or split the phase.`
+        `prompt for ${sessionName} is ${Buffer.byteLength(flagContent, 'utf8')} bytes ` +
+          `(including spawn-token header) — exceeds MAX_FLAG_BYTES=${MAX_FLAG_BYTES} ` +
+          `(the SessionStart hook would refuse it). Trim the prompt or split the phase.`
       );
     }
     mkdir(hookOrchDir, { recursive: true });
@@ -2535,14 +3069,36 @@ function executeSpawn(action, tickState, runState, opts, deps) {
     let entries = [];
     try {
       entries = readdirSync(hookOrchDir);
-    } catch (_) {
-      /* dir might not exist on first sweep — mkdir above handles it */
+    } catch (e) {
+      // Todo 108.i: differentiate ENOENT (dir doesn't exist yet —
+      // mkdir above handles it; expected) from EACCES / EPERM
+      // (cross-user perms or read-only mount — stale flags may
+      // persist and re-introduce the codex-round-20 cross-tick
+      // wrong-prompt bug). Surface non-ENOENT failures so the
+      // operator sees the missing-sweep risk.
+      if (e && e.code !== 'ENOENT') {
+        logger('warn', `stale-flag sweep readdir failed at ${hookOrchDir}: ${e.message}`, {
+          phaseId: phase.id,
+          role,
+        });
+      }
     }
     const ourFlagBasename = `.pending-${sessionName}`;
+    // Codex round 7 P2: honor cell-1-preserved flags from the resume
+    // sweep. opts._preservedResumeFlags is a Set of flag basenames
+    // that the resume sweep determined are still-valid prompts for
+    // live waiting tabs. Without this guard, an UNRELATED spawn in
+    // the same first-tick window would delete the preserved flag
+    // and orphan the waiting tab.
+    const preservedResumeFlags =
+      opts._preservedResumeFlags instanceof Set
+        ? opts._preservedResumeFlags
+        : null;
     for (const name of entries) {
       if (typeof name !== 'string') continue;
       if (!name.startsWith('.pending-')) continue;
       if (name === ourFlagBasename) continue; // we'll rename over it
+      if (preservedResumeFlags && preservedResumeFlags.has(name)) continue;
       // The new `.flagtmp-` prefix doesn't start with `.pending-`,
       // so it's already excluded. Legacy `.pending-*.tmp-*` from
       // older orchestrator versions: skip via substring check.
@@ -2562,7 +3118,7 @@ function executeSpawn(action, tickState, runState, opts, deps) {
       hookOrchDir,
       `.flagtmp-${sessionName}-${process.pid}-${Date.now()}`
     );
-    writeFile(tmpPath, promptText, { encoding: 'utf8' });
+    writeFile(tmpPath, flagContent, { encoding: 'utf8' });
     renameFile(tmpPath, flagPath);
   }
 
@@ -2599,6 +3155,14 @@ function executeSpawn(action, tickState, runState, opts, deps) {
       // Pre-marker write failed (FS error). Don't proceed to spawn —
       // we'd lose the recovery breadcrumb. Surface as a spawn failure
       // and let the next tick re-attempt.
+      //
+      // Codex round 5 P2: unlink the .pending-* flag we just wrote.
+      // No tab will be spawned for this prompt; leaving the flag on
+      // disk would let the next SessionStart hook (any unrelated
+      // tab launching, cross-tick reconciliation sweep, or even a
+      // later spawn for a different role within this same tick)
+      // consume the stale prompt.
+      if (flagPath) bestEffortUnlink(unlinkSync, flagPath);
       logger('error', `pre-spawn marker write failed: ${preR.error}`, {
         phaseId: phase.id,
         role,
@@ -2674,11 +3238,66 @@ function executeSpawn(action, tickState, runState, opts, deps) {
       manifest.defaults && typeof manifest.defaults.permission_mode === 'string'
         ? manifest.defaults.permission_mode.trim()
         : '';
-    if (permissionMode !== '') {
+    // Codex round 15 P2: legacy 'auto' must NOT override the
+    // launcher's auto_mode_flag. The launcher (e.g. agency baseline,
+    // custom wrapper) may emit a different shape like
+    // `--enable-auto-mode`; clobbering it with `--permission-mode auto`
+    // turns valid invocations into unsupported commands. Only the
+    // four documented Claude Code modes (plan | default | acceptEdits
+    // | bypassPermissions) override; legacy 'auto' preserves the
+    // launcher default.
+    const PERMISSION_MODE_OVERRIDES = new Set([
+      'plan',
+      'default',
+      'acceptEdits',
+      'bypassPermissions',
+    ]);
+    if (permissionMode !== '' && PERMISSION_MODE_OVERRIDES.has(permissionMode)) {
       const baseLauncher = effectiveLauncher || {};
+      // Codex round 19 P2: also strip any pre-existing
+      // --permission-mode flag from passthrough_flags. Pre-fix, when
+      // a launcher's passthrough_flags already contained
+      // `--permission-mode=auto` (e.g., the bundled example),
+      // spawn-session would emit two --permission-mode flags and
+      // the trailing one (passthrough) would win — defeating the
+      // operator's defaults.permission_mode override.
+      let cleanedPassthrough = baseLauncher.passthrough_flags;
+      if (Array.isArray(cleanedPassthrough)) {
+        // Codex round 19 + 20 P2: handle three shapes:
+        //   - `--permission-mode=value` (single token)
+        //   - `--permission-mode value` (single token; uncommon)
+        //   - `['--permission-mode', 'value']` (paired tokens —
+        //     when we strip the bare flag we MUST also strip its
+        //     value token, else a stray 'auto' lands in the argv
+        //     after our override).
+        const cleaned = [];
+        for (let idx = 0; idx < cleanedPassthrough.length; idx++) {
+          const f = cleanedPassthrough[idx];
+          if (typeof f !== 'string') {
+            cleaned.push(f);
+            continue;
+          }
+          if (f === '--permission-mode') {
+            // Skip this token AND the following value token (if
+            // any). When idx points at the last element, there's
+            // no value to skip — drop just the bare flag.
+            idx += 1;
+            continue;
+          }
+          if (
+            f.startsWith('--permission-mode=') ||
+            f.startsWith('--permission-mode ')
+          ) {
+            continue;
+          }
+          cleaned.push(f);
+        }
+        cleanedPassthrough = cleaned;
+      }
       effectiveLauncher = {
         ...baseLauncher,
         auto_mode_flag: `--permission-mode ${permissionMode}`,
+        passthrough_flags: cleanedPassthrough,
       };
     }
     spawnResult = spawnFn({
@@ -2688,6 +3307,11 @@ function executeSpawn(action, tickState, runState, opts, deps) {
         title: `${sessionName} — ${phase.title || phase.id}`,
         pluginDir: effectivePluginDir,
         launcher: effectiveLauncher,
+        // Todo 099: propagate the per-spawn token so the spawned tab
+        // sees AGENT_FLAG_TOKEN in its environment. The hook's
+        // pre-rename token filter then rejects any flag whose
+        // embedded token doesn't match.
+        spawnToken,
       });
     } catch (e) {
       // Spawn failed AFTER the flag was written. Clean up the flag
@@ -2695,22 +3319,48 @@ function executeSpawn(action, tickState, runState, opts, deps) {
       // soft-TTL elapses) doesn't pick up this dead session's prompt
       // (codex round 7 P1).
       if (flagPath) bestEffortUnlink(unlinkSync, flagPath);
-      // Todo 090: also reset the pre-spawn marker so the next tick
-      // sees the phase as pending (not stuck in 'spawning' with no
-      // matching live session). Best-effort — failure to roll back
-      // is non-fatal because the resume reconciliation path also
-      // handles 'spawning' + no live PID.
+      // Todo 090 + 110: roll back the pre-spawn `'spawning'` marker via
+      // the shared helper so the next tick sees the phase as the
+      // PRE-SPAWN state (not stuck in 'spawning' with no matching
+      // live PID). Codex round 2 P1: the prior status depends on
+      // dispatch mode — initial spawns came from 'pending', but
+      // recovery and review_retry came from 'running' and rolling
+      // back to 'pending' would lose review state and bypass retry
+      // accounting.
       if (!dryRun) {
-        const rollbackR = runUpdateFn(manifestPath, phase.id, {
-          status: 'pending',
-          dispatched_at: '',
+        // Codex round 8 P2: review-loop QA handoff is emitted as
+        // mode: 'initial' even though the phase is already 'running'
+        // (the impl-complete signal triggered the QA dispatch). For
+        // those, the prior status is 'running', not 'pending' —
+        // rolling back to 'pending' would let the next tick treat
+        // the phase as fresh and re-dispatch impl, deleting the
+        // existing impl-complete signal. Detect via the manifest's
+        // review_loop block + the phase status entry's review_stage.
+        const reviewEnabledHere =
+          phase.review_loop && phase.review_loop.enabled;
+        const phaseEntryHere =
+          tickState.status &&
+          tickState.status.phases &&
+          tickState.status.phases[phase.id];
+        const inReviewLoopRunning =
+          reviewEnabledHere &&
+          phaseEntryHere &&
+          (typeof phaseEntryHere.review_stage === 'string' ||
+            (Number.isInteger(phaseEntryHere.review_iteration) &&
+              phaseEntryHere.review_iteration > 0));
+        const priorStatus =
+          isRecovery || isReviewRetry || inReviewLoopRunning
+            ? 'running'
+            : 'pending';
+        rollbackSpawningMarker({
+          manifestPath,
+          phaseId: phase.id,
+          role,
+          runUpdateFn,
+          logger,
+          reason: 'spawnFn_threw',
+          priorStatus,
         });
-        if (!rollbackR.ok) {
-          logger('warn', `pre-spawn marker rollback failed: ${rollbackR.error}`, {
-            phaseId: phase.id,
-            role,
-          });
-        }
       }
       throw e;
     }
@@ -2784,6 +3434,31 @@ function executeSpawn(action, tickState, runState, opts, deps) {
         // (a) would lose the trust chain entirely; (b) loses one
         // tick.
         bestEffortUnlink(unlinkSync, flagPath);
+        // Todo 111 — REVERTED post-codex round 10 P1.
+        //
+        // Codex caught: rolling the marker back to 'pending' lets the
+        // next tick re-dispatch a fresh tab WITH THE SAME SESSION
+        // NAME (orch-<phase>-<role>) while the original timed-out
+        // tab may still be alive. 099's token-binding prevents
+        // wrong-prompt delivery, but PID lookup is keyed by --name
+        // and cannot tell which of two same-named processes is
+        // ours — the orchestrator could end up monitoring the wrong
+        // PID, breaking the per-(phase, role) uniqueness invariant
+        // the rest of the orchestrator depends on.
+        //
+        // Safer path: leave the 'spawning' marker intact. The next
+        // tick's reconciliation pass (decideTickActions, with the
+        // wrapper-inclusive defer logic from codex round 6/7)
+        // verifies whether the timed-out tab is genuinely dead
+        // before allowing a respawn. If it dies → marker rolls back
+        // there. If it lives → reconciliation adopts. Either way,
+        // session-name uniqueness is preserved.
+        //
+        // The wasted retry-count increment that 111's RA wanted to
+        // save is a smaller cost than the duplicate-session-name
+        // bug. Surface in V1.5 design if a more aggressive rollback
+        // is needed once spawn-session learns to verify session-
+        // name uniqueness before launching.
         const err = new Error(
           `flag ${path.basename(flagPath)} not consumed within ` +
             `${consumeTimeoutMs}ms; treating as spawn failure (cross-session ` +
@@ -2851,13 +3526,55 @@ function executeSpawn(action, tickState, runState, opts, deps) {
       // — both are non-recovery starts of the role's session).
       updates.retry_count = 0;
     }
-    const r = runUpdateFn(manifestPath, phase.id, updates);
-    if (!r.ok) {
-      // Don't throw — the spawn already happened. Surface for triage.
-      logger('error', `runUpdate post-spawn failed: ${r.error}`, {
+    // Todo 096: wrap the post-spawn runUpdate in try/catch. The
+    // spawnFn ALREADY RETURNED — the wt tab is live. If runUpdate
+    // throws (FS error, validation drift, etc.) we MUST NOT touch the
+    // manifest-status: leaving the `'spawning'` marker intact lets
+    // the next tick's reconciliation pass (orchestrate.js's spawning-
+    // marker loop in decideTickActions) detect `'spawning'` + a live
+    // PID match and adopt the session — transitioning to 'running'
+    // and persisting pid lazily.
+    //
+    // **DO NOT call rollbackSpawningMarker here.** That helper is for
+    // pre-spawnFn-launch failures only (todo 110). At THIS catch
+    // site the spawn launched and the tab is alive; rolling the
+    // marker back to 'pending' would orphan the live tab AND make
+    // the phase eligible for re-dispatch on the next tick — exactly
+    // the duplicate-spawn bug 088 / 093 / 096 are designed to close.
+    //
+    // {ok: false} return + thrown errors are both handled here so
+    // a future runUpdate refactor that converts soft-fails to
+    // throws can't reintroduce the bug.
+    let postSpawnUpdateFailed = false;
+    try {
+      const r = runUpdateFn(manifestPath, phase.id, updates);
+      if (!r || !r.ok) {
+        postSpawnUpdateFailed = true;
+        logger('error', `runUpdate post-spawn failed: ${(r && r.error) || 'unknown error'}`, {
+          phaseId: phase.id,
+          role,
+        });
+      }
+    } catch (e) {
+      // Marker stays as 'spawning'; reconciliation adopts next tick.
+      postSpawnUpdateFailed = true;
+      logger('error', `runUpdate post-spawn threw (marker left 'spawning' for reconciliation): ${e && e.message ? e.message : String(e)}`, {
         phaseId: phase.id,
         role,
       });
+    }
+    // Codex round 4 P2: when the post-spawn runUpdate fails for ANY
+    // reason ({ok:false} or thrown), signal the tick so the follow-
+    // up `persist` action in executeActions SKIPS this phase. Without
+    // this, executeActions would run the persist with stale-or-empty
+    // updates on top of the 'spawning' marker — overwriting it with
+    // 'running' but without pid/started_at, defeating 096's
+    // reconciliation-adopts-next-tick contract.
+    if (postSpawnUpdateFailed) {
+      if (!runState.postSpawnUpdateFailedThisTick) {
+        runState.postSpawnUpdateFailedThisTick = new Set();
+      }
+      runState.postSpawnUpdateFailedThisTick.add(phase.id);
     }
   }
   logger('info', `spawned ${sessionName} pid=${spawnResult.pid}`, {
@@ -2887,6 +3604,10 @@ function runOneTick(runState, opts) {
   runState.spawnFailedThisTick = new Set();
   runState.spawnSucceededThisTick = new Set();
   runState.flagTimeoutThisTick = false;
+  // Codex round 4 P2: track phases whose post-spawn runUpdate
+  // (todo 096) failed this tick so the follow-up persist in
+  // executeActions skips them.
+  runState.postSpawnUpdateFailedThisTick = new Set();
   const tickResult = pollAllPhases(opts);
   if (!tickResult.ok) {
     const logger = opts.logger || makeDefaultLogger();
@@ -3143,6 +3864,388 @@ async function runOrchestrator(opts) {
     }
   }
 
+  // Todo 105: --resume reconciliation-aware sweep with the four-cell
+  // decision table.
+  //
+  // Cells (live PID? × matching .pending-<name> present?):
+  //   1. PID alive + flag present  → preserve flag (tab is waiting).
+  //   2. PID alive + no flag       → adopt: 'spawning' → 'running' now.
+  //   3. No PID + flag present     → orphan: rollback marker, sweep flag.
+  //   4. No PID + no flag          → rollback marker (no flag to sweep).
+  //
+  // After the per-phase reconciliation, sweep every .pending-* in the
+  // orch dir EXCEPT the preserved set (cell 1 flags). Each subsequent
+  // spawn from this resume's main loop writes its own .pending-<name>
+  // after the sweep — no tick-1 leakage.
+  //
+  // Degenerate case: when buildPidSnapshot returns null (PowerShell /
+  // WMI failure on this resume entry), the preserved set can't be
+  // computed reliably. The sweep DEFERS entirely — no flags swept,
+  // no markers rolled back. Matches the existing 090 reconciliation's
+  // skip-on-null behavior at decideTickActions.
+  if (opts.resume && !dryRun) {
+    try {
+      const loadFn = opts._loadManifest || loadManifest;
+      const statusFn = opts._loadStatus || loadStatus;
+      const ml = loadFn(opts.manifestPath);
+      const sl = statusFn(opts.manifestPath);
+      // Codex round 1 P2 fix: resolve the HOOK orch dir, NOT the
+      // manifest-dir orch dir. executeSpawn writes flags under
+      // orchDirFor(resolvedWorkdir); for manifests with a separate
+      // workdir, those two paths diverge. Pre-fix the resume sweep
+      // checked/swept the manifest-dir orchDir and missed the
+      // workdir-side flags entirely — misclassifying every
+      // spawning-with-flag case as cell 4 (no flag) and adopting
+      // every spawning-with-no-flag-on-disk case as cell 2.
+      let resumeOrchDir = orchDir;
+      if (ml.ok && ml.manifest && typeof ml.manifest.workdir === 'string') {
+        const wd = path.isAbsolute(ml.manifest.workdir)
+          ? ml.manifest.workdir
+          : path.resolve(manifestDir, ml.manifest.workdir);
+        resumeOrchDir = orchDirFor(wd);
+      }
+      if (ml.ok && sl.ok && sl.status && sl.status.phases) {
+        // Build a pidSnapshot for every spawning (phase, role).
+        const spawningEntries = [];
+        for (const phaseId of Object.keys(sl.status.phases)) {
+          const e = sl.status.phases[phaseId];
+          if (!e || typeof e !== 'object' || e.status !== 'spawning') continue;
+          // Determine candidate roles: declared agents in the manifest,
+          // plus review-loop synthesized roles.
+          const phase = ml.manifest && Array.isArray(ml.manifest.phases)
+            ? ml.manifest.phases.find((p) => p && p.id === phaseId)
+            : null;
+          const declaredRoles = new Set(
+            Array.isArray(phase && phase.agents)
+              ? phase.agents.map((a) => a && a.role).filter((r) => typeof r === 'string')
+              : phase && phase.agent && typeof phase.agent.role === 'string'
+                ? [phase.agent.role]
+                : []
+          );
+          if (phase && phase.review_loop && phase.review_loop.enabled) {
+            declaredRoles.add('impl');
+            declaredRoles.add('qa');
+          }
+          for (const role of declaredRoles) {
+            spawningEntries.push({ phaseId, role });
+          }
+        }
+        const sessionNames = spawningEntries.map((s) =>
+          defaultSessionName(s.phaseId, s.role)
+        );
+        const pidSnapshot = buildPidSnapshot(sessionNames, opts);
+        // Codex round 4 P2: build a SECONDARY snapshot that includes
+        // wrappers (cmd/powershell). On --resume immediately after a
+        // crash during dispatch, the only process WMI may show for a
+        // tab that has not consumed its prompt yet is the wrapper.
+        // The primary snapshot above excludes wrappers by design (so
+        // health checks don't report a dead Claude as alive via its
+        // surviving cmd /k wrapper), but for resume reconciliation
+        // we want to know "is ANY process alive for this session" —
+        // wrapper-only counts.
+        //
+        // Codex round 10 P2: pidSnapshotWithWrappers === null means
+        // the secondary lookup failed. Without it we'd misclassify
+        // wrapper-only waiting tabs as cell 3 (sweep flag) and
+        // orphan them. Treat this as "snapshot unavailable" for
+        // the entire sweep — defer like the primary-null case.
+        let pidSnapshotWithWrappers = null;
+        let wrapperSnapshotFailed = false;
+        if (pidSnapshot !== null) {
+          try {
+            const buildWithWrappers = (sn, oo) => {
+              const m = new Map();
+              const runner = (oo && oo._pidRunner) ||
+                ((program, argv) =>
+                  require('child_process').execFileSync(program, argv, {
+                    stdio: ['ignore', 'pipe', 'ignore'],
+                    encoding: 'utf8',
+                  }));
+              let stdout;
+              try {
+                stdout = runner('powershell', require('./spawn-session').buildPidLookupArgs
+                  ? require('./spawn-session').buildPidLookupArgs()
+                  : ['-NoProfile', '-NoLogo', '-Command',
+                    "@(Get-CimInstance Win32_Process -Filter \"CommandLine LIKE '%--name %'\" | Select-Object ProcessId, CommandLine) | ConvertTo-Json -Compress -Depth 1"
+                  ]);
+              } catch (_) {
+                return null;
+              }
+              const { parsePidLookupOutput } = require('./spawn-session');
+              for (const name of sn) {
+                const pid = parsePidLookupOutput(stdout, name, { excludeWrappers: false });
+                if (Number.isInteger(pid) && pid > 0) {
+                  m.set(name, { pid });
+                }
+              }
+              return m;
+            };
+            pidSnapshotWithWrappers = buildWithWrappers(sessionNames, opts);
+            if (pidSnapshotWithWrappers === null) wrapperSnapshotFailed = true;
+          } catch (_) {
+            pidSnapshotWithWrappers = null;
+            wrapperSnapshotFailed = true;
+          }
+        }
+        if (pidSnapshot === null || wrapperSnapshotFailed) {
+          logger(
+            'warn',
+            `resume sweep deferred: pid snapshot unavailable (${pidSnapshot === null ? 'primary' : 'wrapper-inclusive'} PowerShell/WMI failure); next tick will retry`
+          );
+        } else {
+          const preservedFlags = new Set();
+          const runUpdateFn = opts._runUpdate || runUpdate;
+          // Codex round 3 P2: the manifest-status `'spawning'` marker
+          // is PHASE-SCOPED (single status per phase), but
+          // spawningEntries iterates over ROLES. For multi-role /
+          // review-loop phases we MUST track which phases have
+          // already been adopted (cell 2) or had a flag preserved
+          // (cell 1) so a sibling role's cell-4 rollback doesn't
+          // clobber the phase-level adoption back to 'pending'.
+          const phaseDecided = new Set();
+          for (const { phaseId, role } of spawningEntries) {
+            const sessionName = defaultSessionName(phaseId, role);
+            const flagBasename = `.pending-${sessionName}`;
+            const flagAbsPath = path.join(resumeOrchDir, flagBasename);
+            const snap = pidSnapshot.get(sessionName);
+            // Codex round 5 P2: infer the pre-marker status from the
+            // phase entry's existing fields. A 'spawning' marker can
+            // come from THREE dispatch modes:
+            //   - initial: phase was 'pending'; rollback to 'pending'.
+            //   - recovery: phase was 'running' before the crash that
+            //     triggered the recovery dispatch; rollback to 'running'
+            //     to preserve retry_count and let the next tick continue
+            //     the recovery rather than restart from initial.
+            //   - review_retry: phase was 'running' (in review_stage:
+            //     review_retry_pending or similar); rollback to 'running'
+            //     preserves review_iteration / review_stage.
+            //
+            // Heuristic: if review_iteration > 0 OR review_stage is set
+            // → was in a review-loop dispatch ('running'). Else if
+            // retry_count > 0 → recovery dispatch ('running'). Else
+            // initial → 'pending'.
+            const phaseEntry = sl.status.phases[phaseId];
+            const inReviewLoop =
+              phaseEntry &&
+              (Number.isInteger(phaseEntry.review_iteration) && phaseEntry.review_iteration > 0 ||
+                (typeof phaseEntry.review_stage === 'string' && phaseEntry.review_stage !== ''));
+            const inRecovery =
+              phaseEntry &&
+              Number.isInteger(phaseEntry.retry_count) &&
+              phaseEntry.retry_count > 0;
+            const inferredPriorStatus =
+              inReviewLoop || inRecovery ? 'running' : 'pending';
+            // Codex round 4 P2: a tab that hasn't consumed its prompt
+            // yet may only have its wrapper (cmd/powershell) visible
+            // to WMI. The primary snapshot (excludeWrappers:true)
+            // misses the wrapper-only case; the secondary snapshot
+            // (excludeWrappers:false) catches it. For resume
+            // reconciliation we accept ANY live process — wrapper-
+            // only or inner Claude — so we don't sweep a flag whose
+            // intended tab is still waiting for its hook to fire.
+            const wrapperSnap =
+              pidSnapshotWithWrappers && pidSnapshotWithWrappers.get(sessionName);
+            const liveAlive = !!(
+              (snap && Number.isInteger(snap.pid) && snap.pid > 0) ||
+              (wrapperSnap && Number.isInteger(wrapperSnap.pid) && wrapperSnap.pid > 0)
+            );
+            const existsSync = opts._existsSync || fs.existsSync;
+            const flagPresent = existsSync(flagAbsPath);
+            // Codex round 13 P2: differentiate inner-Claude alive vs
+            // wrapper-only. Cell 1 (preserve flag) accepts wrapper-
+            // only as evidence the tab is still launching. Cell 2
+            // (adopt as running) requires INNER Claude alive — a
+            // wrapper-only with no flag means Claude exited and the
+            // wrapper is post-mortem; adopting it would mark a dead
+            // session 'running' with a fresh started_at grace window.
+            const innerAlive = !!(snap && Number.isInteger(snap.pid) && snap.pid > 0);
+            const wrapperAlive = !!(
+              wrapperSnap && Number.isInteger(wrapperSnap.pid) && wrapperSnap.pid > 0
+            );
+            // Resolve the actual PID for adoption / logging. Prefer
+            // the inner Claude's PID; fall back to the wrapper's PID
+            // when only it is visible (used for logs / cell 1).
+            const adoptedPid = innerAlive ? snap.pid
+              : wrapperAlive ? wrapperSnap.pid
+              : null;
+            if (liveAlive && flagPresent) {
+              // Cell 1: tab waiting for prompt — preserve flag.
+              // Wrapper-only is fine here; the SessionStart hook
+              // will fire when Claude eventually starts, consume
+              // the flag, and the next tick's reconciliation will
+              // adopt via the normal inner-Claude PID match.
+              preservedFlags.add(flagBasename);
+              phaseDecided.add(phaseId);
+              logger(
+                'info',
+                `resume reconciliation [cell 1]: preserving ${flagBasename} (tab pid=${adoptedPid} waiting for prompt)`,
+                { phaseId, role }
+              );
+            } else if (innerAlive && !flagPresent) {
+              // Cell 2: adopt — transition to running. Codex round 13
+              // P2: gate on innerAlive specifically (NOT liveAlive),
+              // so a wrapper-only post-mortem doesn't get adopted as
+              // a fresh running phase.
+              //
+              // Codex round 15 P2: preserve the original
+              // dispatched_at as started_at (mirrors the normal
+              // reconciliation path at decideTickActions). Pre-fix
+              // this used resume-time, giving an old session a
+              // fresh startup-grace and phase-timeout window —
+              // hiding sessions that should have already timed out
+              // or triggered recovery.
+              const startedAt =
+                phaseEntry && typeof phaseEntry.dispatched_at === 'string' && phaseEntry.dispatched_at !== ''
+                  ? phaseEntry.dispatched_at
+                  : new Date(opts._now ? opts._now() : Date.now()).toISOString();
+              const r = runUpdateFn(opts.manifestPath, phaseId, {
+                status: 'running',
+                pid: adoptedPid,
+                started_at: startedAt,
+                dispatched_at: '',
+              });
+              if (r && r.ok) phaseDecided.add(phaseId);
+              logger(
+                r && r.ok ? 'info' : 'warn',
+                `resume reconciliation [cell 2]: adopting live session pid=${adoptedPid} (no flag — already consumed)${r && r.ok ? '' : ' — runUpdate failed: ' + (r && r.error || 'unknown')}`,
+                { phaseId, role }
+              );
+            } else if (flagPresent) {
+              // Cell 3: orphan — flag without an inner-Claude PID
+              // (and either no wrapper alive, or the wrapper-only
+              // window has elapsed). Rollback marker, sweep flag.
+              // Codex round 3 P2: skip the rollback if a sibling role
+              // for the same phase already adopted (cell 1/2). The
+              // 'spawning' marker is phase-scoped, so the adoption
+              // already overwrote it with 'running'; rolling back here
+              // would undo the adoption.
+              if (phaseDecided.has(phaseId)) {
+                try { fs.unlinkSync(flagAbsPath); } catch (_) { /* ignore */ }
+                logger(
+                  'info',
+                  `resume reconciliation [cell 3, sibling-skip]: phase already adopted via another role — sweeping ${flagBasename} only`,
+                  { phaseId, role }
+                );
+              } else {
+                rollbackSpawningMarker({
+                  manifestPath: opts.manifestPath,
+                  phaseId,
+                  role,
+                  runUpdateFn,
+                  logger,
+                  reason: 'resume_orphan_with_flag',
+                  priorStatus: inferredPriorStatus,
+                });
+                // Codex round 12 P2: charge the failed mid-spawn
+                // attempt against retry_count — symmetric with
+                // decideTickActions's reconciliation rollback.
+                // Codex round 13 P2: ONLY increment if the existing
+                // retry_count has a well-formed shape. A corrupt
+                // value (e.g. "two") would otherwise be silently
+                // coerced to 0 and overwritten with 1, defeating
+                // the next-tick shape-validation pre-pass that
+                // would have blocked the phase. Leave corrupt
+                // values in place so the pre-pass surfaces them.
+                const shape = validateRetryCountShape(phaseEntry);
+                if (shape.ok) {
+                  runUpdateFn(opts.manifestPath, phaseId, { retry_count: shape.value + 1 });
+                }
+                try { fs.unlinkSync(flagAbsPath); } catch (_) { /* ignore */ }
+                logger(
+                  'info',
+                  `resume reconciliation [cell 3]: rolled back marker (retry_count${shape.ok ? ` ${shape.value} → ${shape.value + 1}` : ' left corrupt for pre-pass to block'}), swept orphan ${flagBasename}`,
+                  { phaseId, role }
+                );
+                phaseDecided.add(phaseId);
+              }
+            } else {
+              // Cell 4: clean rollback. Includes:
+              //   - !liveAlive && !flagPresent (no process anywhere)
+              //   - wrapperAlive && !innerAlive && !flagPresent
+              //     (wrapper-only post-mortem after Claude exited)
+              // Both warrant rollback so the phase becomes eligible
+              // for re-dispatch / recovery on the next tick.
+              // Codex round 3 P2: same sibling-skip discipline as
+              // cell 3 — don't undo a sibling's adoption.
+              if (phaseDecided.has(phaseId)) {
+                logger(
+                  'info',
+                  'resume reconciliation [cell 4, sibling-skip]: phase already adopted via another role',
+                  { phaseId, role }
+                );
+              } else {
+                rollbackSpawningMarker({
+                  manifestPath: opts.manifestPath,
+                  phaseId,
+                  role,
+                  runUpdateFn,
+                  logger,
+                  reason: 'resume_clean_rollback',
+                  priorStatus: inferredPriorStatus,
+                });
+                // Codex round 13 P2: shape-conditional increment as
+                // in cell 3 — corrupt values stay corrupt so the
+                // next-tick pre-pass blocks them.
+                const shape = validateRetryCountShape(phaseEntry);
+                if (shape.ok) {
+                  runUpdateFn(opts.manifestPath, phaseId, { retry_count: shape.value + 1 });
+                }
+                const wrapperOnly = !innerAlive && wrapperAlive;
+                logger(
+                  'info',
+                  `resume reconciliation [cell 4]: rolled back marker (retry_count${shape.ok ? ` ${shape.value} → ${shape.value + 1}` : ' left corrupt for pre-pass to block'}; ${wrapperOnly ? 'wrapper-only post-mortem' : 'no live PID'}, no flag)`,
+                  { phaseId, role }
+                );
+                phaseDecided.add(phaseId);
+              }
+            }
+          }
+          // Sweep all .pending-* in the (workdir-side) orch dir EXCEPT
+          // preservedFlags. Each subsequent spawn writes its own flag
+          // after the sweep. Use resumeOrchDir (= workdir's orchDir
+          // when manifest declares a separate workdir) — codex round 1
+          // P2 caught the misalignment with executeSpawn's write site.
+          let entries = [];
+          try {
+            entries = (opts._readdirSync || fs.readdirSync)(resumeOrchDir);
+          } catch (e) {
+            if (e && e.code !== 'ENOENT') {
+              logger('warn', `resume sweep readdir failed at ${resumeOrchDir}: ${e.message}`);
+            }
+          }
+          let swept = 0;
+          for (const name of entries) {
+            if (typeof name !== 'string') continue;
+            if (!name.startsWith('.pending-')) continue;
+            if (preservedFlags.has(name)) continue;
+            if (name.includes('.tmp-')) continue;
+            const p = path.join(resumeOrchDir, name);
+            try {
+              fs.unlinkSync(p);
+              swept += 1;
+            } catch (_) { /* best-effort */ }
+          }
+          // Codex round 7 P2: carry the cell-1-preserved set forward
+          // so executeSpawn's own stale-flag sweep (in the same
+          // first-tick window) doesn't delete the preserved flag.
+          // executeSpawn's sweep iterates ALL `.pending-*` in the
+          // hook orch dir except its own session — without this
+          // carry, a subsequent spawn this tick would clobber the
+          // waiting tab's flag and the tab would lose its prompt.
+          if (preservedFlags.size > 0) {
+            opts._preservedResumeFlags = preservedFlags;
+          }
+          logger(
+            'info',
+            `resume sweep complete: preserved=${preservedFlags.size}, swept=${swept}, adopted=${spawningEntries.length}`
+          );
+        }
+      }
+    } catch (e) {
+      logger('warn', `resume reconciliation failed: ${e && e.message ? e.message : String(e)}`);
+    }
+  }
+
   const runState = {
     convergenceCounters: new Map(),
     tickIndex: 0,
@@ -3158,6 +4261,29 @@ async function runOrchestrator(opts) {
   // `tickRes.failed.length > 0` per-tick so exit code stays correct.
   let sawFailureOrBlocked = false;
   let exitReason = null; // 'completed' | 'aborted' | 'max_ticks_unfinished' | 'max_ticks_failed' | etc.
+
+  // Todo 095: register a SINGLE abort listener for the lifetime of the
+  // run. Pre-fix, the inter-tick sleep wired a fresh `addEventListener`
+  // each tick, and `{once:true}` only auto-removes when the abort
+  // actually fires — so over 24h of idle polling (~720 ticks) we'd
+  // accumulate 720 listeners on the same signal, tripping Node's
+  // MaxListenersExceededWarning at 11 and pinning unbounded references
+  // to closed-over per-tick state.
+  //
+  // Pattern: a shared `pendingSleepAbort` ref points at the current
+  // tick's resolver (or `null` between ticks). The single listener
+  // calls whatever resolver is currently parked on the ref.
+  let pendingSleepAbort = null;
+  let sleepAbortListener = null;
+  if (signal && typeof signal.addEventListener === 'function') {
+    sleepAbortListener = () => {
+      const r = pendingSleepAbort;
+      pendingSleepAbort = null;
+      if (r) r();
+    };
+    signal.addEventListener('abort', sleepAbortListener, { once: true });
+  }
+
   try {
     for (;;) {
       if (signal && signal.aborted) {
@@ -3337,19 +4463,44 @@ async function runOrchestrator(opts) {
       // so SIGINT/SIGTERM mid-poll exits within ~50ms instead of
       // waiting up to idleMs (120s). When tests pass `_sleep` that
       // resolves immediately, this path is a no-op in practice.
+      //
+      // Todo 095: this used to register a fresh `addEventListener`
+      // per tick, leaking ~720 listeners over 24h idle. The single
+      // run-lifetime listener registered above (around the for-loop)
+      // forwards aborts to whichever resolver is parked on the
+      // shared `pendingSleepAbort` ref. We park it before sleep,
+      // clear it after, so the ref points only to the current tick's
+      // sleep — never accumulates.
       if (signal && typeof signal.addEventListener === 'function') {
-        await Promise.race([
-          sleep(sleepMs),
-          new Promise((resolve) => {
-            if (signal.aborted) resolve();
-            else signal.addEventListener('abort', () => resolve(), { once: true });
-          }),
-        ]);
+        await new Promise((resolve) => {
+          if (signal.aborted) {
+            resolve();
+            return;
+          }
+          pendingSleepAbort = resolve;
+          // sleep() resolves on its own; either it wins or the
+          // abort listener wins via pendingSleepAbort.
+          sleep(sleepMs).then(() => {
+            // Clear the parked ref only if this sleep resolved
+            // first; if abort fired the listener already cleared it.
+            if (pendingSleepAbort === resolve) pendingSleepAbort = null;
+            resolve();
+          });
+        });
       } else {
         await sleep(sleepMs);
       }
     }
   } finally {
+    // Todo 095: graceful shutdown removes the single run-lifetime
+    // abort listener. {once:true} would auto-remove on actual abort,
+    // but a clean exit (allTerminal, max_ticks_*, spawn_failure_path)
+    // never fires the abort — without explicit removal the listener
+    // would outlive the run on long-running test harnesses sharing
+    // an AbortController across runs.
+    if (signal && sleepAbortListener && typeof signal.removeEventListener === 'function') {
+      try { signal.removeEventListener('abort', sleepAbortListener); } catch (_) { /* ignore */ }
+    }
     if (lockPath) {
       releaseLock(lockPath, opts);
     }
@@ -3375,6 +4526,80 @@ async function runOrchestrator(opts) {
  * orchestrator survives a failed cleanup, and a stale signal will
  * surface as a noisy log next tick rather than crashing the loop.
  */
+/**
+ * Todo 110: shared rollback helper for the pre-spawnFn-launch failure
+ * paths in `executeSpawn`. Reverts the `'spawning'` marker (written
+ * before the spawn launches) back to `'pending'` + clears
+ * `dispatched_at` so the next tick is eligible to re-dispatch the
+ * phase fresh.
+ *
+ * **Scope discipline (codex round 1+10 corrections to PR #22 RA):**
+ *
+ *   - Call from `executeSpawn`'s spawnFn-throws catch — the spawn
+ *     never produced a live tab, so rolling the marker back is safe.
+ *   - Call from the EFLAGTIMEOUT branch ONLY when todo 099's
+ *     out-of-band token binding is in place. Pre-099, an orphan tab
+ *     from the timed-out spawn is still alive and would consume the
+ *     next tick's fresh `.pending-<name>` flag, restoring the cross-
+ *     tick wrong-prompt-to-wrong-agent bug. Post-099, the orphan's
+ *     argv-token can't match the new flag's file-token, so the
+ *     orphan's hook filters the fresh flag out.
+ *   - DO NOT call from the post-spawn `runUpdate`-throw path
+ *     (todo 096). When `spawnFn` already returned successfully,
+ *     the wt tab is live; rolling back the marker would orphan the
+ *     tab and trigger duplicate dispatch on the next tick (the
+ *     opposite of the intended fix). The reconciliation pass at
+ *     `decideTickActions` (orchestrate.js's spawning-marker loop)
+ *     adopts the live session next tick, so leaving the marker
+ *     intact is the correct behavior there.
+ *
+ * Failure to roll back is logged and swallowed — the resume
+ * reconciliation path also handles `'spawning'` + no-live-PID, so
+ * a missed rollback is recoverable, just one tick of churn.
+ *
+ * Returns `true` on success, `false` if the rollback runUpdate failed
+ * (logged via the supplied logger).
+ */
+function rollbackSpawningMarker({
+  manifestPath,
+  phaseId,
+  role,
+  runUpdateFn,
+  logger,
+  reason,
+  // Codex round 2 P1: callers passing a non-initial dispatch
+  // (`recovery` or `review_retry`) MUST supply `priorStatus: 'running'`
+  // so the rollback restores the pre-spawn `running` state instead
+  // of corrupting it to `pending`. Pre-fix the helper unconditionally
+  // wrote `pending`, which made the next tick treat a recovery /
+  // review_retry phase as fresh pending work — losing review_stage /
+  // review_iteration and bypassing retry accounting.
+  //
+  // Default 'pending' preserves the existing contract for the initial
+  // dispatch path (which is the only call site that doesn't pass a
+  // prior status).
+  priorStatus = 'pending',
+  // Pass `priorDispatchedAt: <iso>` to keep the original dispatch
+  // breadcrumb when the marker is rolled back to a non-initial
+  // state. Default empty string clears it (matches the initial-
+  // dispatch contract).
+  priorDispatchedAt = '',
+}) {
+  const updates = {
+    status: priorStatus,
+    dispatched_at: priorDispatchedAt,
+  };
+  const r = runUpdateFn(manifestPath, phaseId, updates);
+  if (!r || !r.ok) {
+    logger('warn', `pre-spawn marker rollback failed (${reason}): ${(r && r.error) || 'unknown error'}`, {
+      phaseId,
+      role,
+    });
+    return false;
+  }
+  return true;
+}
+
 function bestEffortUnlink(unlinkSync, p) {
   try {
     unlinkSync(p);
@@ -3429,7 +4654,11 @@ function printHelp() {
       '',
       'Options:',
       '  --resume                          read manifest-status, skip completed phases, respawn crashed',
-      '  --once                            run a single tick then exit (testing aid)',
+      '  --once                            run a single tick then exit (testing aid).',
+      '                                    Equivalent to `--max-ticks 1`. When both flags',
+      '                                    are passed, the LATER flag on the command line',
+      '                                    wins (parser is left-to-right; --once 0 is',
+      '                                    not allowed because --once takes no value).',
       '  --max-ticks <n>                   exit after N ticks (default: unlimited)',
       '  --active-interval-ms <n>          poll cadence when at least one phase is running (default 30000)',
       '  --idle-interval-ms <n>            poll cadence when nothing is running (default 120000)',
@@ -3466,7 +4695,8 @@ function parseCliArgs(argv) {
   const out = {
     manifestPath: null,
     resume: false,
-    once: false,
+    // Todo 108.e: removed `once: false` default — the field was set
+    // by --once but never read; maxTicks is the canonical signal.
     maxTicks: null,
     activeIntervalMs: null,
     idleIntervalMs: null,
@@ -3489,6 +4719,49 @@ function parseCliArgs(argv) {
       }
       return v;
     };
+    // Todo 106: stricter `next()` for path-typed flags that must NOT
+    // greedily consume the next argv flag as their value.
+    // `--plugin-dir --resume foo.yaml` used to silently parse as
+    // `pluginDir = '--resume'` and drop the `--resume` flag — the
+    // operator had no signal that anything went wrong. Reject any
+    // value that starts with `-`; offer the `--flag=value` form as
+    // an escape hatch for legitimate paths beginning with `-`.
+    const nextNonFlag = () => {
+      const v = argv[++i];
+      if (v === undefined || v === '') {
+        throw new CliError(`${a} requires a value`);
+      }
+      if (v.startsWith('-')) {
+        throw new CliError(
+          `${a} requires a path; got ${JSON.stringify(v)} (looks like another flag — use ${a}=<path> for paths starting with -)`
+        );
+      }
+      return v;
+    };
+    // Todo 106 escape hatch: support `--plugin-dir=<value>` and
+    // `--project-name=<value>` forms so operators with paths that
+    // start with `-` can still pass them.
+    if (a.startsWith('--plugin-dir=')) {
+      const v = a.slice('--plugin-dir='.length);
+      if (v === '') throw new CliError('--plugin-dir= requires a value');
+      // Codex round 12 P3: parity with the bare `--plugin-dir <path>`
+      // form — verify the path exists at the CLI boundary so a typo
+      // surfaces with the offending flag named, not deep inside
+      // scaffold-protocol.
+      if (!fs.existsSync(v)) {
+        throw new CliError(
+          `--plugin-dir path does not exist: ${JSON.stringify(v)}`
+        );
+      }
+      out.pluginDir = v;
+      continue;
+    }
+    if (a.startsWith('--project-name=')) {
+      const v = a.slice('--project-name='.length);
+      if (v === '') throw new CliError('--project-name= requires a value');
+      out.projectName = v;
+      continue;
+    }
     switch (a) {
       case '-h':
       case '--help':
@@ -3498,7 +4771,13 @@ function parseCliArgs(argv) {
         out.resume = true;
         break;
       case '--once':
-        out.once = true;
+        // Todo 108.e: removed write-only `out.once = true`. The
+        // documented contract is "--once sets maxTicks to 1"; the
+        // separate `once` field was set but never consumed by
+        // runOrchestrator. maxTicks is the canonical signal.
+        // Todo 108.n: --help (above) now documents the maxTicks=1
+        // equivalence so operators don't expect a separate
+        // semantic.
         out.maxTicks = 1;
         break;
       case '--max-ticks':
@@ -3523,10 +4802,23 @@ function parseCliArgs(argv) {
         out.reviewLoopMaxIterations = parseIntFlag(a, next(), { allowZero: false });
         break;
       case '--plugin-dir':
-        out.pluginDir = next();
+        out.pluginDir = nextNonFlag();
+        // Todo 108.m: cheap existence check at the CLI boundary.
+        // Pre-fix `--plugin-dir /nonexistent` only failed deep inside
+        // scaffold-protocol's templates copy, with a stack-traceish
+        // error that didn't name the offending flag. fs.existsSync
+        // is a fast read; failure surfaces as a clean parser error
+        // pointing at --plugin-dir. We DON'T check the directory's
+        // shape (templates/ subdir, etc.) — that's scaffold's job;
+        // we just confirm the path is reachable.
+        if (out.pluginDir && !fs.existsSync(out.pluginDir)) {
+          throw new CliError(
+            `--plugin-dir path does not exist: ${JSON.stringify(out.pluginDir)}`
+          );
+        }
         break;
       case '--project-name':
-        out.projectName = next();
+        out.projectName = nextNonFlag();
         break;
       case '--dry-run':
         out.dryRun = true;
@@ -3632,6 +4924,14 @@ async function main() {
   try {
     result = await runOrchestrator(opts);
   } catch (e) {
+    // Todo 108.q: remove SIGINT / SIGTERM listeners on the error
+    // path too. Cosmetic in practice (process.exit(1) below tears
+    // the process down regardless), but removing them satisfies
+    // the symmetry-with-the-success-path expectation a future
+    // refactor that promotes the catch into a non-fatal handler
+    // would otherwise miss.
+    process.removeListener('SIGINT', onSignal);
+    process.removeListener('SIGTERM', onSignal);
     process.stderr.write(`orchestrate: fatal — ${e.message}\n`);
     process.exit(1);
   }
@@ -3689,4 +4989,5 @@ module.exports = {
   depsMet,
   depsBlocked,
   getPhaseStatus,
+  validateRetryCountShape,
 };

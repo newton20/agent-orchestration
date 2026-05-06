@@ -50,7 +50,43 @@ const KNOWN_UPDATE_FIELDS = [
   // mid-spawn crash and reconcile against live PIDs instead of
   // re-dispatching a duplicate session.
   'dispatched_at',
+  // Todo 102: review-loop iteration counter + per-role review stage
+  // marker. orchestrate.js already writes both via runUpdate; without
+  // them in the allow-list the writer either silently strips them
+  // (data loss) or the allow-list misrepresents the contract. Hoisted
+  // alongside `dispatched_at` so the canonical schema lives in one
+  // place.
+  'review_iteration',
+  'review_stage',
+  // Todo 104: per-(phase, role, iteration) spawn id used by the
+  // stale-signal cleanup pass. Manifest-status carries the canonical
+  // current value; signal-file frontmatter carries the value the
+  // agent saw at spawn time; mismatch means stale.
+  'spawn_id',
 ];
+
+// Todo 100: permission_mode enum. Enforced both at manifest validation
+// time (in `validate()` below) and as the canonical export consumed by
+// orchestrate.js when it forwards permission_mode into the inner Claude
+// command line. Whitespace / multi-token strings would otherwise inject
+// arbitrary flags into the spawned process; the enum guarantees only
+// known modes survive the validator.
+//
+// Codex round 2 P2: include 'auto' as a backward-compat value. The
+// repo's docs (docs/manifest-reference.md) and the default launcher
+// (`--permission-mode auto`) historically used 'auto'; existing
+// manifests that explicitly spelled the default would otherwise fail
+// validation. The four documented Claude Code modes (plan | default |
+// acceptEdits | bypassPermissions) remain — 'auto' is the legacy
+// passthrough that spawn-session emits when permission_mode is
+// omitted; keeping it accepted preserves the existing contract.
+const VALID_PERMISSION_MODES = Object.freeze([
+  'auto',
+  'plan',
+  'default',
+  'acceptEdits',
+  'bypassPermissions',
+]);
 const KNOWN_TOP_LEVEL = new Set([
   'name',
   'workdir',
@@ -254,8 +290,21 @@ function validate(manifest) {
         );
       if (D.model !== undefined && typeof D.model !== 'string')
         push('defaults.model', 'must be a string');
-      if (D.permission_mode !== undefined && typeof D.permission_mode !== 'string')
-        push('defaults.permission_mode', 'must be a string');
+      if (D.permission_mode !== undefined) {
+        // Todo 100: enum validation. Reject any value that isn't one of
+        // the documented Claude Code permission modes — empty string,
+        // whitespace, or `acceptEdits --dangerously-skip-permissions`
+        // would otherwise be forwarded into the inner command line and
+        // inject flags the operator never authorised.
+        if (
+          typeof D.permission_mode !== 'string' ||
+          !VALID_PERMISSION_MODES.includes(D.permission_mode)
+        )
+          push(
+            'defaults.permission_mode',
+            `must be one of ${VALID_PERMISSION_MODES.join(' | ')}, got ${JSON.stringify(D.permission_mode)}`
+          );
+      }
       if (D.notifications !== undefined) {
         if (typeof D.notifications !== 'object' || Array.isArray(D.notifications))
           push('defaults.notifications', 'must be an object');
@@ -786,23 +835,66 @@ function loadStatus(manifestPath, { _readFileSync, _existsSync } = {}) {
  * Testable update entry point. Returns { ok: true, status_file, phase,
  * updates } on success, { ok: false, error } on any validation failure.
  * Never calls process.exit — callers (CLI main) do that.
+ *
+ * Todo 103: optional batching seams (`_loadedManifest`, `_loadedStatus`).
+ * When the orchestrator is in a fan-out tick (N runUpdate calls) it
+ * pre-loads manifest + status once and threads them through to skip
+ * 2N redundant disk loads + validation passes. Symmetric with todo
+ * 086's checkHealth seams.
+ *
+ *   - `_loadedManifest`: read-only. The manifest object as
+ *     `loadManifest(...).manifest` produces. When set, skips the
+ *     loadManifest + validate path. Caller MUST have validated the
+ *     object — runUpdate trusts it verbatim. Pass `null` /
+ *     `undefined` to take the disk path.
+ *
+ *   - `_loadedStatus`: SINGLE MUTABLE shared instance across all
+ *     runUpdates within a tick. Each runUpdate mutates this object
+ *     in place and writes the updated YAML to disk. Subsequent
+ *     calls within the same tick read the latest in-memory state,
+ *     NOT a snapshot. Pre-fix RA pivoted to this contract after
+ *     codex round 8 caught that a tick-start snapshot would lose
+ *     mutations from sibling fan-out updates (e.g., role-A's pid
+ *     persisted by call 1, then overwritten when call 2 wrote
+ *     started_at from the stale pre-call-1 snapshot).
+ *
+ *     - `null`: declared "no status file yet" — runUpdate writes
+ *       a fresh shape and the caller's reference points at the
+ *       fresh object after the call.
+ *     - object: mutated in place; same reference across calls.
+ *     - `undefined` (or option absent): take the disk path.
+ *
+ *   - `_writeFileSync` / `_renameSync`: optional write seams for
+ *     tests; default to fs.* equivalents.
  */
-function runUpdate(manifestPath, phaseId, updates) {
-  const loaded = loadManifest(manifestPath);
-  if (!loaded.ok) return { ok: false, error: loaded.error };
+function runUpdate(manifestPath, phaseId, updates, opts = {}) {
+  const writeFileSync = opts._writeFileSync || fs.writeFileSync;
+  const renameSync = opts._renameSync || fs.renameSync;
+  const unlinkSync = opts._unlinkSync || fs.unlinkSync;
 
-  const dangling = findDanglingDeps(
-    Array.isArray(loaded.manifest.phases) ? loaded.manifest.phases : []
-  );
-  const vresult = validate(loaded.manifest);
-  if (dangling.length > 0 || !vresult.valid) {
-    const errs = [...dangling, ...vresult.errors]
-      .map((e) => `${e.path}: ${e.message}`)
-      .join('; ');
-    return {
-      ok: false,
-      error: `manifest is invalid — cannot update status: ${errs}`,
-    };
+  let manifest;
+  if (opts._loadedManifest !== undefined && opts._loadedManifest !== null) {
+    // Trust the caller's pre-validated manifest. Skip the load +
+    // dangling-deps + validate path entirely.
+    manifest = opts._loadedManifest;
+  } else {
+    const loaded = loadManifest(manifestPath);
+    if (!loaded.ok) return { ok: false, error: loaded.error };
+
+    const dangling = findDanglingDeps(
+      Array.isArray(loaded.manifest.phases) ? loaded.manifest.phases : []
+    );
+    const vresult = validate(loaded.manifest);
+    if (dangling.length > 0 || !vresult.valid) {
+      const errs = [...dangling, ...vresult.errors]
+        .map((e) => `${e.path}: ${e.message}`)
+        .join('; ');
+      return {
+        ok: false,
+        error: `manifest is invalid — cannot update status: ${errs}`,
+      };
+    }
+    manifest = loaded.manifest;
   }
 
   if (
@@ -817,7 +909,9 @@ function runUpdate(manifestPath, phaseId, updates) {
         `use [A-Za-z0-9._-]+ and avoid __proto__/prototype/constructor`,
     };
 
-  const ids = new Set(loaded.manifest.phases.map((p) => p.id));
+  const ids = new Set(
+    Array.isArray(manifest.phases) ? manifest.phases.map((p) => p.id) : []
+  );
   if (!ids.has(phaseId))
     return {
       ok: false,
@@ -838,29 +932,100 @@ function runUpdate(manifestPath, phaseId, updates) {
       ok: false,
       error: `pid must be an integer, got ${JSON.stringify(updates.pid)}`,
     };
-  if (
-    updates.retry_count !== undefined &&
-    !Number.isInteger(updates.retry_count)
-  )
-    return {
-      ok: false,
-      error: `retry_count must be an integer, got ${JSON.stringify(updates.retry_count)}`,
-    };
+  if (updates.retry_count !== undefined) {
+    // Todo 097: strict shape check. Non-integers, negatives, and
+    // floats are corrupt-state markers — silent coercion to 0 used to
+    // grant 3 fresh retries beyond the cap, bypassing the convergence
+    // guard. Over-budget integers (e.g. `retry_count: 5` when
+    // MAX_RETRIES=3) are NOT corrupt — they're legitimate historical
+    // state from a prior run with a higher --max-recovery-retries —
+    // and flow through to decideRecoveryAction's budget-exhausted
+    // path. Validation only rejects values whose SHAPE is wrong.
+    if (
+      !Number.isInteger(updates.retry_count) ||
+      updates.retry_count < 0
+    )
+      return {
+        ok: false,
+        error: `retry_count must be a non-negative integer, got ${JSON.stringify(updates.retry_count)}`,
+      };
+  }
 
-  // Reader is the canonical loadStatus path (todo 069). Errors propagate
-  // verbatim so the pre-refactor "corrupt status file at X: ..." message
-  // shape is preserved. `status === null` covers both "file does not
-  // exist" and "file parses to non-object root" (lenient — fresh write
-  // overwrites the unreadable shape).
-  const loadResult = loadStatus(manifestPath);
-  if (!loadResult.ok) return { ok: false, error: loadResult.error };
-  const status =
-    loadResult.status === null
-      ? { phases: Object.create(null) }
-      : loadResult.status;
-  const statusPath = loadResult.statusPath;
+  // Todo 102 (defense-in-depth): warn on truly-unknown fields. The
+  // CLI parser already rejects unknown keys; programmatic callers
+  // (orchestrate.js's runUpdate import) bypass that path, so a fresh
+  // sibling write with an unrecognised key would silently persist.
+  // The warning surfaces drift between writer and the canonical
+  // allow-list without rejecting the write outright.
+  for (const k of Object.keys(updates)) {
+    if (!KNOWN_UPDATE_FIELDS.includes(k))
+      process.stderr.write(
+        `parse-manifest: warning: unknown update field "${k}" — known: ${KNOWN_UPDATE_FIELDS.join(', ')}\n`
+      );
+  }
 
-  const existing = status.phases[phaseId] || {};
+  // Todo 103: status seam. When the caller threads `_loadedStatus`
+  // through, mutate that single shared object across the tick's
+  // runUpdates so each call sees the prior call's mutations. Without
+  // the shared-instance contract, fan-out runUpdates in the same
+  // tick would each start from the same pre-tick snapshot and the
+  // last writer would overwrite the prior siblings' fields.
+  let status;
+  let statusPath;
+  const usingLoadedStatus = '_loadedStatus' in opts;
+  if (usingLoadedStatus) {
+    statusPath = statusPathFor(path.resolve(manifestPath));
+    if (opts._loadedStatus === null) {
+      // Caller declared "no status file yet". Build a fresh shape
+      // and let the post-write step replace the caller's reference
+      // via the returned status (the caller can re-thread it).
+      status = { phases: Object.create(null) };
+    } else {
+      status = opts._loadedStatus;
+      if (
+        !status ||
+        typeof status !== 'object' ||
+        !status.phases ||
+        typeof status.phases !== 'object'
+      ) {
+        return {
+          ok: false,
+          error: '_loadedStatus must be an object with a `phases` map (or null for fresh)',
+        };
+      }
+    }
+  } else {
+    // Reader is the canonical loadStatus path (todo 069). Errors propagate
+    // verbatim so the pre-refactor "corrupt status file at X: ..." message
+    // shape is preserved. `status === null` covers both "file does not
+    // exist" and "file parses to non-object root" (lenient — fresh write
+    // overwrites the unreadable shape).
+    const loadResult = loadStatus(manifestPath);
+    if (!loadResult.ok) return { ok: false, error: loadResult.error };
+    status =
+      loadResult.status === null
+        ? { phases: Object.create(null) }
+        : loadResult.status;
+    statusPath = loadResult.statusPath;
+  }
+
+  // Todo 103 + codex round 1 P2: snapshot the prior in-memory state
+  // BEFORE the mutation, so a failed atomic write can roll the
+  // shared cache back to match disk. Pre-fix, when the tick-level
+  // _loadedStatus seam was used, a failed write for phase A would
+  // leave the cache reflecting the would-be-written state; a later
+  // successful write for phase B would then serialize the entire
+  // cache (including A's failed mutation) — silently persisting A's
+  // 'spawning' marker even though no tab launched.
+  //
+  // Snapshot the per-phase entry and the prior `updated_at`. On
+  // write failure, restore both. The snapshot only matters when
+  // `_loadedStatus` is shared across calls; with the disk-load path
+  // each call gets a fresh `status` so a failed write naturally
+  // discards the mutation when the function returns.
+  const priorEntry = status.phases[phaseId];
+  const priorUpdatedAt = status.updated_at;
+  const existing = priorEntry || {};
   status.phases[phaseId] = { ...existing, ...updates };
   status.updated_at = new Date().toISOString();
 
@@ -881,17 +1046,30 @@ function runUpdate(manifestPath, phaseId, updates) {
   // of bubbling up and killing the orchestrator's main loop.
   const tmpPath = `${statusPath}.tmp-${process.pid}-${Date.now()}`;
   try {
-    fs.writeFileSync(tmpPath, header + yaml.dump(status));
-    fs.renameSync(tmpPath, statusPath);
+    writeFileSync(tmpPath, header + yaml.dump(status));
+    renameSync(tmpPath, statusPath);
   } catch (e) {
     // Best-effort cleanup of the tmp if the rename failed.
-    try { fs.unlinkSync(tmpPath); } catch (_) { /* ignore */ }
+    try { unlinkSync(tmpPath); } catch (_) { /* ignore */ }
+    // Codex round 1 P2 fix: restore the shared cache to its
+    // pre-mutation state so a later successful runUpdate doesn't
+    // serialize this failed attempt's mutation.
+    if (priorEntry === undefined) {
+      delete status.phases[phaseId];
+    } else {
+      status.phases[phaseId] = priorEntry;
+    }
+    if (priorUpdatedAt === undefined) {
+      delete status.updated_at;
+    } else {
+      status.updated_at = priorUpdatedAt;
+    }
     return {
       ok: false,
       error: `failed to persist manifest-status at ${statusPath}: ${e.message}`,
     };
   }
-  return { ok: true, status_file: statusPath, phase: phaseId, updates };
+  return { ok: true, status_file: statusPath, phase: phaseId, updates, status };
 }
 
 // -------------------- Entry --------------------
@@ -931,6 +1109,8 @@ module.exports = {
   loadStatus,
   runUpdate,
   KNOWN_SHELLS,
+  KNOWN_UPDATE_FIELDS,
   VALID_ID_RE,
   VALID_ROLES,
+  VALID_PERMISSION_MODES,
 };

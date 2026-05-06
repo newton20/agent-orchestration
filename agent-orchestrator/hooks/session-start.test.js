@@ -472,3 +472,132 @@ test('FLAG_NAME_RE does not match .consuming-* leftovers', () => {
   assert.doesNotMatch('.consuming-demo-1234-5678-0', FLAG_NAME_RE);
   assert.doesNotMatch('.consuming-phase-0-impl-1-2-3', FLAG_NAME_RE);
 });
+
+// =========================================================================
+// Todo 099 — out-of-band spawn-token binding
+// =========================================================================
+
+const { extractSpawnToken } = require('./session-start');
+
+test('[todo 099] extractSpawnToken parses # spawn_token: <uuid> first-line header', () => {
+  assert.strictEqual(
+    extractSpawnToken('# spawn_token: abc123\nrest of prompt'),
+    'abc123'
+  );
+  assert.strictEqual(
+    extractSpawnToken('#  spawn_token : abc.def-ghi\nrest'),
+    'abc.def-ghi'
+  );
+});
+
+test('[todo 099] extractSpawnToken rejects non-first-line headers (anti-spoof)', () => {
+  // A token-like string mid-prompt MUST NOT match — only the
+  // first line is authoritative.
+  assert.strictEqual(
+    extractSpawnToken('first line is not a token\n# spawn_token: spoofed\nrest'),
+    null
+  );
+});
+
+test('[todo 099] extractSpawnToken returns null for missing/malformed headers', () => {
+  assert.strictEqual(extractSpawnToken(''), null);
+  assert.strictEqual(extractSpawnToken('plain prompt with no header'), null);
+  assert.strictEqual(extractSpawnToken('# spawn_token:\nrest'), null);
+  assert.strictEqual(extractSpawnToken('# spawn_token: bad whitespace token\nrest'), null);
+});
+
+test('[todo 099] runHook with no tabToken falls through to oldest-flag-wins (compat)', () => {
+  const projectDir = mkProjectDir();
+  const orchDir = mkOrchDir(projectDir);
+  try {
+    writeFlag(orchDir, 'compat', '# spawn_token: any-token\nlegacy-style prompt');
+    // No tabToken passed → existing oldest-fresh wins.
+    const out = runHook({ projectDir });
+    const parsed = JSON.parse(out);
+    assert.ok(parsed.additionalContext.includes('legacy-style prompt'));
+  } finally {
+    fs.rmSync(projectDir, { recursive: true, force: true });
+  }
+});
+
+test('[todo 099] runHook with matching tabToken consumes the flag normally', () => {
+  const projectDir = mkProjectDir();
+  const orchDir = mkOrchDir(projectDir);
+  try {
+    writeFlag(orchDir, 'matching', '# spawn_token: tok-a\nactual prompt');
+    const out = runHook({ projectDir, tabToken: 'tok-a' });
+    const parsed = JSON.parse(out);
+    assert.ok(parsed.additionalContext.includes('actual prompt'));
+    // The flag should have been consumed (renamed and unlinked).
+    assert.strictEqual(listPendingFiles(orchDir).length, 0);
+  } finally {
+    fs.rmSync(projectDir, { recursive: true, force: true });
+  }
+});
+
+test('[todo 099] runHook with mismatched tabToken DOES NOT consume the flag (cross-tick poison-pill)', () => {
+  // The orphan-tab cross-tick scenario: orphan's tabToken was set
+  // at its original spawn time (token A); the fresh next-tick flag
+  // carries token B; orphan's hook fires, sees mismatch, and skips
+  // — leaving the fresh flag for the intended new tab.
+  const projectDir = mkProjectDir();
+  const orchDir = mkOrchDir(projectDir);
+  try {
+    const flagPath = writeFlag(
+      orchDir,
+      'orphan',
+      '# spawn_token: tok-NEW\nfresh prompt for the new tab'
+    );
+    const out = runHook({ projectDir, tabToken: 'tok-OLD' });
+    assert.strictEqual(out, '{}', 'mismatched token must yield no additionalContext');
+    // CRITICAL: the fresh flag MUST still exist (not consumed).
+    assert.ok(
+      fs.existsSync(flagPath),
+      'mismatched-token candidate must NOT be renamed/consumed; the fresh flag must survive for the intended tab'
+    );
+    // No .consuming-* sidecar should remain.
+    const consuming = fs
+      .readdirSync(orchDir)
+      .filter((n) => n.startsWith('.consuming-'));
+    assert.strictEqual(consuming.length, 0);
+  } finally {
+    fs.rmSync(projectDir, { recursive: true, force: true });
+  }
+});
+
+test('[todo 099] runHook skips legacy flag (no token header) when tab is bound to a token', () => {
+  // Failing closed: when the tab launched with a token but the flag
+  // it scans has no header (legacy or untrusted), reject. Better
+  // than consuming an unauthenticated prompt.
+  const projectDir = mkProjectDir();
+  const orchDir = mkOrchDir(projectDir);
+  try {
+    const flagPath = writeFlag(orchDir, 'legacy', 'no-header prompt');
+    const out = runHook({ projectDir, tabToken: 'tok-bound' });
+    assert.strictEqual(out, '{}');
+    assert.ok(fs.existsSync(flagPath), 'legacy flag must NOT be consumed by token-bound tab');
+  } finally {
+    fs.rmSync(projectDir, { recursive: true, force: true });
+  }
+});
+
+test('[todo 099] runHook iterates past mismatched candidates to find a matching one', () => {
+  const projectDir = mkProjectDir();
+  const orchDir = mkOrchDir(projectDir);
+  try {
+    // Two candidates: one with mismatched token, one matching. The
+    // hook should skip the mismatch and consume the match.
+    writeFlag(orchDir, 'wrong', '# spawn_token: WRONG\nwrong prompt', { mtimeMs: Date.now() - 1000 });
+    writeFlag(orchDir, 'right', '# spawn_token: RIGHT\nright prompt');
+    const out = runHook({ projectDir, tabToken: 'RIGHT' });
+    const parsed = JSON.parse(out);
+    assert.ok(parsed.additionalContext.includes('right prompt'));
+    // Wrong-token flag must remain on disk (not consumed).
+    assert.ok(
+      fs.existsSync(path.join(orchDir, '.pending-wrong')),
+      'mismatched candidate must remain on disk'
+    );
+  } finally {
+    fs.rmSync(projectDir, { recursive: true, force: true });
+  }
+});

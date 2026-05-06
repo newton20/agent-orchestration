@@ -386,10 +386,16 @@ test('D5 pollAllPhases surfaces config error for invalid manifest', () => {
   }
 });
 
-test('D6 pollAllPhases threads injected seams (no real WMI call)', () => {
+test('D6 pollAllPhases threads injected seams (no real WMI call) [codex round 17: gated wrapper-inclusive]', () => {
+  // Codex round 14 P2 added a wrapper-inclusive snapshot. Round 17
+  // P2 gated it behind 'is any phase spawning?' — when nothing is
+  // spawning the inclusive snapshot is unnecessary, so PID runner
+  // is called ONCE (only the primary snapshot). With a spawning
+  // phase the inclusive snapshot also fires, totaling 2.
   const dir = mkTmp('orch-poll');
   try {
     const mp = writeManifest(dir, makeBaseManifest());
+    // Case 1: no spawning phase → 1 runner call.
     let runnerCalled = 0;
     O.pollAllPhases({
       manifestPath: mp,
@@ -398,7 +404,19 @@ test('D6 pollAllPhases threads injected seams (no real WMI call)', () => {
         return '[]';
       },
     });
-    assert.strictEqual(runnerCalled, 1, 'PID runner is called exactly once per tick');
+    assert.strictEqual(runnerCalled, 1, 'PID runner called once when no phase is spawning');
+
+    // Case 2: a spawning phase → 2 runner calls.
+    writeStatus(mp, { phases: { 'phase-1': { status: 'spawning' } } });
+    runnerCalled = 0;
+    O.pollAllPhases({
+      manifestPath: mp,
+      _pidRunner: () => {
+        runnerCalled += 1;
+        return '[]';
+      },
+    });
+    assert.strictEqual(runnerCalled, 2, 'PID runner called twice when a phase is spawning (primary + wrapper-inclusive)');
   } finally {
     rmrf(dir);
   }
@@ -765,6 +783,49 @@ test('H2 retry budget exhausted (retry_count >= max) → mark_phase_failed', () 
   }
 });
 
+test('H2b [todo 107.d] recovery max-3 INNER boundary asserted (retry_count=2 → spawn iteration=3, NOT exhausted)', () => {
+  // The pre-existing H2 only asserted the outer boundary: retry_count=3
+  // with max=3 → exhausted (no spawn). 107.d closes the inner gap:
+  // retry_count=2 with max=3 must still recover (cur < maxRetries),
+  // and the emitted spawn action's iteration must be cur + 1 = 3. An
+  // off-by-one swap of `>=` → `>` (or `<` → `<=`) would still pass
+  // H1 / H2 / H4 but fail this assertion.
+  const dir = mkTmp('orch-H2b');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, {
+      phases: { 'phase-1': { status: 'running', retry_count: 2 } },
+    });
+    makePhaseDir(mp, 'phase-1');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      { _checkHealth: () => makeStubHealth({ pidAlive: false }) }
+    );
+    const recoverySpawn = actions.find(
+      (a) => a.type === 'spawn' && a.mode === 'recovery'
+    );
+    assert.ok(
+      recoverySpawn,
+      'retry_count=2 must still trigger recovery (inner boundary)'
+    );
+    assert.strictEqual(
+      recoverySpawn.iteration,
+      3,
+      'recovery iteration must be retry_count + 1 = 3'
+    );
+    assert.ok(
+      !actions.some(
+        (a) => a.type === 'mark_phase_failed' && /budget_exhausted/.test(a.reason || '')
+      ),
+      'retry_count=2 must NOT emit budget-exhausted'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
 test('H3 timeout → recovery (treated as crash)', () => {
   const dir = mkTmp('orch-H3');
   try {
@@ -778,6 +839,258 @@ test('H3 timeout → recovery (treated as crash)', () => {
       { _checkHealth: () => makeStubHealth({ pidAlive: true, timedOut: true }) }
     );
     assert.ok(actions.some((a) => a.type === 'spawn' && a.mode === 'recovery'));
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('H5 [todo 097] shape-corrupt retry_count="two" blocks the phase (no recovery)', () => {
+  const dir = mkTmp('orch-H5');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, {
+      phases: { 'phase-1': { status: 'running', retry_count: 'two' } },
+    });
+    makePhaseDir(mp, 'phase-1');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      { _checkHealth: () => makeStubHealth({ pidAlive: false }) }
+    );
+    assert.ok(
+      actions.some(
+        (a) => a.type === 'mark_phase_blocked' && /retry_count_shape_corrupt/.test(a.reason || '')
+      ),
+      'shape-corrupt retry_count must emit mark_phase_blocked, not silently coerce to 0'
+    );
+    assert.ok(
+      !actions.some((a) => a.type === 'spawn' && a.mode === 'recovery'),
+      'shape-corrupt phase must not enter the recovery dispatch path'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('H5b [todo 097] shape-corrupt retry_count=2.5 (float) blocks the phase', () => {
+  const dir = mkTmp('orch-H5b');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, {
+      phases: { 'phase-1': { status: 'running', retry_count: 2.5 } },
+    });
+    makePhaseDir(mp, 'phase-1');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      { _checkHealth: () => makeStubHealth({ pidAlive: false }) }
+    );
+    assert.ok(
+      actions.some((a) => a.type === 'mark_phase_blocked'),
+      'float retry_count must emit mark_phase_blocked'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('H5c [todo 097] retry_count=-1 (negative) blocks the phase', () => {
+  const dir = mkTmp('orch-H5c');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, {
+      phases: { 'phase-1': { status: 'running', retry_count: -1 } },
+    });
+    makePhaseDir(mp, 'phase-1');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      { _checkHealth: () => makeStubHealth({ pidAlive: false }) }
+    );
+    assert.ok(actions.some((a) => a.type === 'mark_phase_blocked'));
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('H5d [todo 097] retry_count absent → treated as 0 (legitimate fresh-spawn, NOT blocked)', () => {
+  const dir = mkTmp('orch-H5d');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    // Note: NO retry_count key on the phase entry.
+    writeStatus(mp, { phases: { 'phase-1': { status: 'running' } } });
+    makePhaseDir(mp, 'phase-1');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      { _checkHealth: () => makeStubHealth({ pidAlive: false }) }
+    );
+    assert.ok(
+      !actions.some((a) => a.type === 'mark_phase_blocked'),
+      'absent retry_count is a legitimate fresh-spawn case; must NOT block'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('H5e [todo 097] retry_count present with explicit null blocks the phase', () => {
+  const dir = mkTmp('orch-H5e');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, {
+      phases: { 'phase-1': { status: 'running', retry_count: null } },
+    });
+    makePhaseDir(mp, 'phase-1');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      { _checkHealth: () => makeStubHealth({ pidAlive: false }) }
+    );
+    assert.ok(
+      actions.some((a) => a.type === 'mark_phase_blocked'),
+      'explicit null retry_count is shape-corrupt (vs absence which defaults to 0)'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('H5f [todo 097] retry_count=5 above MAX_RETRIES (3) is NOT shape-corrupt — flows through to budget-exhausted recovery path', () => {
+  const dir = mkTmp('orch-H5f');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, {
+      phases: { 'phase-1': { status: 'running', retry_count: 5 } },
+    });
+    makePhaseDir(mp, 'phase-1');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      { _checkHealth: () => makeStubHealth({ pidAlive: false }) }
+    );
+    // Over-budget integer must NOT be misclassified as shape-corrupt.
+    assert.ok(
+      !actions.some(
+        (a) => a.type === 'mark_phase_blocked' && /retry_count_shape_corrupt/.test(a.reason || '')
+      ),
+      'over-budget integer is legitimate historical state, NOT shape-corrupt'
+    );
+    // The exhausted-budget path emits mark_phase_failed via decideRecoveryAction.
+    assert.ok(
+      actions.some(
+        (a) => a.type === 'mark_phase_failed' && /recovery_budget_exhausted/.test(a.reason || '')
+      ),
+      'over-budget integer triggers the documented recovery-budget-exhausted policy'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('H6 [todo 094] recovery action populates priorPid + completedCheckpointsBlock from existing data', () => {
+  // Manifest has 3 phases; phase-prev was completed; phase-1 is the
+  // running phase whose pid=4242 just died. The recovery action must
+  // emit priorPid=4242 and a completedCheckpointsBlock that lists
+  // phase-prev sourced from status.phases iteration (NOT from a
+  // top-level completed_phases field — that field does not exist).
+  const dir = mkTmp('orch-H6');
+  try {
+    const mp = writeManifest(
+      dir,
+      makeBaseManifest({
+        phases: [
+          {
+            id: 'phase-prev',
+            completion_signal: 'docs/orchestration/phases/phase-prev/impl-complete.md',
+            agent: { role: 'impl' },
+          },
+          {
+            id: 'phase-1',
+            completion_signal: 'docs/orchestration/phases/phase-1/impl-complete.md',
+            agent: { role: 'impl' },
+            depends_on: ['phase-prev'],
+          },
+        ],
+      })
+    );
+    writeStatus(mp, {
+      phases: {
+        'phase-prev': { status: 'completed' },
+        'phase-1': { status: 'running', pid: 4242, retry_count: 0 },
+      },
+    });
+    makePhaseDir(mp, 'phase-prev');
+    makePhaseDir(mp, 'phase-1');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      { _checkHealth: () => makeStubHealth({ pidAlive: false, heartbeatAge: 30 }) }
+    );
+    const recoverySpawn = actions.find(
+      (a) => a.type === 'spawn' && a.mode === 'recovery'
+    );
+    assert.ok(recoverySpawn, 'recovery spawn must be emitted');
+    assert.strictEqual(
+      recoverySpawn.priorPid,
+      4242,
+      'priorPid sourced from manifest-status pid field'
+    );
+    assert.ok(
+      typeof recoverySpawn.lastHeartbeatTimestamp === 'string',
+      `lastHeartbeatTimestamp derived from heartbeatAge=30; got ${JSON.stringify(recoverySpawn.lastHeartbeatTimestamp)}`
+    );
+    assert.ok(
+      typeof recoverySpawn.completedCheckpointsBlock === 'string' &&
+        /phase-prev/.test(recoverySpawn.completedCheckpointsBlock),
+      `completedCheckpointsBlock must mention phase-prev; got ${JSON.stringify(recoverySpawn.completedCheckpointsBlock)}`
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('H6b [todo 094] recovery action emits explicit null for absent fields (NOT undefined)', () => {
+  // No heartbeat → lastHeartbeatTimestamp: null. No completed phases
+  // → completedCheckpointsBlock: null. No prior pid → priorPid: null.
+  // No plan_units → remainingWorkBlock: null. The dispatch's RA #2
+  // requires explicit null (not undefined / omitted) so the V1.5
+  // hook can distinguish "field not populated" from "field absent
+  // from contract."
+  const dir = mkTmp('orch-H6b');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, {
+      phases: { 'phase-1': { status: 'running', retry_count: 0 } },
+    });
+    makePhaseDir(mp, 'phase-1');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      // No heartbeat record exists; checkHealth returns heartbeatAge=null.
+      { _checkHealth: () => makeStubHealth({ pidAlive: false, heartbeatAge: null }) }
+    );
+    const recoverySpawn = actions.find(
+      (a) => a.type === 'spawn' && a.mode === 'recovery'
+    );
+    assert.ok(recoverySpawn);
+    assert.strictEqual(recoverySpawn.priorPid, null);
+    assert.strictEqual(recoverySpawn.lastHeartbeatTimestamp, null);
+    assert.strictEqual(recoverySpawn.remainingWorkBlock, null);
+    assert.strictEqual(recoverySpawn.completedCheckpointsBlock, null);
+    // Sanity — keys must be PRESENT (not omitted).
+    assert.ok('priorPid' in recoverySpawn);
+    assert.ok('lastHeartbeatTimestamp' in recoverySpawn);
+    assert.ok('remainingWorkBlock' in recoverySpawn);
+    assert.ok('completedCheckpointsBlock' in recoverySpawn);
   } finally {
     rmrf(dir);
   }
@@ -907,6 +1220,178 @@ test('I4 session_not_found nulls also count toward convergence', () => {
       );
     }
     assert.ok(lastActions.some((a) => a.type === 'spawn' && a.mode === 'recovery'));
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('I4b [todo 098] startup_grace RESETS the counter (flap pattern: lookup_failed → grace → lookup_failed counts 1, not 2)', () => {
+  // The "consecutive" word in todo 071's contract is load-bearing:
+  // recovery only fires after N _consecutive_ failures. Pre-fix,
+  // startup_grace was a skip-the-increment, not a reset — the
+  // pattern lookup_failed → startup_grace → lookup_failed left the
+  // counter at 2 (off-by-one from the contract). The fix resets on
+  // grace so the second null is the second consecutive failure
+  // counted from a fresh start.
+  const dir = mkTmp('orch-I4b');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, { phases: { 'phase-1': { status: 'running', retry_count: 0 } } });
+    makePhaseDir(mp, 'phase-1');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const counters = new Map();
+    O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: counters },
+      {
+        _checkHealth: () =>
+          makeStubHealth({ pidAlive: null, pidAliveReason: 'lookup_failed' }),
+        lookupFailedConvergeN: 3,
+      }
+    );
+    assert.strictEqual(counters.get('phase-1:impl'), 1);
+    O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: counters },
+      {
+        _checkHealth: () =>
+          makeStubHealth({ pidAlive: null, pidAliveReason: 'startup_grace' }),
+        lookupFailedConvergeN: 3,
+      }
+    );
+    assert.strictEqual(
+      counters.has('phase-1:impl'),
+      false,
+      'startup_grace must RESET the counter, not just skip the increment'
+    );
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: counters },
+      {
+        _checkHealth: () =>
+          makeStubHealth({ pidAlive: null, pidAliveReason: 'lookup_failed' }),
+        lookupFailedConvergeN: 3,
+      }
+    );
+    assert.strictEqual(counters.get('phase-1:impl'), 1);
+    assert.ok(
+      !actions.some((a) => a.type === 'spawn' && a.mode === 'recovery'),
+      'should NOT recover on second lookup_failed when grace reset the counter'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('I4c [todo 098] flap pattern under custom --converge-n=2 also honors startup_grace reset', () => {
+  // Verifies the threshold itself is unchanged by 098's fix — the
+  // configured --converge-n is preserved, only the WHEN-to-reset
+  // semantic changed. With converge-n=2: lookup_failed → grace →
+  // lookup_failed → lookup_failed should fire on the third call
+  // (counter sequence: 1, reset to 0, 1, 2 → trigger).
+  const dir = mkTmp('orch-I4c');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, { phases: { 'phase-1': { status: 'running', retry_count: 0 } } });
+    makePhaseDir(mp, 'phase-1');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const counters = new Map();
+    let actions;
+    actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: counters },
+      {
+        _checkHealth: () =>
+          makeStubHealth({ pidAlive: null, pidAliveReason: 'lookup_failed' }),
+        lookupFailedConvergeN: 2,
+      }
+    );
+    assert.ok(!actions.some((a) => a.type === 'spawn' && a.mode === 'recovery'));
+    O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: counters },
+      {
+        _checkHealth: () =>
+          makeStubHealth({ pidAlive: null, pidAliveReason: 'startup_grace' }),
+        lookupFailedConvergeN: 2,
+      }
+    );
+    actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: counters },
+      {
+        _checkHealth: () =>
+          makeStubHealth({ pidAlive: null, pidAliveReason: 'lookup_failed' }),
+        lookupFailedConvergeN: 2,
+      }
+    );
+    assert.ok(!actions.some((a) => a.type === 'spawn' && a.mode === 'recovery'));
+    actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: counters },
+      {
+        _checkHealth: () =>
+          makeStubHealth({ pidAlive: null, pidAliveReason: 'lookup_failed' }),
+        lookupFailedConvergeN: 2,
+      }
+    );
+    assert.ok(actions.some((a) => a.type === 'spawn' && a.mode === 'recovery'));
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('I4d [todo 108.j] convergence counter: unknown / null pidAliveReason still counts toward convergence', () => {
+  // The dispatcher comment at orchestrate.js documents:
+  //   "'lookup_failed' OR 'session_not_found' OR null reason ⇒ count."
+  // The null-reason branch was untested pre-fix; a refactor that
+  // accidentally short-circuited unknown reasons would have left
+  // recovery dispatch buggy. Verify counter increments for each
+  // null-reason call below the threshold, and that the threshold
+  // call still triggers recovery.
+  const dir = mkTmp('orch-I4d');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, { phases: { 'phase-1': { status: 'running', retry_count: 0 } } });
+    makePhaseDir(mp, 'phase-1');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const counters = new Map();
+    // Two below-threshold calls increment counter to 1, 2.
+    O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: counters },
+      {
+        _checkHealth: () =>
+          makeStubHealth({ pidAlive: null, pidAliveReason: null }),
+        lookupFailedConvergeN: 3,
+      }
+    );
+    assert.strictEqual(counters.get('phase-1:impl'), 1);
+    O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: counters },
+      {
+        _checkHealth: () =>
+          makeStubHealth({ pidAlive: null, pidAliveReason: null }),
+        lookupFailedConvergeN: 3,
+      }
+    );
+    assert.strictEqual(counters.get('phase-1:impl'), 2);
+    // Third call hits convergence threshold → recovery action emitted
+    // and counter is deleted.
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: counters },
+      {
+        _checkHealth: () =>
+          makeStubHealth({ pidAlive: null, pidAliveReason: null }),
+        lookupFailedConvergeN: 3,
+      }
+    );
+    assert.ok(
+      actions.some((a) => a.type === 'spawn' && a.mode === 'recovery'),
+      'null pidAliveReason must converge to recovery on the Nth call'
+    );
   } finally {
     rmrf(dir);
   }
@@ -1318,6 +1803,91 @@ test('K4 schema_version mismatch → fatal', () => {
   }
 });
 
+test('K4b [todo 101] schema_version=1 (V1 baseline) accepted', () => {
+  const dir = mkTmp('orch-K4b');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, { phases: { 'phase-1': { status: 'running' } } });
+    makePhaseDir(mp, 'phase-1');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      { _checkHealth: () => makeStubHealth({ schema_version: 1 }) }
+    );
+    assert.ok(!actions.some((a) => a.type === 'fatal'));
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('K4c [todo 101] schema_version="1.1" accepted with warning (soft-band)', () => {
+  const dir = mkTmp('orch-K4c');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, { phases: { 'phase-1': { status: 'running' } } });
+    makePhaseDir(mp, 'phase-1');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      { _checkHealth: () => makeStubHealth({ schema_version: '1.1' }) }
+    );
+    assert.ok(!actions.some((a) => a.type === 'fatal'), 'minor bump must not fatal');
+    assert.ok(
+      actions.some(
+        (a) => a.type === 'log' && a.level === 'warn' && /soft-compat band/.test(a.message)
+      ),
+      'minor bump must emit a soft-band warning'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('K4d [todo 101] schema_version=2 (major bump) → fatal', () => {
+  const dir = mkTmp('orch-K4d');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, { phases: { 'phase-1': { status: 'running' } } });
+    makePhaseDir(mp, 'phase-1');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const actions = O.decideTickActions(
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      { _checkHealth: () => makeStubHealth({ schema_version: 2 }) }
+    );
+    assert.ok(
+      actions.some((a) => a.type === 'fatal' && /schema_version/.test(a.message))
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('K4e [todo 101] malformed schema_version values rejected as fatal', () => {
+  const dir = mkTmp('orch-K4e');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, { phases: { 'phase-1': { status: 'running' } } });
+    makePhaseDir(mp, 'phase-1');
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    for (const bad of ['1.0.x', 'abc', '', null, 1.5]) {
+      const actions = O.decideTickActions(
+        { ...tickRes, manifestPath: mp },
+        { convergenceCounters: new Map() },
+        { _checkHealth: () => makeStubHealth({ schema_version: bad }) }
+      );
+      assert.ok(
+        actions.some((a) => a.type === 'fatal'),
+        `malformed value ${JSON.stringify(bad)} must be rejected as fatal`
+      );
+    }
+  } finally {
+    rmrf(dir);
+  }
+});
+
 test('K5 heartbeatTruncated logs debug but does not trigger recovery', () => {
   const dir = mkTmp('orch-K5');
   try {
@@ -1451,7 +2021,10 @@ test('L1 executeActions translates spawnedAt → started_at on persist (todo 087
   }
 });
 
-test('L2 executeActions writes flag file atomically with prompt content', () => {
+test('L2 executeActions writes flag file atomically with prompt content (todo 099: spawn-token header prepended)', () => {
+  // Todo 099: every flag now starts with `# spawn_token: <uuid>` so
+  // the SessionStart hook can do pre-rename token filtering. Inject
+  // a deterministic _spawnToken so the test asserts on a known value.
   const dir = mkTmp('orch-L2');
   try {
     const mp = writeManifest(dir, makeBaseManifest());
@@ -1467,6 +2040,7 @@ test('L2 executeActions writes flag file atomically with prompt content', () => 
       _spawnSession: fakeSpawn,
       _generatePrompt: fakeGen,
       _runUpdate: fakeUpdate,
+      _spawnToken: 'test-token-abc',
       logger: silentLogger(),
       projectName: 'p',
     });
@@ -1475,7 +2049,10 @@ test('L2 executeActions writes flag file atomically with prompt content', () => 
       'orch-phase-1-impl'
     );
     assert.ok(fs.existsSync(flagPath));
-    assert.strictEqual(fs.readFileSync(flagPath, 'utf8'), '# hello prompt');
+    assert.strictEqual(
+      fs.readFileSync(flagPath, 'utf8'),
+      '# spawn_token: test-token-abc\n# hello prompt'
+    );
   } finally {
     rmrf(dir);
   }
@@ -1927,10 +2504,10 @@ test('O2 parseCliArgs: --resume', () => {
   assert.strictEqual(a.resume, true);
 });
 
-test('O3 parseCliArgs: --once sets maxTicks to 1', () => {
+test('O3 parseCliArgs: --once sets maxTicks to 1 (todo 108.e: no separate `once` field)', () => {
   const a = O.parseCliArgs(['node', 's.js', '--once', 'm.yaml']);
   assert.strictEqual(a.maxTicks, 1);
-  assert.strictEqual(a.once, true);
+  assert.strictEqual(a.once, undefined);
 });
 
 test('O4 parseCliArgs: integer flags accept positive ints', () => {
@@ -1993,18 +2570,110 @@ test('O5g parseCliArgs --help sets showHelp; main path skips manifest required',
   assert.strictEqual(a.manifestPath, null);
 });
 
-test('O6 parseCliArgs: --plugin-dir + --project-name capture string args', () => {
+test('O6 parseCliArgs: --plugin-dir + --project-name capture string args (todo 108.m: path must exist)', () => {
+  // Todo 108.m: --plugin-dir now validates the path exists at the
+  // CLI boundary. Use the test directory itself to satisfy the check.
+  const dir = mkTmp('orch-O6');
+  try {
+    const a = O.parseCliArgs([
+      'node',
+      's.js',
+      '--plugin-dir',
+      dir,
+      '--project-name',
+      'demo',
+      'm.yaml',
+    ]);
+    assert.strictEqual(a.pluginDir, dir);
+    assert.strictEqual(a.projectName, 'demo');
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('O6a [todo 108.m] --plugin-dir nonexistent path → CliError', () => {
+  assert.throws(
+    () =>
+      O.parseCliArgs([
+        'node',
+        's.js',
+        '--plugin-dir',
+        '/nonexistent-plugin-dir-' + Date.now(),
+        'm.yaml',
+      ]),
+    /--plugin-dir path does not exist/
+  );
+});
+
+test('O6b [todo 106] --plugin-dir followed by another flag → error (no greedy consume)', () => {
+  // Pre-fix `--plugin-dir --resume bar.yaml` parsed as
+  // `pluginDir = '--resume'` and silently dropped `--resume`.
+  // The fix rejects `-`-prefixed values for path-typed flags.
+  assert.throws(
+    () => O.parseCliArgs(['node', 's.js', '--plugin-dir', '--resume', 'bar.yaml']),
+    /--plugin-dir requires a path|use --plugin-dir=/
+  );
+});
+
+test('O6c [todo 106] --project-name followed by another flag → error', () => {
+  assert.throws(
+    () => O.parseCliArgs(['node', 's.js', '--project-name', '--once', 'bar.yaml']),
+    /--project-name requires a path|use --project-name=/
+  );
+});
+
+test('O6d [todo 106 + codex round 12 P3] --plugin-dir=<path> escape hatch via `=` form (still validates existence)', () => {
+  // The `=` form is the escape hatch for paths that begin with `-`.
+  // Codex round 12 P3 made the `=` form ALSO validate existence
+  // (parity with the bare form). To exercise both, use a real path
+  // that starts with `-` would require creating one — instead use
+  // the existing test-tmp dir as the value.
+  const dir = mkTmp('orch-O6d');
+  try {
+    const a = O.parseCliArgs([
+      'node',
+      's.js',
+      `--plugin-dir=${dir}`,
+      '--resume',
+      'bar.yaml',
+    ]);
+    assert.strictEqual(a.pluginDir, dir);
+    assert.strictEqual(a.resume, true);
+    assert.strictEqual(a.manifestPath, 'bar.yaml');
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('O6e [todo 106] --project-name=<value> escape hatch', () => {
   const a = O.parseCliArgs([
     'node',
     's.js',
-    '--plugin-dir',
-    '/p',
-    '--project-name',
-    'demo',
-    'm.yaml',
+    '--project-name=--my-project',
+    'bar.yaml',
   ]);
-  assert.strictEqual(a.pluginDir, '/p');
-  assert.strictEqual(a.projectName, 'demo');
+  assert.strictEqual(a.projectName, '--my-project');
+});
+
+test('O6f [todo 106] non-flag value continues to work normally', () => {
+  // Sanity check: the existing happy path is preserved — only
+  // `-`-prefixed values trip the new check. Use the cwd as a
+  // path that always exists (todo 108.m's existence check).
+  const dir = mkTmp('orch-O6f');
+  try {
+    const a = O.parseCliArgs([
+      'node',
+      's.js',
+      '--plugin-dir',
+      dir,
+      '--resume',
+      'bar.yaml',
+    ]);
+    assert.strictEqual(a.pluginDir, dir);
+    assert.strictEqual(a.resume, true);
+  } finally {
+    rmrf(dir);
+  }
 });
 
 test('O7 parseCliArgs: --dry-run + --skip-scaffold are flags', () => {
@@ -3448,6 +4117,105 @@ test('W4 [codex round 6 P2] --max-ticks with running phases left → ok=false su
 // X — codex round 7 regression tests
 // =========================================================================
 
+test('X1b [todo 110] spawn failure rolls back the spawning marker to pending (calls rollbackSpawningMarker helper)', () => {
+  const dir = mkTmp('orch-X1b');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const updates = [];
+    const trackingRunUpdate = (manifestPath, phaseId, u) => {
+      updates.push({ phaseId, ...u });
+      return { ok: true };
+    };
+    O.executeActions(
+      [{ type: 'spawn', phaseId: 'phase-1', role: 'impl', mode: 'initial', iteration: 1 }],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: () => {
+          throw new Error('wt unavailable');
+        },
+        _generatePrompt: makeFakeGenerate(),
+        _runUpdate: trackingRunUpdate,
+        logger: silentLogger(),
+        projectName: 'p',
+      }
+    );
+    // The spawn-throw path writes (1) the pre-spawn 'spawning' marker
+    // and then (2) the rollback to 'pending' via the shared helper.
+    const markerWrites = updates.filter((u) => u.status === 'spawning');
+    const rollbackWrites = updates.filter(
+      (u) => u.status === 'pending' && u.dispatched_at === ''
+    );
+    assert.strictEqual(markerWrites.length, 1, 'pre-spawn marker written exactly once');
+    assert.strictEqual(rollbackWrites.length, 1, 'rollback to pending written exactly once');
+    // Order matters — rollback must come AFTER marker.
+    const markerIdx = updates.findIndex((u) => u.status === 'spawning');
+    const rollbackIdx = updates.findIndex(
+      (u) => u.status === 'pending' && u.dispatched_at === ''
+    );
+    assert.ok(markerIdx < rollbackIdx, 'rollback follows marker write');
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('X1c [todo 096] post-spawn runUpdate throw LEAVES the spawning marker intact (NOT rolled back)', () => {
+  // 096's contract: when spawnFn already returned successfully (the wt
+  // tab is live), a thrown post-spawn runUpdate must NOT touch the
+  // manifest-status. The 'spawning' marker stays so the next tick's
+  // reconciliation pass can adopt the live session via PID match.
+  // Rolling back here would orphan the live tab and re-introduce the
+  // duplicate-spawn class todo 088 / 093 / 096 are designed to close.
+  const dir = mkTmp('orch-X1c');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const updates = [];
+    let runUpdateCalls = 0;
+    const trackingRunUpdate = (manifestPath, phaseId, u) => {
+      runUpdateCalls += 1;
+      updates.push({ phaseId, ...u });
+      // First call = pre-spawn marker (write 'spawning'). Succeed.
+      // Second call = post-spawn runUpdate (transition to 'running'
+      //   + persist pid/started_at). THROW.
+      if (runUpdateCalls === 2) {
+        throw new Error('post-spawn runUpdate FS error');
+      }
+      return { ok: true };
+    };
+    O.executeActions(
+      [{ type: 'spawn', phaseId: 'phase-1', role: 'impl', mode: 'initial', iteration: 1 }],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: makeFakeSpawnSession(),
+        _generatePrompt: makeFakeGenerate(),
+        _runUpdate: trackingRunUpdate,
+        logger: silentLogger(),
+        projectName: 'p',
+      }
+    );
+    // Marker write succeeded (first runUpdate call).
+    const markerWrites = updates.filter((u) => u.status === 'spawning');
+    assert.strictEqual(markerWrites.length, 1, 'pre-spawn marker written once');
+    // CRITICAL: NO rollback to 'pending' — the marker must remain
+    // 'spawning' so reconciliation adopts on the next tick.
+    const rollbackWrites = updates.filter(
+      (u) => u.status === 'pending' && u.dispatched_at === ''
+    );
+    assert.strictEqual(
+      rollbackWrites.length,
+      0,
+      'post-spawn runUpdate throw must NOT roll back the spawning marker'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
 test('X1 [codex round 7 P1] spawn failure unlinks the flag file (no leak)', () => {
   const dir = mkTmp('orch-X1');
   try {
@@ -3509,14 +4277,45 @@ test('X2 [codex round 7 P2] terminal completion observed same-tick (mark_phase_c
   }
 });
 
-test('X3 [codex round 7 P1] flag-consume serialization defaults to 0ms when test seam injects spawn', () => {
-  // Documented contract: tests pass `_spawnSession` and the flag
-  // wait collapses to 0ms so the suite stays fast. This test
-  // exercises the path indirectly by asserting the suite doesn't
-  // hang; total test runtime is monitored at the npm-test level.
-  // The presence of the seam is the contract; no functional check
-  // beyond "tests don't hang."
-  assert.ok(true);
+test('X3 [codex round 7 P1 + todo 107.a] flag-consume defaults to 0ms when test seam injects spawn (no explicit override)', () => {
+  // Todo 107.a: pre-fix this test was vacuous (`assert.ok(true)`)
+  // and over-stated coverage by 1. The actual contract: when
+  // tests pass `_spawnSession` AND don't override `flagConsumeTimeoutMs`,
+  // the flag-consume busy-wait collapses to 0ms so the suite stays
+  // fast. We verify functionally by running executeActions through
+  // the fake-spawn path with no explicit timeout and asserting the
+  // call returns quickly even though the production default would
+  // have been 10s.
+  const dir = mkTmp('orch-X3');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    const fakeSpawn = makeFakeSpawnSession();
+    const t0 = Date.now();
+    O.executeActions(
+      [{ type: 'spawn', phaseId: 'phase-1', role: 'impl', mode: 'initial', iteration: 1 }],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: fakeSpawn,
+        _generatePrompt: makeFakeGenerate(),
+        _runUpdate: makeFakeRunUpdate(),
+        // No flagConsumeTimeoutMs override — the fake-spawn detection
+        // collapses to 0; production default is 10_000.
+        logger: silentLogger(),
+        projectName: 'p',
+      }
+    );
+    const elapsed = Date.now() - t0;
+    assert.ok(
+      elapsed < 1000,
+      `fake-spawn flag-consume must collapse to 0ms (production default would be 10000ms); took ${elapsed}ms`
+    );
+    assert.strictEqual(fakeSpawn.calls.length, 1, 'fake spawn ran exactly once');
+  } finally {
+    rmrf(dir);
+  }
 });
 
 // =========================================================================
@@ -4028,6 +4827,101 @@ test('AC1 [codex round 12 P2] stale lock reclaim uses rename so two starters can
   }
 });
 
+test('AC1b [todo 107.c] stale-lock reclaim ENOENT (rename loser) falls through to exclusive create', () => {
+  // The reclaim path renames the stale lockfile to a sidecar so two
+  // concurrent reclaimers can't both clobber. The LOSER of that race
+  // sees ENOENT on rename — pre-fix this branch was untested and a
+  // refactor that made ENOENT throw could break the orchestrator's
+  // start handshake silently. Inject a renameSync that throws ENOENT
+  // on the stale-rename and verify acquireLock falls through to the
+  // exclusive-create path (which then succeeds because the actual
+  // file no longer exists).
+  const dir = mkTmp('orch-AC1b');
+  try {
+    fs.writeFileSync(
+      path.join(dir, '.orchestrator.lock'),
+      JSON.stringify({ pid: 999, startedAt: 'old', hostname: 'h' })
+    );
+    let renameCalls = 0;
+    const renameENOENT = (from, to) => {
+      renameCalls += 1;
+      // First call: stale-lock rename; the "winner" already moved
+      // the file aside. Simulate ENOENT.
+      if (renameCalls === 1) {
+        // Actually unlink the file ourselves so the subsequent
+        // exclusive-create path finds an empty slot.
+        try { fs.unlinkSync(from); } catch (_) { /* already gone */ }
+        const e = new Error('ENOENT: file vanished');
+        e.code = 'ENOENT';
+        throw e;
+      }
+      return fs.renameSync(from, to);
+    };
+    const lockedPath = O.acquireLock(dir, {
+      _pid: 1,
+      _killer: () => {
+        const e = new Error('no such');
+        e.code = 'ESRCH';
+        throw e;
+      },
+      _renameSync: renameENOENT,
+    });
+    assert.ok(typeof lockedPath === 'string');
+    assert.ok(fs.existsSync(lockedPath), 'fresh lockfile must exist after fall-through');
+    O.releaseLock(lockedPath);
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AC1c [todo 108.k] stale-signal post-spawn cleanup tolerates statSync throws (file vanished mid-cleanup)', () => {
+  // The post-spawn cleanup at executeSpawn iterates staleUnlinks and
+  // calls statSync to compare current mtime vs pre-spawn snapshot.
+  // If the file vanished between snapshot and cleanup (e.g., another
+  // process unlinked it), statSync throws ENOENT — pre-fix the
+  // catch-all silently swallowed without coverage. Test that the
+  // happy path tolerates a synthetic statSync throw.
+  const dir = mkTmp('orch-AC1c');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    const phaseDir = makePhaseDir(mp, 'phase-1');
+    // Plant a stale signal that the cleanup pass will try to inspect.
+    writeCompletionSignal(phaseDir, 'impl', 'complete');
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    let statSyncCalls = 0;
+    const throwingStatSync = (p) => {
+      // First call (pre-spawn snapshot): use real fs.statSync.
+      // Subsequent calls (post-spawn cleanup): throw ENOENT to
+      // simulate the file vanishing mid-cleanup.
+      statSyncCalls += 1;
+      if (statSyncCalls === 1) return fs.statSync(p);
+      const e = new Error('ENOENT: file vanished');
+      e.code = 'ENOENT';
+      throw e;
+    };
+    const tickRes = O.pollAllPhases({ manifestPath: mp, _pidRunner: () => '[]' });
+    // Recovery dispatch triggers stale-signal cleanup.
+    const result = O.executeActions(
+      [{ type: 'spawn', phaseId: 'phase-1', role: 'impl', mode: 'recovery', iteration: 1 }],
+      { ...tickRes, manifestPath: mp },
+      { convergenceCounters: new Map() },
+      {
+        _spawnSession: makeFakeSpawnSession(),
+        _generatePrompt: makeFakeGenerate(),
+        _runUpdate: makeFakeRunUpdate(),
+        _statSync: throwingStatSync,
+        logger: silentLogger(),
+        projectName: 'p',
+      }
+    );
+    // Should NOT crash — the throwing statSync is tolerated.
+    assert.strictEqual(result.fatal, null);
+    assert.strictEqual(result.spawned, 1);
+  } finally {
+    rmrf(dir);
+  }
+});
+
 test('AC2 [codex round 12 P2] initial impl dispatch unlinks stale impl-complete.md', () => {
   const dir = mkTmp('orch-AC2');
   try {
@@ -4413,14 +5307,17 @@ test('AF2 [codex round 15 P2] manifest without permission_mode → launcher unch
   }
 });
 
-test('AF3 [codex round 15 P2] permission_mode merges with manifest launcher block', () => {
+test('AF3 [codex round 15 P2 + todo 100] permission_mode merges with manifest launcher block (enum-validated value)', () => {
   const dir = mkTmp('orch-AF3');
   try {
     const mp = writeManifest(
       dir,
       Object.assign(makeBaseManifest(), {
         launcher: { shell: 'powershell', binary: 'agency claude' },
-        defaults: { permission_mode: 'bypass' },
+        // Todo 100: permission_mode is a strict enum. The legacy free-form
+        // value `'bypass'` no longer validates; use the canonical Claude
+        // Code mode name so the merge path still exercises the same code.
+        defaults: { permission_mode: 'bypassPermissions' },
       })
     );
     fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
@@ -4441,7 +5338,7 @@ test('AF3 [codex round 15 P2] permission_mode merges with manifest launcher bloc
     const launcherArg = fakeSpawn.calls[0].launcher;
     assert.strictEqual(launcherArg.shell, 'powershell');
     assert.strictEqual(launcherArg.binary, 'agency claude');
-    assert.strictEqual(launcherArg.auto_mode_flag, '--permission-mode bypass');
+    assert.strictEqual(launcherArg.auto_mode_flag, '--permission-mode bypassPermissions');
   } finally {
     rmrf(dir);
   }
@@ -4525,6 +5422,192 @@ test('AG2 [codex round 16 P2] abort during sleep exits without waiting full inte
     assert.ok(
       elapsed < 3000,
       `aborted run should exit fast; took ${elapsed}ms (interval was 5000ms)`
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AG3 [todo 095] abort listener stays at 1 across many ticks (no MaxListenersExceededWarning)', async () => {
+  // Pre-fix, runOrchestrator wired addEventListener('abort', ..., {once:true})
+  // every tick — Node fires MaxListenersExceededWarning at 11. Run 50 ticks
+  // through a fast-resolving _sleep and assert the listener count stays at 1.
+  const dir = mkTmp('orch-AG3');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, { phases: { 'phase-1': { status: 'running' } } });
+    makePhaseDir(mp, 'phase-1');
+    const ac = new AbortController();
+    let warningSeen = false;
+    const onWarning = (w) => {
+      if (
+        w &&
+        (w.name === 'MaxListenersExceededWarning' ||
+          /MaxListenersExceededWarning/.test(String(w.message || w)))
+      ) {
+        warningSeen = true;
+      }
+    };
+    process.on('warning', onWarning);
+    let maxObservedListeners = 0;
+    try {
+      await O.runOrchestrator({
+        manifestPath: mp,
+        resume: true,
+        signal: ac.signal,
+        _spawnSession: makeFakeSpawnSession(),
+        _generatePrompt: makeFakeGenerate(),
+        _checkHealth: () => makeStubHealth({ pidAlive: true }),
+        _pidRunner: () => '[]',
+        _sleep: async () => {
+          // Sample listener count mid-loop. Node EventTarget exposes count
+          // on the underlying [Symbol(events)] map; we count via getMaxListeners
+          // proxy where available, else fall back to N=0 (the assertion
+          // below is conservative — the warning catches the regression).
+          if (typeof ac.signal[Symbol.for('events')] !== 'undefined') {
+            const m = ac.signal[Symbol.for('events')];
+            const handlers = m && m.get && m.get('abort');
+            if (handlers && typeof handlers.length === 'number') {
+              maxObservedListeners = Math.max(maxObservedListeners, handlers.length);
+            }
+          }
+        },
+        logger: silentLogger(),
+        projectName: 't',
+        activeIntervalMs: 1,
+        idleIntervalMs: 1,
+        maxTicks: 50,
+      });
+    } finally {
+      process.removeListener('warning', onWarning);
+    }
+    assert.strictEqual(
+      warningSeen,
+      false,
+      'MaxListenersExceededWarning fired — abort listeners are leaking per tick'
+    );
+    // Listener count cap (when introspection is available) is at most 1
+    // because we register a single run-lifetime listener.
+    if (maxObservedListeners > 0) {
+      assert.ok(
+        maxObservedListeners <= 1,
+        `expected <=1 abort listener, observed ${maxObservedListeners}`
+      );
+    }
+  } finally {
+    rmrf(dir);
+  }
+});
+
+// =========================================================================
+// AG4 — todo 105 resume reconciliation-aware sweep
+// =========================================================================
+
+test('AG4a [todo 105 cell 1] resume preserves .pending-<name> when tab is alive (waiting for prompt)', async () => {
+  const dir = mkTmp('orch-AG4a');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, {
+      phases: { 'phase-1': { status: 'spawning', dispatched_at: '2026-01-01T00:00:00Z' } },
+    });
+    const orchDir = path.join(dir, 'docs', 'orchestration');
+    fs.mkdirSync(orchDir, { recursive: true });
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const flagPath = path.join(orchDir, '.pending-orch-phase-1-impl');
+    fs.writeFileSync(flagPath, 'prompt-content');
+    // Inject a pid runner that reports the session as live.
+    const fakePidRunner = () =>
+      JSON.stringify([
+        {
+          ProcessId: 12345,
+          CommandLine: 'claude --name orch-phase-1-impl',
+        },
+      ]);
+    await O.runOrchestrator({
+      manifestPath: mp,
+      resume: true,
+      _spawnSession: makeFakeSpawnSession(),
+      _generatePrompt: makeFakeGenerate(),
+      _checkHealth: () => makeStubHealth({ pidAlive: true }),
+      _pidRunner: fakePidRunner,
+      _sleep: () => Promise.resolve(),
+      logger: silentLogger(),
+      projectName: 't',
+      maxTicks: 0,
+    });
+    assert.ok(
+      fs.existsSync(flagPath),
+      'cell 1: live PID + flag present → flag must be preserved'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AG4b [todo 105 cell 3] resume sweeps orphan .pending-<name> when no live PID', async () => {
+  const dir = mkTmp('orch-AG4b');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, {
+      phases: { 'phase-1': { status: 'spawning', dispatched_at: '2026-01-01T00:00:00Z' } },
+    });
+    const orchDir = path.join(dir, 'docs', 'orchestration');
+    fs.mkdirSync(orchDir, { recursive: true });
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const flagPath = path.join(orchDir, '.pending-orch-phase-1-impl');
+    fs.writeFileSync(flagPath, 'stale-prompt');
+    // pid runner returns no matching session.
+    await O.runOrchestrator({
+      manifestPath: mp,
+      resume: true,
+      _spawnSession: makeFakeSpawnSession(),
+      _generatePrompt: makeFakeGenerate(),
+      _checkHealth: () => makeStubHealth({ pidAlive: false }),
+      _pidRunner: () => '[]',
+      _sleep: () => Promise.resolve(),
+      logger: silentLogger(),
+      projectName: 't',
+      maxTicks: 0,
+    });
+    assert.ok(
+      !fs.existsSync(flagPath),
+      'cell 3: no live PID + orphan flag → flag must be swept'
+    );
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AG4c [todo 105 null-pidSnapshot] resume DEFERS sweep entirely when buildPidSnapshot returns null', async () => {
+  const dir = mkTmp('orch-AG4c');
+  try {
+    const mp = writeManifest(dir, makeBaseManifest());
+    writeStatus(mp, {
+      phases: { 'phase-1': { status: 'spawning', dispatched_at: '2026-01-01T00:00:00Z' } },
+    });
+    const orchDir = path.join(dir, 'docs', 'orchestration');
+    fs.mkdirSync(orchDir, { recursive: true });
+    fs.mkdirSync(path.join(dir, 'docs', 'orchestration', 'templates'), { recursive: true });
+    const flagPath = path.join(orchDir, '.pending-orch-phase-1-impl');
+    fs.writeFileSync(flagPath, 'prompt');
+    // pid runner THROWS → buildPidSnapshot returns null → sweep defers.
+    await O.runOrchestrator({
+      manifestPath: mp,
+      resume: true,
+      _spawnSession: makeFakeSpawnSession(),
+      _generatePrompt: makeFakeGenerate(),
+      _checkHealth: () => makeStubHealth({ pidAlive: true }),
+      _pidRunner: () => {
+        throw new Error('WMI unavailable');
+      },
+      _sleep: () => Promise.resolve(),
+      logger: silentLogger(),
+      projectName: 't',
+      maxTicks: 0,
+    });
+    assert.ok(
+      fs.existsSync(flagPath),
+      'null pidSnapshot must DEFER the sweep — flag remains'
     );
   } finally {
     rmrf(dir);
@@ -4817,12 +5900,17 @@ test('AK2 [codex round 20 P2] flag for THIS dispatch is not deleted by the sweep
         _spawnSession: makeFakeSpawnSession(),
         _generatePrompt: makeFakeGenerate({ promptText: '# new prompt' }),
         _runUpdate: makeFakeRunUpdate(),
+        _spawnToken: 'ak2-token',
         logger: silentLogger(),
         projectName: 'p',
       }
     );
     // The flag must be the NEW prompt (rename overwrote the same-name flag).
-    assert.strictEqual(fs.readFileSync(samePath, 'utf8'), '# new prompt');
+    // Todo 099: every flag now carries a spawn-token header.
+    assert.strictEqual(
+      fs.readFileSync(samePath, 'utf8'),
+      '# spawn_token: ak2-token\n# new prompt'
+    );
   } finally {
     rmrf(dir);
   }
@@ -4832,10 +5920,16 @@ test('AK2 [codex round 20 P2] flag for THIS dispatch is not deleted by the sweep
 // AL — codex round 21 regression tests
 // =========================================================================
 
-test('AL1 [codex round 21 P2] tmp flag basename does NOT match the hook FLAG_NAME_RE', () => {
-  // The hook's FLAG_NAME_RE is /^\.pending-[A-Za-z0-9._-]+$/.
-  // Our tmp prefix is `.flagtmp-` which must NOT match.
-  const FLAG_NAME_RE = /^\.pending-[A-Za-z0-9._-]+$/;
+test('AL1 [codex round 21 P2 + todo 107.b] tmp flag basename does NOT match the hook FLAG_NAME_RE (imported from source-of-truth)', () => {
+  // Todo 107.b: import FLAG_NAME_RE from `../hooks/session-start`
+  // instead of duplicating the regex literal here. If the source-of-
+  // truth regex changes (e.g. to add a new ID character class),
+  // this test must follow automatically — copying the literal
+  // silently de-syncs invariant coverage from the source. The hook
+  // and parse-manifest's VALID_ID_RE already share the class via
+  // the docs/todos/006 / 027 contract; this test is the
+  // orchestrator-side mirror.
+  const { FLAG_NAME_RE } = require('../hooks/session-start');
   const goodTmp = '.flagtmp-orch-phase-1-impl-1234-5678';
   const badLegacyTmp = '.pending-orch-phase-1-impl.tmp-1234-5678';
   assert.strictEqual(FLAG_NAME_RE.test(goodTmp), false);
@@ -4965,13 +6059,11 @@ test('AL5 [codex round 21 P2] bare run with all-completed manifest-status procee
 // AM — codex round 22 regression tests
 // =========================================================================
 
-test('AM1 [codex round 22 P2] shared-workdir secondary lock refuses second concurrent orchestrator', async () => {
+test('AM1 [codex round 22 P2 + todo 107.e] shared-workdir secondary lock refuses second concurrent orchestrator (verifies r1 acquired + cleanup + same-path)', async () => {
   const dir = mkTmp('orch-AM1');
   try {
     const sharedWorkdir = path.join(dir, 'shared');
     fs.mkdirSync(sharedWorkdir, { recursive: true });
-    // Manifest 1 lives in dir/m1, manifest 2 in dir/m2; both target
-    // the same workdir.
     fs.mkdirSync(path.join(dir, 'm1'), { recursive: true });
     fs.mkdirSync(path.join(dir, 'm2'), { recursive: true });
     const mp1 = writeManifest(
@@ -4982,7 +6074,16 @@ test('AM1 [codex round 22 P2] shared-workdir secondary lock refuses second concu
       path.join(dir, 'm2'),
       makeBaseManifest({ workdir: path.relative(path.join(dir, 'm2'), sharedWorkdir) })
     );
-    // Manifest 1 starts first and gets BOTH locks (manifestDir + workdir).
+    const sharedLockPath = path.join(
+      sharedWorkdir,
+      'docs',
+      'orchestration',
+      '.orchestrator.lock'
+    );
+    // Todo 107.e: explicit assertion that r1 actually acquired the
+    // shared-workdir lockfile during its pre-flight. Pre-fix the
+    // test never confirmed this — a regression that silently
+    // skipped the workdir-lock acquire would have passed.
     const r1 = await O.runOrchestrator({
       manifestPath: mp1,
       _spawnSession: makeFakeSpawnSession(),
@@ -4992,25 +6093,34 @@ test('AM1 [codex round 22 P2] shared-workdir secondary lock refuses second concu
       _sleep: () => Promise.resolve(),
       logger: silentLogger(),
       projectName: 't',
-      maxTicks: 0, // immediate exit, but locks acquired during pre-flight
+      maxTicks: 0,
     });
-    // Pre-write a `.orchestrator.lock` at the shared workdir so we
-    // can simulate a second orchestrator hitting it. (After r1
-    // completes its locks are released; we need to plant one for
-    // the test.)
-    const sharedLockPath = path.join(
-      sharedWorkdir,
+    void r1;
+    // After r1 exits cleanly, both its locks should be released.
+    // Todo 107.e: explicit cleanup assertion — neither the shared
+    // workdir lockfile nor the manifestDir lockfile may persist.
+    assert.ok(
+      !fs.existsSync(sharedLockPath),
+      'r1 must release the shared-workdir lockfile on clean exit'
+    );
+    const m1LockPath = path.join(
+      path.dirname(mp1),
       'docs',
       'orchestration',
       '.orchestrator.lock'
     );
+    assert.ok(
+      !fs.existsSync(m1LockPath),
+      'r1 must release the manifestDir lockfile on clean exit'
+    );
+
+    // Plant a "live" lock at the shared workdir to simulate a second
+    // concurrent orchestrator.
     fs.mkdirSync(path.dirname(sharedLockPath), { recursive: true });
     fs.writeFileSync(
       sharedLockPath,
       JSON.stringify({ pid: 99999, startedAt: 'now', hostname: 'h' })
     );
-    // m2 should refuse because the workdir lock is held by an
-    // "alive" PID.
     const r2 = await O.runOrchestrator({
       manifestPath: mp2,
       _killer: () => {}, // alive
@@ -5026,6 +6136,45 @@ test('AM1 [codex round 22 P2] shared-workdir secondary lock refuses second concu
     assert.strictEqual(r2.ok, false);
     assert.strictEqual(r2.summary, 'lock_contention');
     assert.match(r2.error, /workdir/);
+  } finally {
+    rmrf(dir);
+  }
+});
+
+test('AM1b [todo 107.e] same-path workdir (manifestDir IS workdir) does NOT acquire two locks against itself', async () => {
+  // Edge case the pre-fix AM1 test didn't cover: when manifestDir and
+  // workdir resolve to the SAME path (workdir absent or pointing at
+  // manifestDir), the orchestrator must take exactly ONE lock —
+  // re-acquiring the same lockfile would self-conflict. On
+  // case-insensitive filesystems (NTFS, APFS) the comparison should
+  // also collapse path-case differences.
+  const dir = mkTmp('orch-AM1b');
+  try {
+    // No `workdir` field → defaults to manifestDir (same-path case).
+    const mp = writeManifest(dir, makeBaseManifest());
+    const r = await O.runOrchestrator({
+      manifestPath: mp,
+      _spawnSession: makeFakeSpawnSession(),
+      _generatePrompt: makeFakeGenerate(),
+      _checkHealth: () => makeStubHealth({ pidAlive: true }),
+      _pidRunner: () => '[]',
+      _sleep: () => Promise.resolve(),
+      logger: silentLogger(),
+      projectName: 't',
+      maxTicks: 0,
+    });
+    void r;
+    // Neither path's lockfile should remain after a clean exit.
+    const lockPath = path.join(
+      path.dirname(mp),
+      'docs',
+      'orchestration',
+      '.orchestrator.lock'
+    );
+    assert.ok(
+      !fs.existsSync(lockPath),
+      'same-path scenario must release its single lockfile cleanly'
+    );
   } finally {
     rmrf(dir);
   }
