@@ -422,10 +422,9 @@ function buildSpawnCommand({
       );
     }
     if (shell === 'powershell') {
-      // PowerShell: $env:AGENT_FLAG_TOKEN='<token>'; <innerCmd>
-      // The single-quoted form is safe because the token has no
-      // single quotes (validated above).
-      innerCmd = `$env:AGENT_FLAG_TOKEN='${spawnToken}'; ${innerCmd}`;
+      // Windows Terminal splits unescaped semicolons even inside argv.
+      // It removes this escape before passing the script to PowerShell.
+      innerCmd = `$env:AGENT_FLAG_TOKEN='${spawnToken}'\\; ${innerCmd}`;
     } else {
       // cmd: set AGENT_FLAG_TOKEN=<token>&&<innerCmd>
       // No spaces around `&&` — cmd interprets surrounding spaces
