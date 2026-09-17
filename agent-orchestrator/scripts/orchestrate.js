@@ -809,6 +809,9 @@ function pollAllPhases(opts) {
   if (!loaded.ok) {
     return { ok: false, error: loaded.error, errorKind: 'config' };
   }
+  if (loaded.manifest.schema_version === 2) {
+    return { ok: false, error: 'V2 cannot use the legacy tick; live_dispatch_disabled', errorKind: 'config' };
+  }
   const dangling = findDanglingDeps(
     Array.isArray(loaded.manifest.phases) ? loaded.manifest.phases : []
   );
@@ -833,6 +836,9 @@ function pollAllPhases(opts) {
     statusResult.status === null
       ? { phases: Object.create(null) }
       : statusResult.status;
+  if (status.schema_version === 2) {
+    return { ok: false, error: 'V2 state cannot use the legacy tick; live_dispatch_disabled', errorKind: 'config' };
+  }
 
   // Build the session-name list from EVERY phase × role pair the
   // manifest declares. We pre-fetch even for `pending` phases — the
@@ -2368,6 +2374,10 @@ function executeActions(actions, tickState, runState, opts) {
     spawned: 0,
     fatal: null,
   };
+  if (tickState.manifest?.schema_version === 2 || tickState.status?.schema_version === 2) {
+    out.fatal = 'V2 cannot execute legacy actions; live_dispatch_disabled';
+    return out;
+  }
   const logger = opts.logger || makeDefaultLogger();
   const spawnFn = opts._spawnSession || spawnSession;
   const generateFn = opts._generatePrompt || generatePrompt;
@@ -3682,7 +3692,132 @@ function runOneTick(runState, opts) {
  * callers do not need to reference it (the loop releases the lock on
  * normal exit).
  */
+async function acquireLegacyOwner(manifestPath, manifest, opts) {
+  const W = require('./workspace-owner');
+  const manifestDir = path.dirname(path.resolve(manifestPath));
+  const workdir = path.resolve(manifestDir, manifest.workdir || '.');
+  const workspace = W.resolveWorkspace(workdir);
+  return W.acquireWorkspaceOwner(workspace, {
+    _runtimeRoot: opts._runtimeRoot,
+    legacyLockPaths: [
+      path.join(orchDirFor(manifestDir), LOCKFILE_NAME),
+      path.join(orchDirFor(workdir), LOCKFILE_NAME),
+      path.join(orchDirFor(workspace.root), LOCKFILE_NAME),
+    ],
+  });
+}
+
+async function startV2Foundation(opts) {
+  const { prepareV2Manifest } = require('./parse-manifest');
+  const { readState, createStateStore } = require('./state-store');
+  const W = require('./workspace-owner');
+  const persisted = readState(opts.manifestPath);
+  let accepted;
+  let authoring = { status: 'unchanged' };
+  if (persisted?.schema_version === 2 && !opts.rerun) {
+    accepted = persisted.accepted;
+    const authored = loadManifest(opts.manifestPath);
+    if (!authored.ok) authoring = { status: 'invalid', error: authored.error };
+    else {
+      const validation = validate(authored.manifest);
+      const hash = require('node:crypto').createHash('sha256').update(JSON.stringify(authored.manifest)).digest('hex');
+      if (!validation.valid) authoring = { status: 'invalid', errors: validation.errors };
+      else if (hash !== accepted.source_sha256) authoring = { status: 'drifted' };
+    }
+  } else {
+    const loaded = loadManifest(opts.manifestPath);
+    if (!loaded.ok) throw new Error(loaded.error);
+    accepted = prepareV2Manifest(loaded.manifest, opts.manifestPath);
+  }
+  const resolved = prepareV2Manifest(accepted.manifest, accepted.source_path);
+  const declaredTargets = [resolved, ...resolved.phases.flatMap((phase) => phase.agents)];
+  const acceptedTargets = [accepted, ...accepted.phases.flatMap((phase) => phase.agents)];
+  for (const [i, target] of acceptedTargets.entries()) {
+    if (W.resolveWorkspace(target.workdir).key !== target.workspace.key ||
+        W.canonicalPath(target.workdir) !== target.workdir ||
+        declaredTargets[i].workdir !== target.workdir ||
+        declaredTargets[i].workspace.key !== target.workspace.key) {
+      throw new Error(`accepted workdir identity changed: ${target.workdir}`);
+    }
+  }
+  const manifestDir = path.dirname(path.resolve(opts.manifestPath));
+  const owner = await W.acquireWorkspaceOwner(accepted.workspace, {
+    _runtimeRoot: opts._runtimeRoot,
+    _probeLegacyProcess: opts._probeLegacyProcess,
+    legacyLockPaths: [
+      path.join(orchDirFor(manifestDir), LOCKFILE_NAME),
+      path.join(orchDirFor(accepted.workdir), LOCKFILE_NAME),
+      path.join(orchDirFor(accepted.workspace.root), LOCKFILE_NAME),
+    ],
+  });
+  try {
+    const store = createStateStore({ manifestPath: opts.manifestPath, owner, _fs: opts._stateFs });
+    const state = opts.rerun
+      ? store.rerun({ expectedRevision: persisted?.revision, accepted })
+      : store.initialize(accepted);
+    const scaffold = scaffoldProtocol({ manifestPath: opts.manifestPath, accepted: state.accepted, runId: state.run_id, owner, pluginDir: opts.pluginDir });
+    if (!scaffold.ok) throw new Error(scaffold.error || 'V2 run scaffold failed');
+    owner.setReadiness('live_dispatch_disabled');
+    return { owner, store, state, authoring, summary: 'live_dispatch_disabled' };
+  } catch (error) {
+    await owner.release();
+    throw error;
+  }
+}
+
 async function runOrchestrator(opts) {
+  if (!opts || typeof opts.manifestPath !== 'string' || !opts.manifestPath.trim()) {
+    throw new Error('runOrchestrator: manifestPath is required (non-empty string)');
+  }
+  const logger = opts.logger || makeDefaultLogger();
+  let owner;
+  try {
+    const status = loadStatus(opts.manifestPath);
+    if (!status.ok) throw new Error(status.error);
+    const loaded = (opts._loadManifest || loadManifest)(opts.manifestPath);
+    const v2State = status.status?.schema_version === 2;
+    if (!v2State && !loaded.ok) throw new Error(loaded.error);
+    if (v2State || loaded.manifest?.schema_version === 2) {
+      if (opts.dryRun) {
+        const accepted = v2State && !opts.rerun ? status.status.accepted
+          : require('./parse-manifest').prepareV2Manifest(loaded.manifest, opts.manifestPath);
+        return { ok: true, summary: 'live_dispatch_disabled', dryRun: true, accepted, history: [] };
+      }
+      const runtime = await startV2Foundation(opts);
+      owner = runtime.owner;
+      logger('warn', 'V2 accepted state is ready; live_dispatch_disabled until engine adapter acceptance.');
+      if (runtime.authoring.status !== 'unchanged') {
+        logger('warn', `authoring manifest is ${runtime.authoring.status}; continuing with the persisted accepted snapshot`);
+      }
+      const limit = Number.isSafeInteger(opts.maxTicks) ? opts.maxTicks : Infinity;
+      for (let tick = 1; tick < limit && !opts.signal?.aborted; tick++) {
+        require('./workspace-owner').assertOwnership(owner, runtime.state.workspace);
+        await new Promise((resolve) => {
+          const finish = () => { clearTimeout(timer); opts.signal?.removeEventListener('abort', finish); resolve(); };
+          const timer = setTimeout(finish, opts.idleIntervalMs || 1000);
+          opts.signal?.addEventListener('abort', finish, { once: true });
+          if (opts.signal?.aborted) finish();
+        });
+      }
+      return { ok: true, summary: 'live_dispatch_disabled', run_id: runtime.state.run_id, revision: runtime.state.revision, authoring: runtime.authoring, history: [] };
+    }
+    if (loaded.manifest?.schema_version !== undefined && loaded.manifest.schema_version !== 1) {
+      throw new Error('unsupported manifest schema_version; use 1 or 2');
+    }
+    if (opts.rerun) throw new Error('--rerun is only supported for explicit V2 runs');
+    if (!opts.dryRun) {
+      owner = await (opts._acquireLegacyOwner || acquireLegacyOwner)(opts.manifestPath, loaded.manifest, opts);
+    }
+    return await runLegacyOrchestrator(opts);
+  } catch (error) {
+    logger('error', error.message);
+    return { ok: false, summary: error.code === 'ELOCKED' ? 'lock_contention' : 'preflight_failed', error: error.message, code: error.code === 'ELOCKED' ? 2 : 1, history: [] };
+  } finally {
+    if (owner) await owner.release();
+  }
+}
+
+async function runLegacyOrchestrator(opts) {
   if (!opts || typeof opts.manifestPath !== 'string' || opts.manifestPath.trim() === '') {
     throw new Error('runOrchestrator: manifestPath is required (non-empty string)');
   }
@@ -4639,6 +4774,8 @@ function printHelp() {
       '',
       'Options:',
       '  --resume                          read manifest-status, skip completed phases, respawn crashed',
+      '  --rerun                           V2: explicitly create a new run, retaining prior history',
+      '                                    V2 ordinary starts retain the accepted run; live dispatch is disabled.',
       '  --once                            run a single tick then exit (testing aid).',
       '                                    Equivalent to `--max-ticks 1`. When both flags',
       '                                    are passed, the LATER flag on the command line',
@@ -4658,7 +4795,7 @@ function printHelp() {
       '  -h | --help                       this message',
       '',
       'Exit codes:',
-      '  0 — every phase reached `completed`',
+      '  0 — V1: every phase completed; V2: accepted state ready (live_dispatch_disabled)',
       '  1 — one or more phases failed, or fatal error',
       '  2 — refused to start (lockfile contention)',
     ].join('\n')
@@ -4754,6 +4891,9 @@ function parseCliArgs(argv) {
         break;
       case '--resume':
         out.resume = true;
+        break;
+      case '--rerun':
+        out.rerun = true;
         break;
       case '--once':
         // Todo 108.e: removed write-only `out.once = true`. The
@@ -4884,6 +5024,7 @@ async function main() {
   const opts = {
     manifestPath: path.resolve(args.manifestPath),
     resume: args.resume,
+    rerun: args.rerun,
     maxTicks: args.maxTicks,
     activeIntervalMs: args.activeIntervalMs,
     idleIntervalMs: args.idleIntervalMs,
@@ -4943,6 +5084,7 @@ module.exports = {
   LOCKFILE_NAME,
   // Public functions
   runOrchestrator,
+  startV2Foundation,
   runOneTick,
   pollAllPhases,
   decideTickActions,

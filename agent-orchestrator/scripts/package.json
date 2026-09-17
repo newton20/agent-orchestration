@@ -12,7 +12,7 @@
     "orchestrate": "./orchestrate.js"
   },
   "scripts": {
-    "test": "node --test parse-manifest.test.js scaffold-protocol.test.js spawn-session.test.js generate-prompt.test.js check-health.test.js orchestrate.test.js"
+    "test": "node --test parse-manifest.test.js scaffold-protocol.test.js spawn-session.test.js generate-prompt.test.js check-health.test.js orchestrate.test.js state-store.test.js workspace-owner.test.js"
   },
   "dependencies": {
     "js-yaml": "^4.1.0"

@@ -33,7 +33,148 @@ const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const yaml = require('js-yaml');
 
-const O = require('./orchestrate');
+const ActualOrchestrator = require('./orchestrate');
+const O = {
+  ...ActualOrchestrator,
+  runOrchestrator: (opts) => ActualOrchestrator.runOrchestrator({
+    _acquireLegacyOwner: async () => ({ release: async () => {} }),
+    ...opts,
+  }),
+};
+const { runtimeFixture } = require('./test-support/runtime-fixture');
+
+test('U1 V2 startup persists accepted state without reaching legacy dispatch, and restart ignores invalid authoring', async (t) => {
+  const fx = runtimeFixture(t);
+  const opts = { manifestPath: fx.manifestPath, maxTicks: 1, _runtimeRoot: fx.runtimeRoot, logger: () => {},
+    _spawnSession: () => assert.fail('V1 launch reached'),
+    _scaffoldProtocol: () => assert.fail('V1 scaffold reached') };
+  const first = await O.runOrchestrator(opts);
+  assert.equal(first.summary, 'live_dispatch_disabled', JSON.stringify(first));
+  const saved = readStatus(fx.manifestPath);
+  assert.equal(saved.schema_version, 2);
+  fs.writeFileSync(fx.manifestPath, 'invalid: [');
+  const resumed = await O.runOrchestrator(opts);
+  assert.equal(resumed.summary, 'live_dispatch_disabled', JSON.stringify(resumed));
+  assert.equal(resumed.authoring.status, 'invalid');
+  assert.deepEqual(readStatus(fx.manifestPath), saved);
+  fs.writeFileSync(fx.manifestPath, yaml.dump({ ...fx.manifest, name: 'edited' }));
+  assert.equal((await O.runOrchestrator(opts)).authoring.status, 'drifted');
+  assert.deepEqual(readStatus(fx.manifestPath), saved);
+  const rerun = await O.runOrchestrator({ ...opts, rerun: true });
+  assert.notEqual(rerun.run_id, saved.run_id);
+  assert.equal(readStatus(fx.manifestPath).history[0].run_id, saved.run_id);
+});
+
+test('U1 V2 refuses active V1 and unsupported state without touching either file', async (t) => {
+  const fx = runtimeFixture(t);
+  for (const status of [{ phases: { p1: { status: 'spawning' } } }, { schema_version: 7, phases: {} }]) {
+    const statusPath = writeStatus(fx.manifestPath, status);
+    const before = fs.readFileSync(statusPath, 'utf8');
+    const result = await O.runOrchestrator({ manifestPath: fx.manifestPath, maxTicks: 1, _runtimeRoot: fx.runtimeRoot, logger: () => {},
+      _spawnSession: () => assert.fail('launch reached') });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /active|V1|schema|state/i);
+    assert.equal(fs.readFileSync(statusPath, 'utf8'), before);
+  }
+});
+
+test('U1 direct V1 tick and action entry points cannot dispatch V2', (t) => {
+  const fx = runtimeFixture(t);
+  const tick = O.runOneTick({}, { manifestPath: fx.manifestPath, logger: () => {},
+    _checkHealth: () => assert.fail('legacy health reached'),
+    _spawnSession: () => assert.fail('legacy spawn reached') });
+  assert.equal(tick.halt, true);
+  assert.match(tick.error, /V2|schema|disabled/i);
+  const actions = O.executeActions([{ type: 'persist', phaseId: 'p1', updates: { status: 'running' } }],
+    { manifest: fx.manifest }, {}, { logger: () => {}, _runUpdate: () => assert.fail('legacy writer reached') });
+  assert.match(actions.fatal, /V2|schema|disabled/i);
+});
+
+test('U1 accepted declarations reject junction retargeting on restart', async (t) => {
+  const fx = runtimeFixture(t);
+  const other = runtimeFixture(t);
+  const alias = path.join(fx.root, 'target');
+  fs.symlinkSync(fx.workdir, alias, 'junction');
+  fx.manifest.phases[0].agent.workdir = alias;
+  fs.writeFileSync(fx.manifestPath, yaml.dump(fx.manifest));
+  const opts = { manifestPath: fx.manifestPath, maxTicks: 1, _runtimeRoot: fx.runtimeRoot, logger: () => {} };
+  assert.equal((await O.runOrchestrator(opts)).ok, true);
+  const state = readStatus(fx.manifestPath);
+  fs.rmdirSync(alias);
+  fs.symlinkSync(other.workdir, alias, 'junction');
+  const restart = await O.runOrchestrator(opts);
+  assert.equal(restart.ok, false);
+  assert.match(restart.error, /identity|workdir/i);
+  assert.deepEqual(readStatus(fx.manifestPath), state);
+});
+
+test('U1 actual V1 and V2 runners and different manifest locations share the owner', async (t) => {
+  const fx = runtimeFixture(t);
+  const runtime = await ActualOrchestrator.startV2Foundation({ manifestPath: fx.manifestPath, _runtimeRoot: fx.runtimeRoot });
+  t.after(() => runtime.owner.release());
+  const nested = path.join(fx.workdir, 'nested');
+  fs.mkdirSync(nested);
+  const secondPath = path.join(nested, 'other.yaml');
+  for (const version of [1, 2]) {
+    fs.writeFileSync(secondPath, yaml.dump({ ...fx.manifest, schema_version: version, workdir: '..' }));
+    const result = await ActualOrchestrator.runOrchestrator({
+      manifestPath: secondPath, maxTicks: 1, _runtimeRoot: fx.runtimeRoot, logger: () => {},
+      _spawnSession: () => assert.fail('contending runner dispatched'),
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.summary, 'lock_contention', JSON.stringify(result));
+    assert.equal(fs.existsSync(require('./parse-manifest').statusPathFor(secondPath)), false);
+  }
+});
+
+test('U1 startup write failure releases ownership and preserves absence of accepted state', async (t) => {
+  const fx = runtimeFixture(t);
+  const options = { manifestPath: fx.manifestPath, maxTicks: 1, _runtimeRoot: fx.runtimeRoot, logger: () => {},
+    _stateFs: { renameSync: () => { throw new Error('injected write failure'); } } };
+  const failed = await O.runOrchestrator(options);
+  assert.equal(failed.ok, false);
+  assert.match(failed.error, /write failure/);
+  assert.equal(readStatus(fx.manifestPath), null);
+  const retry = await O.runOrchestrator({ ...options, _stateFs: undefined });
+  assert.equal(retry.summary, 'live_dispatch_disabled');
+});
+
+test('U1 persisted run-scoped scaffold preserves artifacts and events across restart', async (t) => {
+  const fx = runtimeFixture(t);
+  const first = await O.runOrchestrator({ manifestPath: fx.manifestPath, maxTicks: 1, _runtimeRoot: fx.runtimeRoot, logger: () => {} });
+  const directory = path.join(fx.workdir, 'docs', 'orchestration', 'runs', first.run_id);
+  const artifact = path.join(directory, 'phases', 'p1', 'notes.md');
+  const log = path.join(directory, 'logs', 'events.jsonl');
+  fs.writeFileSync(artifact, 'keep notes');
+  fs.writeFileSync(log, '{"keep":"event"}\n');
+  await O.runOrchestrator({ manifestPath: fx.manifestPath, maxTicks: 1, _runtimeRoot: fx.runtimeRoot, logger: () => {} });
+  assert.equal(fs.readFileSync(artifact, 'utf8'), 'keep notes');
+  assert.equal(fs.readFileSync(log, 'utf8'), '{"keep":"event"}\n');
+});
+
+test('U1 V2 activation checks real primary and workdir legacy locks before creating state', async (t) => {
+  const fx = runtimeFixture(t);
+  const manifestDirectory = path.join(fx.root, 'authoring');
+  fs.mkdirSync(manifestDirectory);
+  const manifestPath = path.join(manifestDirectory, 'manifest.yaml');
+  fs.writeFileSync(manifestPath, yaml.dump({ ...fx.manifest, workdir: fx.workdir }));
+  const locks = [manifestDirectory, fx.workdir].map((directory) => path.join(directory, 'docs', 'orchestration', '.orchestrator.lock'));
+  for (const lock of locks) {
+    fs.mkdirSync(path.dirname(lock), { recursive: true });
+    fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, hostname: os.hostname() }));
+    const result = await O.runOrchestrator({ manifestPath, maxTicks: 1, _runtimeRoot: fx.runtimeRoot, logger: () => {} });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /legacy owner is live/);
+    assert.ok(fs.existsSync(lock), 'live metadata must not be drained');
+    assert.equal(readStatus(manifestPath), null);
+    fs.unlinkSync(lock);
+  }
+  for (const lock of locks) fs.writeFileSync(lock, JSON.stringify({ pid: 42, hostname: os.hostname() }));
+  const drained = await O.runOrchestrator({ manifestPath, maxTicks: 1, _runtimeRoot: fx.runtimeRoot, logger: () => {},
+    _probeLegacyProcess: () => ({ state: 'dead' }) });
+  assert.equal(drained.ok, true, JSON.stringify(drained));
+  assert.ok(locks.every((lock) => !fs.existsSync(lock)));
+});
 
 // -------------------- Helpers --------------------
 

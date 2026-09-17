@@ -28,8 +28,13 @@
 const fs = require('fs');
 const path = require('path');
 const yaml = require('js-yaml');
+const { createHash } = require('node:crypto');
 
 const KNOWN_SHELLS = ['powershell', 'cmd'];
+const V2_ENGINES = Object.freeze(['claude', 'agency-claude', 'agency-copilot']);
+const V2_ACCESS = Object.freeze(['mutating', 'read-only']);
+const V2_DEFAULT_PHASE_TIMEOUT_MINUTES = 60;
+const V2_DEFAULT_HEARTBEAT_TIMEOUT_MINUTES = 5;
 // Todo 090: 'spawning' is a transient status the orchestrator writes
 // BEFORE wt new-tab fires and replaces with 'running' AFTER the spawn
 // + post-persist completes. A SIGTERM / Ctrl+C / orchestrator crash
@@ -88,6 +93,7 @@ const VALID_PERMISSION_MODES = Object.freeze([
   'bypassPermissions',
 ]);
 const KNOWN_TOP_LEVEL = new Set([
+  'schema_version',
   'name',
   'workdir',
   'launcher',
@@ -239,10 +245,18 @@ function validate(manifest) {
 
   const push = (path, message) => errors.push({ path, message });
   const warn = (path, message) => warnings.push({ path, message });
+  if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
+    return { valid: false, errors: [{ path: '', message: 'manifest must be an object' }], warnings };
+  }
+  if (manifest.schema_version !== undefined && manifest.schema_version !== 1 && manifest.schema_version !== 2) {
+    push('schema_version', 'unsupported schema_version; omit it or use 1 for V1, or explicit 2 for V2');
+  }
+  const v2 = manifest.schema_version === 2;
+  if (v2) validateV2Fields(manifest, push);
 
   // ---- top-level
   for (const k of Object.keys(manifest)) {
-    if (!KNOWN_TOP_LEVEL.has(k))
+    if (!KNOWN_TOP_LEVEL.has(k) && !(v2 && ['terminal', 'limits'].includes(k)))
       warn(k, `unknown top-level field "${k}" — ignored (forward-compat)`);
   }
 
@@ -272,12 +286,12 @@ function validate(manifest) {
 
   // ---- defaults
   if (manifest.defaults !== undefined) {
-    if (typeof manifest.defaults !== 'object' || Array.isArray(manifest.defaults))
+    if (!manifest.defaults || typeof manifest.defaults !== 'object' || Array.isArray(manifest.defaults))
       push('defaults', 'must be an object');
     else {
       const D = manifest.defaults;
       for (const k of Object.keys(D)) {
-        if (!KNOWN_DEFAULTS.has(k))
+        if (!KNOWN_DEFAULTS.has(k) && !(v2 && k === 'engine'))
           warn(`defaults.${k}`, `unknown defaults field "${k}"`);
       }
       if (D.phase_timeout_minutes !== undefined)
@@ -306,7 +320,7 @@ function validate(manifest) {
           );
       }
       if (D.notifications !== undefined) {
-        if (typeof D.notifications !== 'object' || Array.isArray(D.notifications))
+        if (!D.notifications || typeof D.notifications !== 'object' || Array.isArray(D.notifications))
           push('defaults.notifications', 'must be an object');
         else {
           if (
@@ -412,7 +426,7 @@ function validate(manifest) {
     }
 
     if (p.review_loop !== undefined) {
-      if (typeof p.review_loop !== 'object' || Array.isArray(p.review_loop))
+      if (!p.review_loop || typeof p.review_loop !== 'object' || Array.isArray(p.review_loop))
         push(`${p_}.review_loop`, 'must be an object');
       else {
         if (
@@ -436,9 +450,10 @@ function validate(manifest) {
     if (!hasAgent && !hasAgents)
       push(`${p_}`, 'must define either `agent` (shorthand) or `agents` (list)');
     else if (hasAgent && hasAgents)
-      warn(
+      (v2 ? push : warn)(
         `${p_}`,
-        'both `agent` and `agents` defined — `agents` takes precedence, `agent` ignored'
+        v2 ? 'V2 rejects both `agent` and `agents`; choose one form'
+          : 'both `agent` and `agents` defined — `agents` takes precedence, `agent` ignored'
       );
     if (hasAgent) validateAgent(p.agent, `${p_}.agent`, push);
     if (hasAgents) {
@@ -460,6 +475,105 @@ function validate(manifest) {
   }
 
   return { valid: false, errors, warnings };
+}
+
+function validateV2Fields(manifest, push) {
+  const object = (value) => value && typeof value === 'object' && !Array.isArray(value);
+  const migrationFields = new Set(['launcher', 'binary', 'executable', 'command', 'args', 'flags', 'passthrough_flags', 'shell_args', 'auto_mode_flag']);
+  const rejectLaunchFields = (value, prefix) => {
+    if (!object(value)) return;
+    for (const key of Object.keys(value)) {
+      if (migrationFields.has(key)) push(prefix ? `${prefix}.${key}` : key,
+        'V2 rejects legacy launcher/raw flags and arbitrary binaries; migrate to defaults.engine / agent.engine and terminal.shell, or retain schema_version: 1');
+    }
+  };
+  rejectLaunchFields(manifest, '');
+  const defaults = object(manifest.defaults) ? manifest.defaults : {};
+  if (!V2_ENGINES.includes(defaults.engine)) push('defaults.engine', `V2 requires one of ${V2_ENGINES.join(' | ')}`);
+  rejectLaunchFields(defaults, 'defaults');
+  for (const key of ['terminal', 'limits']) {
+    if (manifest[key] !== undefined && !object(manifest[key])) push(key, 'must be an object');
+  }
+  const terminal = object(manifest.terminal) ? manifest.terminal : {};
+  if (terminal.shell !== undefined && !KNOWN_SHELLS.includes(terminal.shell)) push('terminal.shell', 'must be powershell | cmd');
+  for (const key of Object.keys(terminal)) {
+    if (key !== 'shell') push(`terminal.${key}`, 'V2 terminal only supports shell; engine arguments belong to supported adapters');
+  }
+  const limits = object(manifest.limits) ? manifest.limits : {};
+  const cap = limits.max_timeout_minutes === undefined ? 1440 : limits.max_timeout_minutes;
+  const timeout = (value, field) => {
+    if (!Number.isSafeInteger(value) || value <= 0) push(field, 'V2 timeout must be a positive integer');
+    else if (value > cap) push(field, `exceeds limits.max_timeout_minutes (${cap})`);
+  };
+  if (!Number.isSafeInteger(cap) || cap <= 0) push('limits.max_timeout_minutes', 'must be a positive integer');
+  for (const key of Object.keys(limits)) {
+    if (key !== 'max_timeout_minutes') push(`limits.${key}`, 'unknown V2 limit');
+  }
+  for (const field of ['phase_timeout_minutes', 'heartbeat_timeout_minutes']) {
+    const fallback = field === 'phase_timeout_minutes' ? V2_DEFAULT_PHASE_TIMEOUT_MINUTES : V2_DEFAULT_HEARTBEAT_TIMEOUT_MINUTES;
+    timeout(defaults[field] === undefined ? fallback : defaults[field], `defaults.${field}`);
+  }
+  if (manifest.workdir !== undefined && (typeof manifest.workdir !== 'string' || !manifest.workdir.trim())) push('workdir', 'must be a non-empty path');
+  if (!Array.isArray(manifest.phases)) return;
+  manifest.phases.forEach((phase, i) => {
+    if (!object(phase)) return;
+    rejectLaunchFields(phase, `phases[${i}]`);
+    if (phase.timeout_minutes !== undefined) timeout(phase.timeout_minutes, `phases[${i}].timeout_minutes`);
+    const agents = phase.agents !== undefined ? phase.agents : [phase.agent];
+    if (!Array.isArray(agents)) return;
+    const roles = new Set();
+    agents.forEach((agent, j) => {
+      if (!object(agent)) return;
+      const field = phase.agents !== undefined ? `phases[${i}].agents[${j}]` : `phases[${i}].agent`;
+      rejectLaunchFields(agent, field);
+      if (!VALID_ROLES.includes(agent.role)) push(`${field}.role`, `must be one of ${VALID_ROLES.join(' | ')}`);
+      if (roles.has(agent.role)) push(`${field}.role`, 'duplicate role in a V2 phase');
+      roles.add(agent.role);
+      if (agent.engine !== undefined && !V2_ENGINES.includes(agent.engine)) push(`${field}.engine`, `must be one of ${V2_ENGINES.join(' | ')}`);
+      if (agent.access !== undefined && !V2_ACCESS.includes(agent.access)) push(`${field}.access`, 'must be mutating | read-only');
+      if (agent.workdir !== undefined && (typeof agent.workdir !== 'string' || !agent.workdir.trim())) push(`${field}.workdir`, 'must be a non-empty path');
+    });
+  });
+}
+
+function prepareV2Manifest(manifest, manifestPath) {
+  const result = validate(manifest);
+  if (!result.valid) throw new Error(`invalid V2 manifest: ${result.errors.map((e) => `${e.path}: ${e.message}`).join('; ')}`);
+  if (manifest.schema_version !== 2) throw new Error('V2 requires explicit schema_version: 2');
+  const dangling = findDanglingDeps(manifest.phases);
+  if (dangling.length) throw new Error(`invalid V2 dependencies: ${dangling.map((e) => e.message).join('; ')}`);
+  const { resolveWorkspace, canonicalPath } = require('./workspace-owner');
+  const sourcePath = path.resolve(manifestPath);
+  const manifestDir = path.dirname(sourcePath);
+  const resolveWorkdir = (value, field) => {
+    try { return canonicalPath(path.resolve(manifestDir, value)); } catch (error) {
+      throw new Error(`cannot resolve ${field}: ${error.message}`);
+    }
+  };
+  const workdir = resolveWorkdir(manifest.workdir || '.', 'workdir');
+  const workspace = resolveWorkspace(workdir);
+  const normalized = JSON.parse(JSON.stringify(manifest));
+  normalized.defaults = {
+    ...normalized.defaults,
+    phase_timeout_minutes: normalized.defaults.phase_timeout_minutes ?? V2_DEFAULT_PHASE_TIMEOUT_MINUTES,
+    heartbeat_timeout_minutes: normalized.defaults.heartbeat_timeout_minutes ?? V2_DEFAULT_HEARTBEAT_TIMEOUT_MINUTES,
+  };
+  normalized.terminal = { shell: manifest.terminal?.shell || 'powershell' };
+  normalized.limits = { max_timeout_minutes: manifest.limits?.max_timeout_minutes ?? 1440 };
+  const phases = normalizePhases(normalized);
+  phases.forEach((phase, i) => {
+    const rawAgents = manifest.phases[i].agents || [manifest.phases[i].agent];
+    phase.agents.forEach((agent, j) => {
+      agent.workdir = rawAgents[j].workdir === undefined ? workdir
+        : resolveWorkdir(rawAgents[j].workdir, `phases[${i}].agents[${j}].workdir`);
+      agent.workspace = resolveWorkspace(agent.workdir);
+    });
+  });
+  return {
+    source_path: sourcePath,
+    source_sha256: createHash('sha256').update(JSON.stringify(manifest)).digest('hex'),
+    manifest: normalized, phases, execution_order: result.executionOrder, workspace, workdir,
+  };
 }
 
 /**
@@ -634,6 +748,7 @@ function findCycle(ids, deps, residue) {
 // -------------------- Dangling dep check (runs before graph) --------------------
 
 function findDanglingDeps(phases) {
+  phases = Array.isArray(phases) ? phases.filter((p) => p && typeof p === 'object') : [];
   const ids = new Set(phases.map((p) => p.id).filter(Boolean));
   const dangling = [];
   phases.forEach((p, i) => {
@@ -669,11 +784,11 @@ function normalizePhases(manifest) {
         ? p.timeout_minutes
         : D.phase_timeout_minutes !== undefined
           ? D.phase_timeout_minutes
-          : null;
+          : manifest.schema_version === 2 ? V2_DEFAULT_PHASE_TIMEOUT_MINUTES : null;
     const agents = p.agents
-      ? p.agents.map((a) => normalizeAgent(a, D))
+      ? p.agents.map((a) => normalizeAgent(a, D, manifest.schema_version === 2))
       : p.agent
-        ? [normalizeAgent(p.agent, D)]
+        ? [normalizeAgent(p.agent, D, manifest.schema_version === 2)]
         : [];
     return {
       id: p.id,
@@ -693,12 +808,13 @@ function normalizePhases(manifest) {
   });
 }
 
-function normalizeAgent(a, defaults) {
+function normalizeAgent(a, defaults, v2 = false) {
   return {
     role: a.role || 'impl',
     model: a.model || defaults.model || null,
     prompt_file: a.prompt_file || null,
     plugin_dir: a.plugin_dir || null,
+    ...(v2 ? { engine: a.engine || defaults.engine, access: a.access || 'mutating', workdir: a.workdir ?? null } : {}),
   };
 }
 
@@ -725,13 +841,21 @@ function runValidate(manifestPath) {
     process.exit(1);
   }
 
-  const phasesResolved = normalizePhases(manifest);
+  let accepted;
+  try {
+    if (manifest.schema_version === 2) accepted = prepareV2Manifest(manifest, manifestPath);
+  } catch (error) {
+    emit({ valid: false, errors: [{ path: 'workdir', message: error.message }], warnings: result.warnings });
+    process.exit(1);
+  }
+  const phasesResolved = accepted ? accepted.phases : normalizePhases(manifest);
   emit({
     valid: true,
     manifest,
     phases_resolved: phasesResolved,
     execution_order: result.executionOrder,
     warnings: result.warnings,
+    ...(accepted ? { accepted } : {}),
   });
 }
 
@@ -782,6 +906,9 @@ function loadStatus(manifestPath, { _readFileSync, _existsSync } = {}) {
   if (!existsSync(statusPath)) return { ok: true, status: null, statusPath };
   let raw;
   try {
+    if (!_readFileSync && fs.statSync(statusPath).size > require('./state-store').MAX_STATE_BYTES) {
+      throw new Error('status exceeds canonical state size limit');
+    }
     raw = readFileSync(statusPath, 'utf8');
   } catch (e) {
     return {
@@ -808,6 +935,14 @@ function loadStatus(manifestPath, { _readFileSync, _existsSync } = {}) {
     // Empty doc / scalar / array root — treat as no usable status.
     // runUpdate then writes a fresh shape; readers return null.
     return { ok: true, status: null, statusPath };
+  }
+  if (parsed.schema_version !== undefined && parsed.schema_version !== 1) {
+    try {
+      require('./state-store').validateState(parsed);
+      return { ok: true, status: parsed, statusPath };
+    } catch (error) {
+      return { ok: false, error: `invalid versioned state at ${statusPath}: ${error.message}`, statusPath };
+    }
   }
   // Normalize phases. Always produce an Object.create(null) map so
   // downstream `status.phases[id]` indexing is safe regardless of the
@@ -871,6 +1006,15 @@ function runUpdate(manifestPath, phaseId, updates, opts = {}) {
   const writeFileSync = opts._writeFileSync || fs.writeFileSync;
   const renameSync = opts._renameSync || fs.renameSync;
   const unlinkSync = opts._unlinkSync || fs.unlinkSync;
+  // Cached V1 tick data must never overwrite a versioned record on disk.
+  const onDisk = loadStatus(manifestPath);
+  if (!onDisk.ok) return { ok: false, error: onDisk.error };
+  if (onDisk.status?.schema_version !== undefined && onDisk.status.schema_version !== 1) {
+    return { ok: false, error: 'V1 runUpdate cannot mutate V2 state; use the workspace owner state store' };
+  }
+  if (opts._loadedStatus?.schema_version !== undefined && opts._loadedStatus.schema_version !== 1) {
+    return { ok: false, error: 'V1 runUpdate cannot mutate versioned state' };
+  }
 
   let manifest;
   if (opts._loadedManifest !== undefined && opts._loadedManifest !== null) {
@@ -897,6 +1041,9 @@ function runUpdate(manifestPath, phaseId, updates, opts = {}) {
     manifest = loaded.manifest;
   }
 
+  if (manifest.schema_version !== undefined && manifest.schema_version !== 1) {
+    return { ok: false, error: 'V1 runUpdate cannot mutate V2 state; use the workspace owner state store' };
+  }
   if (
     typeof phaseId !== 'string' ||
     UNSAFE_ID_KEYS.has(phaseId) ||
@@ -1113,4 +1260,9 @@ module.exports = {
   VALID_ID_RE,
   VALID_ROLES,
   VALID_PERMISSION_MODES,
+  V2_ENGINES,
+  V2_ACCESS,
+  V2_DEFAULT_PHASE_TIMEOUT_MINUTES,
+  V2_DEFAULT_HEARTBEAT_TIMEOUT_MINUTES,
+  prepareV2Manifest,
 };

@@ -12,6 +12,20 @@ const path = require('node:path');
 const yaml = require('js-yaml');
 
 const { scaffoldProtocol } = require('./scaffold-protocol');
+const { runtimeFixture } = require('./test-support/runtime-fixture');
+
+test('U1 V2 scaffold requires persisted run identity and preserves run-scoped artifacts', (t) => {
+  const fx = runtimeFixture(t);
+  const P = require('./parse-manifest');
+  const accepted = P.prepareV2Manifest(fx.manifest, fx.manifestPath);
+  const missing = scaffoldProtocol({ manifestPath: fx.manifestPath });
+  assert.equal(missing.ok, false);
+  assert.match(missing.error, /run|owner|state/i);
+  const preview = scaffoldProtocol({ manifestPath: fx.manifestPath, accepted, runId: 'run-test', dryRun: true });
+  assert.equal(preview.ok, true);
+  assert.match(preview.protoDir, /runs[\\/]run-test$/);
+  assert.equal(fs.existsSync(preview.protoDir), false);
+});
 
 // Fixture builder: writes a manifest + a plugin-dir with template stubs
 // into a fresh temp dir. Returns paths so tests can inspect results.

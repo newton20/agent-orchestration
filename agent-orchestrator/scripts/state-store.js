@@ -1,0 +1,337 @@
+'use strict';
+
+const fs = require('node:fs');
+const path = require('node:path');
+const yaml = require('js-yaml');
+const { randomUUID, createHash } = require('node:crypto');
+const { assertOwnership, validateWorkspace } = require('./workspace-owner');
+const { statusPathFor, validate, normalizePhases, findDanglingDeps, V2_ENGINES, V2_ACCESS } = require('./parse-manifest');
+
+const STATE_SCHEMA_VERSION = 2;
+const MAX_STATE_BYTES = 16 * 1024 * 1024;
+const SAFE_ID = /^(?!\.+$)[A-Za-z0-9._-]+$/;
+const RESERVED = new Set(['__proto__', 'constructor', 'prototype']);
+const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+const isId = (value) => typeof value === 'string' && SAFE_ID.test(value) && !RESERVED.has(value);
+const positive = (value) => Number.isSafeInteger(value) && value > 0;
+const nonnegative = (value) => Number.isSafeInteger(value) && value >= 0;
+
+function requireShape(condition, message) {
+  if (!condition) throw new Error(`invalid state: ${message}`);
+}
+
+function canonicalJson(value) {
+  const seen = new Set();
+  function visit(item) {
+    if (item === null || typeof item === 'string' || typeof item === 'boolean') return JSON.stringify(item);
+    if (typeof item === 'number' && Number.isFinite(item)) return JSON.stringify(item);
+    if (!isObject(item) && !Array.isArray(item)) throw new Error('state and command payloads must be JSON data');
+    if (seen.has(item)) throw new Error('state and command payloads cannot contain cycles');
+    seen.add(item);
+    let serialized;
+    if (Array.isArray(item)) {
+      serialized = `[${Array.from(item, visit).join(',')}]`;
+    } else {
+      if (![Object.prototype, null].includes(Object.getPrototypeOf(item))) throw new Error('state requires plain JSON objects');
+      const keys = Object.keys(item).sort();
+      if (keys.some((key) => RESERVED.has(key))) throw new Error('state contains a reserved object key');
+      serialized = `{${keys.map((key) => `${JSON.stringify(key)}:${visit(item[key])}`).join(',')}}`;
+    }
+    seen.delete(item);
+    return serialized;
+  }
+  return visit(value);
+}
+
+function clone(value) {
+  return JSON.parse(canonicalJson(value));
+}
+
+function fingerprint(payload) {
+  return createHash('sha256').update(canonicalJson(payload)).digest('hex');
+}
+
+function validateAccepted(accepted) {
+  requireShape(isObject(accepted) && positive(accepted.revision), 'accepted revision is required');
+  requireShape(isObject(accepted.manifest) && accepted.manifest.schema_version === 2, 'accepted manifest must activate V2');
+  const result = validate(accepted.manifest);
+  requireShape(result.valid && findDanglingDeps(accepted.manifest.phases).length === 0, 'accepted manifest validation failed');
+  requireShape(isObject(accepted.manifest.terminal) && isObject(accepted.manifest.limits), 'accepted terminal and timeout cap are required');
+  requireShape(positive(accepted.manifest.defaults.phase_timeout_minutes) && positive(accepted.manifest.defaults.heartbeat_timeout_minutes),
+    'accepted effective timeout defaults are required');
+  requireShape(typeof accepted.source_path === 'string' && path.isAbsolute(accepted.source_path), 'accepted source_path must be absolute');
+  requireShape(/^[a-f0-9]{64}$/.test(accepted.source_sha256), 'accepted source fingerprint is required');
+  requireShape(typeof accepted.workdir === 'string' && path.isAbsolute(accepted.workdir), 'accepted workdir must be absolute');
+  validateWorkspace(accepted.workspace);
+  requireShape(canonicalJson(accepted.execution_order) === canonicalJson(result.executionOrder), 'accepted dependency order mismatch');
+  const normalized = normalizePhases(accepted.manifest);
+  requireShape(Array.isArray(accepted.phases) && accepted.phases.length === normalized.length, 'accepted phases mismatch');
+  normalized.forEach((phase, i) => {
+    const actual = accepted.phases[i];
+    requireShape(isObject(actual) && Array.isArray(actual.agents) && actual.agents.length === phase.agents.length, 'accepted agents mismatch');
+    const { agents, ...fields } = phase;
+    const { agents: actualAgents, ...actualFields } = actual;
+    requireShape(canonicalJson(fields) === canonicalJson(actualFields), 'accepted normalized phase mismatch');
+    actualAgents.forEach((agent, j) => {
+      const { workdir, workspace, ...rest } = agent;
+      const { workdir: declaration, ...expected } = agents[j];
+      requireShape(canonicalJson(rest) === canonicalJson(expected), 'accepted agent configuration mismatch');
+      requireShape(typeof workdir === 'string' && path.isAbsolute(workdir), 'accepted agent workdir must be absolute');
+      validateWorkspace(workspace);
+    });
+  });
+}
+
+function validateLegacyCompleted(record) {
+  requireShape(isObject(record) && (record.schema_version === undefined || record.schema_version === 1), 'unsupported legacy schema');
+  requireShape(isObject(record.phases) && Object.keys(record.phases).length > 0, 'legacy V1 history requires completed phases');
+  for (const [id, phase] of Object.entries(record.phases)) {
+    requireShape(isId(id) && isObject(phase) && phase.status === 'completed',
+      'active or uncorrelated V1 history cannot activate V2; drain and reconcile it explicitly');
+  }
+}
+
+function validateRun(record) {
+  requireShape(isObject(record) && record.schema_version === STATE_SCHEMA_VERSION, `unsupported state schema_version ${record?.schema_version}`);
+  canonicalJson(record);
+  requireShape(positive(record.revision) && isId(record.run_id), 'revision and run_id are required');
+  validateWorkspace(record.workspace);
+  validateAccepted(record.accepted);
+  requireShape(record.workspace.key === record.accepted.workspace.key, 'workspace and accepted snapshot disagree');
+  requireShape(isObject(record.operator) && typeof record.operator.paused === 'boolean', 'operator.paused must be boolean');
+  requireShape(typeof record.runtime_status === 'string' && record.runtime_status.length > 0, 'runtime_status is required');
+  requireShape(record.live_dispatch_enabled === false, 'live V2 dispatch is disabled until adapter acceptance');
+  requireShape(typeof record.created_at === 'string' && Number.isFinite(Date.parse(record.created_at)) &&
+    typeof record.updated_at === 'string' && Number.isFinite(Date.parse(record.updated_at)), 'state timestamps are required');
+  requireShape(isObject(record.phases), 'phases must be a map');
+  const phaseIds = record.accepted.phases.map((phase) => phase.id).sort();
+  requireShape(canonicalJson(Object.keys(record.phases).sort()) === canonicalJson(phaseIds), 'runtime phases disagree with accepted phases');
+  const attempts = new Set();
+  for (const [phaseId, phase] of Object.entries(record.phases)) {
+    requireShape(isObject(phase) && typeof phase.status === 'string' && nonnegative(phase.review_iteration) &&
+      typeof phase.review_stage === 'string' && isObject(phase.roles), `invalid phase ${phaseId}`);
+    const declared = record.accepted.phases.find((p) => p.id === phaseId);
+    const requiredRoles = new Set(declared.agents.map((agent) => agent.role));
+    if (declared.review_loop.enabled) { requiredRoles.add('impl'); requiredRoles.add('qa'); }
+    for (const role of requiredRoles) requireShape(Object.hasOwn(phase.roles, role), `missing role ${phaseId}/${role}`);
+    for (const [role, entry] of Object.entries(phase.roles)) {
+      requireShape(isId(role) && isObject(entry) && Array.isArray(entry.attempts), 'roles require attempt arrays');
+      requireShape(entry.current_attempt_id === null || isId(entry.current_attempt_id), 'invalid current_attempt_id');
+      for (const attempt of entry.attempts) {
+        requireShape(isObject(attempt) && isId(attempt.attempt_id) && !attempts.has(attempt.attempt_id), 'invalid or duplicate attempt_id');
+        requireShape(attempt.run_id === record.run_id && attempt.phase_id === phaseId && attempt.role === role &&
+          nonnegative(attempt.review_iteration), 'attempt identity mismatch');
+        requireShape(V2_ENGINES.includes(attempt.engine) && V2_ACCESS.includes(attempt.access), 'invalid attempt engine/access');
+        requireShape(typeof attempt.workdir === 'string' && path.isAbsolute(attempt.workdir), 'attempt workdir must be absolute');
+        validateWorkspace(attempt.workspace);
+        attempts.add(attempt.attempt_id);
+      }
+      requireShape(entry.current_attempt_id === null || entry.attempts.some((attempt) => attempt.attempt_id === entry.current_attempt_id),
+        'current attempt is missing');
+    }
+  }
+  requireShape(isObject(record.command_results), 'command_results must be a map');
+  for (const [id, command] of Object.entries(record.command_results)) {
+    requireShape(isId(id) && isObject(command) && /^[a-f0-9]{64}$/.test(command.fingerprint) &&
+      isObject(command.response) && positive(command.response.revision) && command.response.revision <= record.revision &&
+      Object.hasOwn(command.response, 'result'), 'invalid command dedup result');
+  }
+  requireShape(positive(record.next_event_sequence) && Array.isArray(record.outbox), 'invalid pending event outbox');
+  let previousSequence = 0;
+  for (const event of record.outbox) {
+    requireShape(isObject(event) && positive(event.sequence) && event.sequence > previousSequence &&
+      event.sequence < record.next_event_sequence && event.run_id === record.run_id &&
+      event.event_id === `${record.run_id}:${event.sequence}` && positive(event.revision) && event.revision <= record.revision &&
+      typeof event.type === 'string' && event.type.length > 0 && Object.hasOwn(event, 'payload'), 'invalid event identity or ordering');
+    previousSequence = event.sequence;
+  }
+  requireShape(Array.isArray(record.legacy_history), 'legacy_history must be an array');
+  record.legacy_history.forEach(validateLegacyCompleted);
+}
+
+function validateState(record) {
+  validateRun(record);
+  requireShape(Array.isArray(record.history), 'history must be an array');
+  const ids = new Set([record.run_id]);
+  let priorRevision = 0;
+  for (const prior of record.history) {
+    requireShape(!Object.hasOwn(prior, 'history') && !ids.has(prior.run_id), 'recursive or duplicate run history');
+    validateRun(prior);
+    requireShape(prior.workspace.key === record.workspace.key && prior.revision > priorRevision && prior.revision < record.revision,
+      'invalid historical workspace or revision');
+    ids.add(prior.run_id);
+    priorRevision = prior.revision;
+  }
+  return record;
+}
+
+function readRecord(manifestPath) {
+  const statusPath = statusPathFor(path.resolve(manifestPath));
+  let fd;
+  try { fd = fs.openSync(statusPath, 'r'); } catch (error) {
+    if (error.code === 'ENOENT') return { state: null, bytes: null };
+    throw new Error(`cannot read canonical state ${statusPath}: ${error.message}`);
+  }
+  let bytes;
+  try {
+    const size = fs.fstatSync(fd).size;
+    if (size > MAX_STATE_BYTES) throw new Error('canonical state exceeds size limit');
+    const buffer = Buffer.alloc(size + 1);
+    let length = 0;
+    while (length < buffer.length) {
+      const count = fs.readSync(fd, buffer, length, buffer.length - length, null);
+      if (count === 0) break;
+      length += count;
+    }
+    if (length > size) throw new Error('canonical state changed size during read');
+    bytes = buffer.subarray(0, length).toString('utf8');
+  } finally { fs.closeSync(fd); }
+  let state;
+  try { state = yaml.load(bytes, { schema: yaml.JSON_SCHEMA }); } catch (error) {
+    throw new Error(`corrupt canonical state ${statusPath}: ${error.message}`);
+  }
+  requireShape(isObject(state), 'canonical state must be an object');
+  if (state.schema_version !== undefined && state.schema_version !== 1) validateState(state);
+  return { state, bytes };
+}
+
+function readState(manifestPath) {
+  return readRecord(manifestPath).state;
+}
+
+function appendEvents(draft, events) {
+  requireShape(Array.isArray(events), 'transaction events must be an array');
+  for (const event of events) {
+    requireShape(isObject(event) && typeof event.type === 'string' && event.type && Object.hasOwn(event, 'payload'), 'invalid transaction event');
+    const sequence = draft.next_event_sequence++;
+    draft.outbox.push({
+      sequence, event_id: `${draft.run_id}:${sequence}`, run_id: draft.run_id,
+      revision: draft.revision, type: event.type, payload: clone(event.payload),
+    });
+  }
+}
+
+function newRun(accepted, revision, history = [], legacyHistory = []) {
+  const snapshot = { ...clone(accepted), revision: 1 };
+  validateAccepted(snapshot);
+  const phases = {};
+  for (const phase of snapshot.phases) {
+    const roles = new Set(phase.agents.map((agent) => agent.role));
+    if (phase.review_loop.enabled) { roles.add('impl'); roles.add('qa'); }
+    phases[phase.id] = {
+      status: 'pending', review_iteration: 0, review_stage: 'impl',
+      roles: Object.fromEntries([...roles].map((role) => [role, { current_attempt_id: null, attempts: [] }])),
+    };
+  }
+  const now = new Date().toISOString();
+  const state = {
+    schema_version: STATE_SCHEMA_VERSION, revision, run_id: randomUUID(),
+    workspace: clone(snapshot.workspace), accepted: snapshot, operator: { paused: false },
+    runtime_status: 'live_dispatch_disabled', live_dispatch_enabled: false,
+    phases, command_results: {}, outbox: [], next_event_sequence: 1,
+    created_at: now, updated_at: now, history: clone(history), legacy_history: clone(legacyHistory),
+  };
+  appendEvents(state, [{ type: 'run_created', payload: { accepted_revision: 1, status: 'live_dispatch_disabled' } }]);
+  return state;
+}
+
+function createStateStore({ manifestPath, owner, _fs = {} }) {
+  const statusPath = statusPathFor(path.resolve(manifestPath));
+  const io = { ...fs, ..._fs };
+  let mutating = false;
+  function owned(workspace) {
+    assertOwnership(owner, workspace);
+    if (mutating) throw new Error('state transactions cannot be nested');
+  }
+  function publish(state, previousBytes) {
+    validateState(state);
+    const bytes = JSON.stringify(state, null, 2) + '\n';
+    if (Buffer.byteLength(bytes) > MAX_STATE_BYTES) throw new Error('canonical state exceeds size limit; refusing publication');
+    const temp = `${statusPath}.tmp-${randomUUID()}`;
+    let fd;
+    try {
+      fd = io.openSync(temp, 'wx', 0o600);
+      io.writeFileSync(fd, bytes, 'utf8');
+      io.fsyncSync(fd);
+      io.closeSync(fd);
+      fd = undefined;
+      assertOwnership(owner, state.workspace);
+      if (readRecord(manifestPath).bytes !== previousBytes) throw new Error('state revision fencing failed before publication');
+      io.renameSync(temp, statusPath);
+    } catch (error) {
+      if (fd !== undefined) {
+        try { io.closeSync(fd); } catch (closeError) { error.message += `; close failed: ${closeError.message}`; }
+      }
+      try { io.unlinkSync(temp); } catch (cleanupError) {
+        if (cleanupError.code !== 'ENOENT') error.message += `; temporary cleanup failed: ${cleanupError.message}`;
+      }
+      throw new Error(`failed to publish canonical state: ${error.message}`);
+    }
+    return clone(state);
+  }
+  return Object.freeze({
+    read: () => readState(manifestPath),
+    initialize(accepted) {
+      const current = readRecord(manifestPath);
+      owned(current.state?.schema_version === 2 ? current.state.workspace : accepted.workspace);
+      if (current.state?.schema_version === 2) return clone(current.state);
+      if (current.state) validateLegacyCompleted(current.state);
+      const state = newRun(accepted, 1, [], current.state ? [current.state] : []);
+      return publish(state, current.bytes);
+    },
+    transact({ expectedRevision, command, mutate }) {
+      const current = readRecord(manifestPath);
+      requireShape(current.state?.schema_version === 2, 'initialize a V2 run before transacting');
+      owned(current.state.workspace);
+      requireShape(isObject(command) && isId(command.id) && Object.hasOwn(command, 'payload'), 'command id and payload are required');
+      const hash = fingerprint(command.payload);
+      const prior = current.state.command_results[command.id];
+      if (prior) {
+        if (prior.fingerprint !== hash) throw new Error('command ID reuse with differing payload fingerprint is rejected');
+        return clone(prior.response);
+      }
+      if (!positive(expectedRevision) || expectedRevision !== current.state.revision) throw new Error('state revision conflict');
+      if (typeof mutate !== 'function') throw new Error('synchronous transaction callback is required');
+      const draft = clone(current.state);
+      mutating = true;
+      try {
+        const outcome = mutate(draft);
+        if (outcome && typeof outcome.then === 'function') throw new Error('transaction callback must be synchronous, not async');
+        requireShape(isObject(outcome) && Object.hasOwn(outcome, 'result'), 'transaction result is required');
+        for (const field of ['schema_version', 'run_id', 'workspace', 'history', 'legacy_history', 'created_at', 'command_results', 'outbox', 'next_event_sequence', 'revision']) {
+          if (canonicalJson(draft[field]) !== canonicalJson(current.state[field])) throw new Error(`immutable transaction field: ${field}`);
+        }
+        // Structural acceptance belongs to the later human-command contract.
+        if (canonicalJson(draft.accepted) !== canonicalJson(current.state.accepted)) throw new Error('accepted snapshot is immutable in foundation transactions');
+        draft.revision++;
+        draft.updated_at = new Date().toISOString();
+        const response = { revision: draft.revision, result: clone(outcome.result) };
+        draft.command_results[command.id] = { fingerprint: hash, response };
+        appendEvents(draft, outcome.events);
+        publish(draft, current.bytes);
+        return clone(response);
+      } finally { mutating = false; }
+    },
+    rerun({ expectedRevision, accepted }) {
+      const current = readRecord(manifestPath);
+      requireShape(current.state?.schema_version === 2, 'explicit rerun requires an existing V2 run');
+      owned(current.state.workspace);
+      if (expectedRevision !== current.state.revision) throw new Error('state revision conflict');
+      if (accepted.workspace.key !== current.state.workspace.key) throw new Error('rerun cannot change workspace identity');
+      for (const phase of Object.values(current.state.phases)) {
+        if (!['pending', 'completed', 'failed', 'blocked'].includes(phase.status) ||
+            Object.values(phase.roles).some((role) => role.attempts.length > 0)) {
+          throw new Error('rerun requires attempt closure reconciliation before replacing an active run');
+        }
+      }
+      const { history, ...prior } = current.state;
+      const next = newRun(accepted, current.state.revision + 1, [...history, prior]);
+      return publish(next, current.bytes);
+    },
+  });
+}
+
+module.exports = {
+  STATE_SCHEMA_VERSION, MAX_STATE_BYTES, canonicalJson, fingerprint,
+  validateAccepted, validateState, readState, createStateStore,
+};
