@@ -5615,6 +5615,178 @@ test('AG4c [todo 105 null-pidSnapshot] resume DEFERS sweep entirely when buildPi
 });
 
 // =========================================================================
+// AG5 — phase-scoped resume decisions through the first resumed tick
+// =========================================================================
+
+async function assertSiblingResume({
+  roles,
+  liveRole = 'qa',
+  processKind = 'inner',
+  pending = true,
+  orphan = false,
+  ageMs = 1_000,
+  lookupFailure,
+  failAdoption = false,
+  reviewLoop = false,
+  retryCount = 0,
+  rollback = false,
+  rollbackOnTick = false,
+  resumeTicks = 1,
+  unrelatedPhase = false,
+}) {
+  const dir = mkTmp('orch-AG5');
+  try {
+    const now = Date.now();
+    const dispatchedAt = new Date(now - ageMs).toISOString();
+    const phase = {
+      id: 'phase-1',
+      agents: roles.map((role) => ({ role })),
+      completion_signal: 'docs/orchestration/phases/phase-1/impl-complete.md',
+      timeout_minutes: 30,
+      ...(reviewLoop ? { review_loop: { enabled: true } } : {}),
+    };
+    const phases = [phase];
+    if (unrelatedPhase) {
+      phases.push({
+        id: 'other',
+        agents: [{ role: 'impl' }],
+        completion_signal: 'docs/orchestration/phases/other/impl-complete.md',
+        timeout_minutes: 30,
+      });
+    }
+    const mp = writeManifest(dir, makeBaseManifest({ phases }));
+    const initial = {
+      status: 'spawning',
+      dispatched_at: dispatchedAt,
+      retry_count: retryCount,
+      ...(reviewLoop ? { review_stage: liveRole, review_iteration: 2 } : {}),
+    };
+    writeStatus(mp, { phases: { 'phase-1': initial } });
+    const orchDir = O.orchDirFor(dir);
+    fs.mkdirSync(path.join(orchDir, 'templates'), { recursive: true });
+    makePhaseDir(mp, 'phase-1');
+    const flagPath = path.join(orchDir, `.pending-orch-phase-1-${liveRole}`);
+    const siblingFlag = path.join(orchDir, `.pending-orch-phase-1-${liveRole === 'qa' ? 'impl' : 'qa'}`);
+    const prompt = '# spawn_token: original-dispatch\nOriginal prompt\n';
+    if (pending) {
+      fs.writeFileSync(flagPath, prompt);
+      fs.utimesSync(flagPath, new Date(now - ageMs), new Date(now - ageMs));
+    }
+    if (orphan) fs.writeFileSync(siblingFlag, 'orphan prompt');
+    const rows = processKind === 'dead' ? [] : [{
+      ProcessId: 12345,
+      CommandLine: processKind === 'wrapper'
+        ? `cmd.exe /k claude --name orch-phase-1-${liveRole}`
+        : `claude --name orch-phase-1-${liveRole}`,
+    }];
+    const spawn = makeFakeSpawnSession();
+    const updates = [];
+    let lookups = 0;
+    const result = await O.runOrchestrator({
+      manifestPath: mp,
+      resume: true,
+      maxTicks: resumeTicks,
+      _now: () => now,
+      _startTimeProbe: () => now - 100_000,
+      _pidRunner: () => {
+        lookups += 1;
+        if (lookupFailure === 'primary' || (lookupFailure === 'wrapper' && lookups % 2 === 0)) {
+          throw new Error('WMI unavailable');
+        }
+        return JSON.stringify(rows);
+      },
+      _runUpdate: (manifestPath, phaseId, patch) => {
+        if (phaseId === 'phase-1') updates.push({ ...patch });
+        if (failAdoption && patch.status === 'running' && patch.pid === 12345) {
+          return { ok: false, error: 'EBUSY' };
+        }
+        return require('./parse-manifest').runUpdate(manifestPath, phaseId, patch);
+      },
+      _spawnSession: (opts) => {
+        fs.unlinkSync(path.join(orchDir, `.pending-${opts.name}`));
+        return spawn(opts);
+      },
+      _generatePrompt: makeFakeGenerate(),
+      _checkHealth: () => makeStubHealth(),
+      _sleep: () => Promise.resolve(),
+      logger: silentLogger(),
+      projectName: 't',
+    });
+    assert.strictEqual(result.history.length, resumeTicks, `exercise resumed ticks: ${JSON.stringify(result)}`);
+    const final = readStatus(mp).phases['phase-1'];
+    const rollbackUpdates = updates.filter((u) => u.status === 'pending' ||
+      (u.status === 'running' && u.dispatched_at === '' && u.pid === undefined));
+    assert.strictEqual(rollbackUpdates.length, rollback ? 1 : 0, 'rollback is decided once, after observing every sibling');
+    const expectedSpawns = rollback && !rollbackOnTick && !reviewLoop && retryCount === 0 ? roles.length : 0;
+    const charges = updates.filter((u) => u.retry_count === retryCount + 1);
+    assert.strictEqual(charges.length, rollback ? 1 : 0, 'charge one failed phase attempt, never a live or uncertain sibling');
+    assert.strictEqual(final.retry_count, expectedSpawns > 0 ? 0 : retryCount + (rollback ? 1 : 0));
+    assert.strictEqual(spawn.calls.filter((c) => c.name.startsWith('orch-phase-1-')).length, expectedSpawns, 'resume must not launch duplicate workers');
+    assert.strictEqual(spawn.calls.filter((c) => c.name === 'orch-other-impl').length, unrelatedPhase ? 1 : 0);
+    if (!rollback) {
+      const adopted = processKind === 'inner' && lookupFailure !== 'primary' && !failAdoption;
+      assert.strictEqual(final.status, adopted ? 'running' : 'spawning');
+      if (adopted) {
+        assert.strictEqual(final.pid, 12345);
+        assert.strictEqual(final.started_at, dispatchedAt, 'adoption must retain the original grace window');
+      } else {
+        assert.strictEqual(final.dispatched_at, dispatchedAt);
+      }
+      if (pending) assert.strictEqual(fs.readFileSync(flagPath, 'utf8'), prompt, 'preserve the original token-bound prompt');
+      else assert.ok(!fs.existsSync(flagPath), 'do not recreate an already consumed prompt');
+      if (orphan && !lookupFailure) assert.ok(!fs.existsSync(siblingFlag), 'sweep only the dead sibling prompt');
+    } else {
+      assert.strictEqual(final.status, rollbackOnTick && !reviewLoop && retryCount === 0 ? 'pending' : 'running');
+      assert.strictEqual(fs.existsSync(flagPath), rollbackOnTick && pending);
+      assert.ok(!fs.existsSync(siblingFlag));
+    }
+    if (reviewLoop) {
+      assert.strictEqual(final.review_stage, liveRole);
+      assert.strictEqual(final.review_iteration, 2);
+    }
+  } finally {
+    rmrf(dir);
+  }
+}
+
+for (const roles of [['impl', 'qa'], ['qa', 'impl']]) {
+  for (const scenario of [
+    { name: 'live pending' },
+    { name: 'live pending with orphan sibling', orphan: true },
+    { name: 'live consumed', pending: false },
+    { name: 'live consumed with orphan sibling', pending: false, orphan: true },
+    { name: 'live adoption persist fails', pending: false, failAdoption: true },
+    { name: 'live recovery', retryCount: 2 },
+    { name: 'wrapper pending', processKind: 'wrapper' },
+    { name: 'wrapper consumed within grace', processKind: 'wrapper', pending: false },
+    { name: 'wrapper consumed after grace', processKind: 'wrapper', pending: false, ageMs: 61_000, rollback: true },
+    { name: 'wrapper pending after grace', processKind: 'wrapper', ageMs: 61_000, rollback: true, rollbackOnTick: true },
+    { name: 'expired wrapper recovery across two ticks', processKind: 'wrapper', ageMs: 61_000, retryCount: 2, rollback: true, rollbackOnTick: true, resumeTicks: 2 },
+    { name: 'expired wrapper review across two ticks', processKind: 'wrapper', ageMs: 61_000, reviewLoop: true, rollback: true, rollbackOnTick: true, resumeTicks: 2 },
+    { name: 'primary lookup fails', lookupFailure: 'primary', orphan: true },
+    { name: 'primary lookup fails during unrelated dispatch', lookupFailure: 'primary', unrelatedPhase: true },
+    { name: 'wrapper lookup fails without flag', processKind: 'wrapper', pending: false, lookupFailure: 'wrapper' },
+    { name: 'wrapper lookup fails with expired flag', processKind: 'wrapper', ageMs: 61_000, lookupFailure: 'wrapper' },
+    { name: 'wrapper lookup fails during unrelated dispatch', processKind: 'wrapper', lookupFailure: 'wrapper', unrelatedPhase: true },
+    { name: 'all dead without flags', processKind: 'dead', pending: false, rollback: true },
+    { name: 'all dead with flags', processKind: 'dead', orphan: true, rollback: true },
+    { name: 'all dead recovery', processKind: 'dead', retryCount: 2, rollback: true },
+  ]) {
+    test(`AG5 sibling resume ${roles.join(',')}: ${scenario.name}`, async () => {
+      await assertSiblingResume({ roles, ...scenario });
+    });
+  }
+}
+
+for (const [declaredRole, liveRole] of [['impl', 'qa'], ['qa', 'impl']]) {
+  for (const pending of [true, false]) {
+    test(`AG5 sibling resume synthesizes ${liveRole}: pending=${pending}`, async () => {
+      await assertSiblingResume({ roles: [declaredRole], liveRole, reviewLoop: true, pending });
+    });
+  }
+}
+
+// =========================================================================
 // AH — codex round 17 regression tests
 // =========================================================================
 

@@ -897,8 +897,8 @@ function pollAllPhases(opts) {
     try {
       pidSnapshotWithWrappers = buildPidSnapshotInclusive(sessionNames, opts);
     } catch (_) {
-      // Best-effort. The reconciliation defer logic falls back to
-      // primary-snapshot behavior when this is null.
+      // Keep lookup failure distinct from an empty snapshot so
+      // reconciliation cannot mistake uncertainty for a dead tab.
       pidSnapshotWithWrappers = null;
     }
   }
@@ -992,6 +992,16 @@ function depsBlocked(phase, status) {
     if (depEntry.status === 'failed' || depEntry.status === 'blocked') return true;
   }
   return false;
+}
+
+function inferSpawningPriorStatus(phaseEntry) {
+  // A phase marker has no per-role prior status. Preserve running
+  // recovery/review progress; only initial dispatch returns to pending.
+  const inReviewLoop =
+    (Number.isInteger(phaseEntry.review_iteration) && phaseEntry.review_iteration > 0) ||
+    (typeof phaseEntry.review_stage === 'string' && phaseEntry.review_stage !== '');
+  const inRecovery = Number.isInteger(phaseEntry.retry_count) && phaseEntry.retry_count > 0;
+  return inReviewLoop || inRecovery ? 'running' : 'pending';
 }
 
 function isTerminalStatus(s) {
@@ -1280,9 +1290,9 @@ function decideTickActions(tickState, runState, opts) {
   //     writing running + the snapshot's pid + started_at =
   //     dispatched_at, then clearing dispatched_at.
   //   - PID snapshot does NOT have the session → tab never
-  //     registered (or died before WMI saw it). Reset to pending +
-  //     clear dispatched_at + increment retry_count so the next
-  //     tick re-dispatches against the recovery budget.
+  //     registered (or died before WMI saw it). Restore its inferred
+  //     pre-dispatch status, clear dispatched_at, and increment
+  //     retry_count so recovery/review progress survives.
   // The pid snapshot may be `null` when buildPidSnapshot's runner
   // failed; in that case skip reconciliation this tick — next tick
   // re-tries with a fresh snapshot.
@@ -1450,27 +1460,38 @@ function decideTickActions(tickState, runState, opts) {
         },
       });
     } else {
-      // Reset to pending; budget incremented so the orchestrator's
-      // recovery semantics treat this as one of the retry attempts.
+      // A failed wrapper lookup cannot establish that a launching tab
+      // is dead, even when its hook has already consumed the flag.
+      if (pidSnapshotWithWrappers === null) {
+        actions.push({
+          type: 'log',
+          level: 'warn',
+          message: `phase ${phase.id} reconciliation deferred: wrapper PID snapshot unavailable; next tick will retry`,
+          phaseId: phase.id,
+        });
+        continue;
+      }
+      // Restore the pre-dispatch status and charge one failed attempt.
       // Todo 097: shape was already validated by the pre-pass above;
       // this read is guaranteed-safe (shape-corrupt phases exit early
       // via mark_phase_blocked). Treating absent as 0 is the legitimate
       // fresh-spawn path validateRetryCountShape codifies.
       const shape = validateRetryCountShape(phaseEntry);
       const cur = shape.ok ? shape.value : 0;
+      const priorStatus = inferSpawningPriorStatus(phaseEntry);
       actions.push({
         type: 'log',
         level: 'warn',
         message:
           `phase ${phase.id} resume reconciliation: no live session ` +
-          `for any declared role; resetting to pending (retry_count ${cur} → ${cur + 1})`,
+          `for any declared role; resetting to ${priorStatus} (retry_count ${cur} → ${cur + 1})`,
         phaseId: phase.id,
       });
       actions.push({
         type: 'persist',
         phaseId: phase.id,
         updates: {
-          status: 'pending',
+          status: priorStatus,
           dispatched_at: '',
           retry_count: cur + 1,
         },
@@ -3988,6 +4009,11 @@ async function runOrchestrator(opts) {
           }
         }
         if (pidSnapshot === null || wrapperSnapshotFailed) {
+          // Unrelated phases can still dispatch this tick. Their stale
+          // flag sweep must not remove prompts whose owners are unknown.
+          opts._preservedResumeFlags = new Set(spawningEntries.map(({ phaseId, role }) =>
+            `.pending-${defaultSessionName(phaseId, role)}`
+          ));
           logger(
             'warn',
             `resume sweep deferred: pid snapshot unavailable (${pidSnapshot === null ? 'primary' : 'wrapper-inclusive'} PowerShell/WMI failure); next tick will retry`
@@ -3995,79 +4021,45 @@ async function runOrchestrator(opts) {
         } else {
           const preservedFlags = new Set();
           const runUpdateFn = opts._runUpdate || runUpdate;
-          // Codex round 3 P2: the manifest-status `'spawning'` marker
-          // is PHASE-SCOPED (single status per phase), but
-          // spawningEntries iterates over ROLES. For multi-role /
-          // review-loop phases we MUST track which phases have
-          // already been adopted (cell 2) or had a flag preserved
-          // (cell 1) so a sibling role's cell-4 rollback doesn't
-          // clobber the phase-level adoption back to 'pending'.
-          const phaseDecided = new Set();
-          for (const { phaseId, role } of spawningEntries) {
+          // Observe every sibling before changing a phase-scoped marker.
+          // Live or launching sessions protect the phase even if their
+          // adoption write fails; a missing sibling cannot justify retry.
+          const protectedPhases = new Set();
+          const resumeNow = opts._now ? opts._now() : Date.now();
+          const observations = spawningEntries.map(({ phaseId, role }) => {
             const sessionName = defaultSessionName(phaseId, role);
             const flagBasename = `.pending-${sessionName}`;
             const flagAbsPath = path.join(resumeOrchDir, flagBasename);
             const snap = pidSnapshot.get(sessionName);
-            // Codex round 5 P2: infer the pre-marker status from the
-            // phase entry's existing fields. A 'spawning' marker can
-            // come from THREE dispatch modes:
-            //   - initial: phase was 'pending'; rollback to 'pending'.
-            //   - recovery: phase was 'running' before the crash that
-            //     triggered the recovery dispatch; rollback to 'running'
-            //     to preserve retry_count and let the next tick continue
-            //     the recovery rather than restart from initial.
-            //   - review_retry: phase was 'running' (in review_stage:
-            //     review_retry_pending or similar); rollback to 'running'
-            //     preserves review_iteration / review_stage.
-            //
-            // Heuristic: if review_iteration > 0 OR review_stage is set
-            // → was in a review-loop dispatch ('running'). Else if
-            // retry_count > 0 → recovery dispatch ('running'). Else
-            // initial → 'pending'.
-            const phaseEntry = sl.status.phases[phaseId];
-            const inReviewLoop =
-              phaseEntry &&
-              (Number.isInteger(phaseEntry.review_iteration) && phaseEntry.review_iteration > 0 ||
-                (typeof phaseEntry.review_stage === 'string' && phaseEntry.review_stage !== ''));
-            const inRecovery =
-              phaseEntry &&
-              Number.isInteger(phaseEntry.retry_count) &&
-              phaseEntry.retry_count > 0;
-            const inferredPriorStatus =
-              inReviewLoop || inRecovery ? 'running' : 'pending';
-            // Codex round 4 P2: a tab that hasn't consumed its prompt
-            // yet may only have its wrapper (cmd/powershell) visible
-            // to WMI. The primary snapshot (excludeWrappers:true)
-            // misses the wrapper-only case; the secondary snapshot
-            // (excludeWrappers:false) catches it. For resume
-            // reconciliation we accept ANY live process — wrapper-
-            // only or inner Claude — so we don't sweep a flag whose
-            // intended tab is still waiting for its hook to fire.
-            const wrapperSnap =
-              pidSnapshotWithWrappers && pidSnapshotWithWrappers.get(sessionName);
-            const liveAlive = !!(
-              (snap && Number.isInteger(snap.pid) && snap.pid > 0) ||
-              (wrapperSnap && Number.isInteger(wrapperSnap.pid) && wrapperSnap.pid > 0)
-            );
-            const existsSync = opts._existsSync || fs.existsSync;
-            const flagPresent = existsSync(flagAbsPath);
-            // Codex round 13 P2: differentiate inner-Claude alive vs
-            // wrapper-only. Cell 1 (preserve flag) accepts wrapper-
-            // only as evidence the tab is still launching. Cell 2
-            // (adopt as running) requires INNER Claude alive — a
-            // wrapper-only with no flag means Claude exited and the
-            // wrapper is post-mortem; adopting it would mark a dead
-            // session 'running' with a fresh started_at grace window.
+            const wrapperSnap = pidSnapshotWithWrappers.get(sessionName);
             const innerAlive = !!(snap && Number.isInteger(snap.pid) && snap.pid > 0);
             const wrapperAlive = !!(
               wrapperSnap && Number.isInteger(wrapperSnap.pid) && wrapperSnap.pid > 0
             );
-            // Resolve the actual PID for adoption / logging. Prefer
-            // the inner Claude's PID; fall back to the wrapper's PID
-            // when only it is visible (used for logs / cell 1).
-            const adoptedPid = innerAlive ? snap.pid
-              : wrapperAlive ? wrapperSnap.pid
-              : null;
+            const liveAlive = innerAlive || wrapperAlive;
+            const flagPresent = (opts._existsSync || fs.existsSync)(flagAbsPath);
+            const adoptedPid = innerAlive ? snap.pid : wrapperAlive ? wrapperSnap.pid : null;
+            const dispatchedAt = sl.status.phases[phaseId].dispatched_at;
+            const dispatchedAtMs = typeof dispatchedAt === 'string' ? Date.parse(dispatchedAt) : NaN;
+            // Match the tick reconciliation's bounded wrapper grace,
+            // including the post-consumption / pre-inner-PID window.
+            const wrapperOnlyFresh = wrapperAlive && Number.isFinite(dispatchedAtMs) &&
+              resumeNow - dispatchedAtMs <= 60_000;
+            if (innerAlive || (wrapperAlive && flagPresent) || wrapperOnlyFresh) {
+              protectedPhases.add(phaseId);
+            }
+            return {
+              phaseId, role, flagBasename, flagAbsPath, flagPresent,
+              innerAlive, wrapperAlive, liveAlive, adoptedPid,
+            };
+          });
+          const phaseDecided = new Set();
+          for (const {
+            phaseId, role, flagBasename, flagAbsPath, flagPresent,
+            innerAlive, wrapperAlive, liveAlive, adoptedPid,
+          } of observations) {
+            const phaseEntry = sl.status.phases[phaseId];
+            const inferredPriorStatus = inferSpawningPriorStatus(phaseEntry);
             if (liveAlive && flagPresent) {
               // Cell 1: tab waiting for prompt — preserve flag.
               // Wrapper-only is fine here; the SessionStart hook
@@ -4114,16 +4106,11 @@ async function runOrchestrator(opts) {
               // Cell 3: orphan — flag without an inner-Claude PID
               // (and either no wrapper alive, or the wrapper-only
               // window has elapsed). Rollback marker, sweep flag.
-              // Codex round 3 P2: skip the rollback if a sibling role
-              // for the same phase already adopted (cell 1/2). The
-              // 'spawning' marker is phase-scoped, so the adoption
-              // already overwrote it with 'running'; rolling back here
-              // would undo the adoption.
-              if (phaseDecided.has(phaseId)) {
+              if (protectedPhases.has(phaseId) || phaseDecided.has(phaseId)) {
                 try { fs.unlinkSync(flagAbsPath); } catch (_) { /* ignore */ }
                 logger(
                   'info',
-                  `resume reconciliation [cell 3, sibling-skip]: phase already adopted via another role — sweeping ${flagBasename} only`,
+                  `resume reconciliation [cell 3, sibling-skip]: phase protected or already reconciled; sweeping ${flagBasename} only`,
                   { phaseId, role }
                 );
               } else {
@@ -4163,14 +4150,12 @@ async function runOrchestrator(opts) {
               //   - !liveAlive && !flagPresent (no process anywhere)
               //   - wrapperAlive && !innerAlive && !flagPresent
               //     (wrapper-only post-mortem after Claude exited)
-              // Both warrant rollback so the phase becomes eligible
-              // for re-dispatch / recovery on the next tick.
-              // Codex round 3 P2: same sibling-skip discipline as
-              // cell 3 — don't undo a sibling's adoption.
-              if (phaseDecided.has(phaseId)) {
+              // Rollback requires no protected sibling and no fresh
+              // wrapper-only launch within the dispatch grace window.
+              if (protectedPhases.has(phaseId) || phaseDecided.has(phaseId)) {
                 logger(
                   'info',
-                  'resume reconciliation [cell 4, sibling-skip]: phase already adopted via another role',
+                  'resume reconciliation [cell 4, sibling-skip]: phase protected or already reconciled',
                   { phaseId, role }
                 );
               } else {
