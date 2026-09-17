@@ -46,7 +46,7 @@ defaults:
   model: sonnet
   phase_timeout_minutes: 120
   heartbeat_timeout_minutes: 5
-  permission_mode: auto
+  permission_mode: bypassPermissions   # one of: plan | default | acceptEdits | bypassPermissions
   notifications:                      # V1.5 (Unit 10)
     enabled: false
     email: liudun88@gmail.com

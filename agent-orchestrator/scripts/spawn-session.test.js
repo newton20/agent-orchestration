@@ -75,6 +75,50 @@ test('agency launcher: powershell -NoExit -Command "agency claude ..."', () => {
   assert.ok(command.endsWith('"'), `expected trailing double quote, got: ${command}`);
 });
 
+test('spawn token: PowerShell separator survives Windows Terminal parsing', () => {
+  const { argv } = buildSpawnCommand({
+    name: 'orch-token',
+    workdir: 'C:\\work',
+    launcher: AGENCY_LAUNCHER,
+    spawnToken: 'token-123',
+  });
+  const script = argv.at(-1);
+  // Windows Terminal scans each argv element for unescaped separators.
+  assert.doesNotMatch(script, /^;|[^\\];/);
+  assert.strictEqual(
+    script.replaceAll('\\;', ';'),
+    "$env:AGENT_FLAG_TOKEN='token-123'; agency claude --enable-auto-mode --name orch-token"
+  );
+});
+
+test('spawn token: cmd assignment has no trailing whitespace', () => {
+  const { argv } = buildSpawnCommand({
+    name: 'orch-token',
+    workdir: 'C:\\work',
+    spawnToken: 'token-123',
+  });
+  assert.strictEqual(
+    argv.at(-1),
+    'set AGENT_FLAG_TOKEN=token-123&&claude --permission-mode auto --name orch-token'
+  );
+});
+
+test('spawn token: rejects shell metacharacters for both launchers', () => {
+  for (const launcher of [DEFAULT_LAUNCHER, AGENCY_LAUNCHER]) {
+    for (const spawnToken of ['bad;token', 'bad&token', "bad'token", 'bad token']) {
+      assert.throws(
+        () => buildSpawnCommand({
+          name: 'orch-token',
+          workdir: 'C:\\work',
+          launcher,
+          spawnToken,
+        }),
+        /spawnToken contains shell-unsafe characters/
+      );
+    }
+  }
+});
+
 // -------------------- --suppressApplicationTitle presence --------------------
 
 test('--suppressApplicationTitle is ALWAYS present (default launcher)', () => {

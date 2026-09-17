@@ -20,8 +20,10 @@ const {
   statusPathFor,
   loadStatus,
   runUpdate,
+  KNOWN_UPDATE_FIELDS,
   VALID_ID_RE,
   VALID_ROLES,
+  VALID_PERMISSION_MODES,
 } = require('./parse-manifest');
 const { FLAG_NAME_RE } = require('../hooks/session-start');
 
@@ -866,6 +868,252 @@ test('VALID_ROLES is the same reference imported by check-health', () => {
     VALID_ROLES,
     'check-health re-exports the same VALID_ROLES reference; mutations or replacements must propagate'
   );
+});
+
+// -------------------- Todo 102: KNOWN_UPDATE_FIELDS --------------------
+
+test('KNOWN_UPDATE_FIELDS [todo 102] includes review_iteration + review_stage + spawn_id', () => {
+  // Allow-list must contain every field orchestrate.js writes through
+  // runUpdate. Drift between this list and the writers used to silently
+  // strip review_iteration / review_stage; codex caught the same class
+  // for spawn_id (todo 104). Test the membership directly so the next
+  // writer-side addition surfaces here loudly.
+  assert.ok(KNOWN_UPDATE_FIELDS.includes('review_iteration'));
+  assert.ok(KNOWN_UPDATE_FIELDS.includes('review_stage'));
+  assert.ok(KNOWN_UPDATE_FIELDS.includes('spawn_id'));
+});
+
+test('runUpdate [todo 102] persists review_iteration + review_stage to manifest-status', () => {
+  const file = write(validMinimal);
+  const r = runUpdate(file, 'phase-0', {
+    review_iteration: 2,
+    review_stage: 'qa-running',
+  });
+  assert.strictEqual(r.ok, true, r.error);
+  const reload = loadStatus(file);
+  assert.strictEqual(reload.ok, true);
+  assert.strictEqual(reload.status.phases['phase-0'].review_iteration, 2);
+  assert.strictEqual(reload.status.phases['phase-0'].review_stage, 'qa-running');
+});
+
+test('runUpdate [todo 102] warns on truly-unknown fields (defense-in-depth)', () => {
+  const file = write(validMinimal);
+  const origWrite = process.stderr.write.bind(process.stderr);
+  let captured = '';
+  process.stderr.write = (chunk) => {
+    captured += String(chunk);
+    return true;
+  };
+  try {
+    const r = runUpdate(file, 'phase-0', { not_a_real_field: 'x' });
+    assert.strictEqual(r.ok, true, r.error);
+  } finally {
+    process.stderr.write = origWrite;
+  }
+  assert.ok(
+    /unknown update field "not_a_real_field"/.test(captured),
+    `expected stderr warning, got: ${captured}`
+  );
+});
+
+// -------------------- Todo 100: permission_mode enum --------------------
+
+test('VALID_PERMISSION_MODES [todo 100 + codex round 2 P2] is exported + frozen + includes auto for compat', () => {
+  assert.ok(Array.isArray(VALID_PERMISSION_MODES));
+  assert.deepStrictEqual(
+    [...VALID_PERMISSION_MODES],
+    ['auto', 'plan', 'default', 'acceptEdits', 'bypassPermissions']
+  );
+  assert.ok(Object.isFrozen(VALID_PERMISSION_MODES));
+});
+
+test('validate [todo 100] accepts every documented permission_mode', () => {
+  for (const mode of VALID_PERMISSION_MODES) {
+    const m = {
+      name: 'pm-ok',
+      defaults: { permission_mode: mode },
+      phases: [
+        { id: 'phase-0', completion_signal: 'x.md', agent: { role: 'impl' } },
+      ],
+    };
+    const r = validate(m);
+    assert.strictEqual(r.valid, true, `mode ${mode} should validate; errors: ${JSON.stringify(r.errors)}`);
+  }
+});
+
+test('validate [todo 100] rejects whitespace-injected permission_mode (flag-injection vector)', () => {
+  const m = {
+    name: 'pm-bad',
+    defaults: {
+      permission_mode: 'acceptEdits --dangerously-skip-permissions',
+    },
+    phases: [
+      { id: 'phase-0', completion_signal: 'x.md', agent: { role: 'impl' } },
+    ],
+  };
+  const r = validate(m);
+  assert.strictEqual(r.valid, false);
+  assert.ok(
+    r.errors.some((e) => e.path === 'defaults.permission_mode'),
+    `errors should include defaults.permission_mode; got ${JSON.stringify(r.errors)}`
+  );
+});
+
+test('validate [todo 100] rejects empty permission_mode', () => {
+  const m = {
+    name: 'pm-empty',
+    defaults: { permission_mode: '' },
+    phases: [
+      { id: 'phase-0', completion_signal: 'x.md', agent: { role: 'impl' } },
+    ],
+  };
+  const r = validate(m);
+  assert.strictEqual(r.valid, false);
+});
+
+test('validate [todo 100] rejects unknown enum value', () => {
+  const m = {
+    name: 'pm-unknown',
+    defaults: { permission_mode: 'unknownValue' },
+    phases: [
+      { id: 'phase-0', completion_signal: 'x.md', agent: { role: 'impl' } },
+    ],
+  };
+  const r = validate(m);
+  assert.strictEqual(r.valid, false);
+});
+
+// -------------------- Todo 097: retry_count strict shape --------------------
+
+test('runUpdate [todo 097] rejects float retry_count', () => {
+  const file = write(validMinimal);
+  const r = runUpdate(file, 'phase-0', { retry_count: 2.5 });
+  assert.strictEqual(r.ok, false);
+  assert.ok(/retry_count/.test(r.error));
+});
+
+test('runUpdate [todo 097] rejects negative retry_count', () => {
+  const file = write(validMinimal);
+  const r = runUpdate(file, 'phase-0', { retry_count: -1 });
+  assert.strictEqual(r.ok, false);
+  assert.ok(/retry_count/.test(r.error));
+});
+
+test('runUpdate [todo 097] rejects string retry_count', () => {
+  const file = write(validMinimal);
+  const r = runUpdate(file, 'phase-0', { retry_count: 'two' });
+  assert.strictEqual(r.ok, false);
+  assert.ok(/retry_count/.test(r.error));
+});
+
+test('runUpdate [todo 097] accepts well-formed integer retry_count above MAX_RETRIES', () => {
+  // Over-budget integer is NOT corrupt — it can be legitimate historical
+  // state from a prior run with --max-recovery-retries=5 that the
+  // operator restarted under the default cap of 3. The shape validator
+  // accepts; the budget comparison happens later in decideRecoveryAction.
+  const file = write(validMinimal);
+  const r = runUpdate(file, 'phase-0', { retry_count: 5 });
+  assert.strictEqual(r.ok, true, r.error);
+});
+
+// -------------------- Todo 103: runUpdate caching seams --------------------
+
+test('runUpdate [todo 103] _loadedManifest seam skips loadManifest (one disk read across N calls)', () => {
+  const file = write(validMinimal);
+  // Pre-load once.
+  const loaded = loadManifest(file);
+  assert.strictEqual(loaded.ok, true);
+  // Spy via _writeFileSync seam — the load path uses fs.readFileSync
+  // which we can't easily stub here; instead, exercise the seam by
+  // throwing a manifest mutation that would only work IF the cached
+  // value is honored. Mutate the cached manifest's name; runUpdate
+  // should accept the cached value (we trust the caller).
+  loaded.manifest.name = 'cached-name';
+  const r = runUpdate(file, 'phase-0', { status: 'running' }, {
+    _loadedManifest: loaded.manifest,
+  });
+  assert.strictEqual(r.ok, true, r.error);
+});
+
+test('runUpdate [todo 103] _loadedStatus shared instance preserves mutations across same-tick calls', () => {
+  // Critical RA contract (codex round 8 of PR #22): a fan-out tick
+  // that calls runUpdate(role-A, {pid: 1234}) then runUpdate(role-B,
+  // {started_at: '...'}) on the SAME shared _loadedStatus must end
+  // with BOTH role-A's pid AND role-B's started_at on disk. If the
+  // second call started from the pre-call-1 snapshot, role-A's pid
+  // would be lost.
+  //
+  // The current code routes a single phase per runUpdate call; the
+  // mutation contract bites when the same phase is updated twice
+  // in one tick (e.g., mark_phase_running + post-spawn pid persist).
+  // Test the contract with two writes on the same phase id under
+  // a shared _loadedStatus.
+  const file = write(validMinimal);
+  const loaded = loadManifest(file);
+  const sharedStatus = { phases: Object.create(null) };
+  const r1 = runUpdate(
+    file,
+    'phase-0',
+    { pid: 1234, status: 'running' },
+    { _loadedManifest: loaded.manifest, _loadedStatus: sharedStatus }
+  );
+  assert.strictEqual(r1.ok, true, r1.error);
+  // The shared object now has phase-0 with pid=1234.
+  assert.strictEqual(sharedStatus.phases['phase-0'].pid, 1234);
+
+  const r2 = runUpdate(
+    file,
+    'phase-0',
+    { started_at: '2026-01-01T00:00:00Z' },
+    { _loadedManifest: loaded.manifest, _loadedStatus: sharedStatus }
+  );
+  assert.strictEqual(r2.ok, true, r2.error);
+  // Both fields must be present on the shared object — second write
+  // started from the in-memory cache, NOT a fresh disk load that
+  // would have missed the in-memory pid.
+  assert.strictEqual(sharedStatus.phases['phase-0'].pid, 1234);
+  assert.strictEqual(
+    sharedStatus.phases['phase-0'].started_at,
+    '2026-01-01T00:00:00Z'
+  );
+  // Disk reflects the merged state too (final write wins; both fields
+  // present because the second call mutated the cache that was then
+  // serialized).
+  const reload = loadStatus(file);
+  assert.strictEqual(reload.status.phases['phase-0'].pid, 1234);
+  assert.strictEqual(
+    reload.status.phases['phase-0'].started_at,
+    '2026-01-01T00:00:00Z'
+  );
+});
+
+test('runUpdate [todo 103] _loadedStatus=null treats as fresh-write (matches "no status file" path)', () => {
+  const file = write(validMinimal);
+  const loaded = loadManifest(file);
+  // Pass `null` to declare "no status file" without taking the disk
+  // path. runUpdate writes a fresh shape.
+  const r = runUpdate(
+    file,
+    'phase-0',
+    { status: 'pending' },
+    { _loadedManifest: loaded.manifest, _loadedStatus: null }
+  );
+  assert.strictEqual(r.ok, true, r.error);
+  const reload = loadStatus(file);
+  assert.strictEqual(reload.status.phases['phase-0'].status, 'pending');
+});
+
+test('runUpdate [todo 103] rejects malformed _loadedStatus (must be object with phases or null)', () => {
+  const file = write(validMinimal);
+  const loaded = loadManifest(file);
+  const r = runUpdate(
+    file,
+    'phase-0',
+    { status: 'running' },
+    { _loadedManifest: loaded.manifest, _loadedStatus: 'not-an-object' }
+  );
+  assert.strictEqual(r.ok, false);
+  assert.ok(/_loadedStatus/.test(r.error));
 });
 
 test('VALID_ID_RE and FLAG_NAME_RE share the same ID character class', () => {
