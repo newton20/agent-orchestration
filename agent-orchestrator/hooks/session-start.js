@@ -230,13 +230,10 @@ function runHook(opts) {
     // renameSync runs and steals the FRESH flag. Post-rename peek
     // sees T2 → mismatch.
     //
-    // Pre-round-18, this path unlinked the .consuming-* file —
-    // losing the fresh prompt for the intended new tab. Now we
-    // try to RESTORE it: rename `.consuming-*` back to
-    // `.pending-<name>` so the intended tab's hook can find it.
-    // Best-effort; if restore fails (target exists, FS error), we
-    // log loudly and unlink — better to surface a missing prompt
-    // than silently corrupt the protocol.
+    // Restore the claimed prompt without replacing a newer pending
+    // flag, so the intended tab can still find it. If restoration
+    // fails, log and clean up the consuming file without delivering
+    // another spawn's prompt.
     if (tabToken) {
       let postContent;
       try {
@@ -248,37 +245,18 @@ function runHook(opts) {
       }
       const postToken = extractSpawnToken(postContent);
       if (postToken !== tabToken) {
-        // Codex round 18 + 21 P2: best-effort restore the fresh
-        // flag, but DO NOT clobber a yet-newer pending flag. Node's
-        // renameSync replaces an existing target on most platforms
-        // — without the existsSync guard, restore could overwrite
-        // a third-tick fresh flag with our stale .consuming-* file
-        // (older than what's on disk), corrupting the protocol.
-        //
-        // Race window: existsSync → renameSync is not atomic; a
-        // brand-new flag could be written between the check and
-        // the rename. The window is narrow in practice (orchestrator
-        // writes flags with `.flagtmp-` prefix, then renames atomically;
-        // the prompt-write+rename happens entirely under the
-        // orchestrator lock). If we lose the race, log loudly and
-        // unlink — surfacing a missing prompt is better than silent
-        // corruption.
-        let restored = false;
-        if (!fsLib.existsSync(cand.path)) {
-          try {
-            fsLib.renameSync(consumingPath, cand.path);
-            restored = true;
-          } catch (err) {
+        // A hard link publishes atomically and fails if the destination
+        // exists; checking before rename cannot prevent an overwrite.
+        try {
+          fsLib.linkSync(consumingPath, cand.path);
+        } catch (err) {
+          if (err && err.code === 'EEXIST') {
+            logErr(`post-rename token mismatch on ${cand.name}: a newer flag is already on disk; cannot restore stale .consuming-*`);
+          } else {
             logErr(`post-rename token mismatch + restore failed for ${cand.name}: ${err.message}`);
           }
-        } else {
-          logErr(
-            `post-rename token mismatch on ${cand.name}: a newer flag is already on disk; cannot restore stale .consuming-* (likely cross-tick race)`
-          );
         }
-        if (!restored) {
-          tryUnlink(fsLib, consumingPath);
-        }
+        tryUnlink(fsLib, consumingPath);
         continue;
       }
     }

@@ -601,3 +601,51 @@ test('[todo 099] runHook iterates past mismatched candidates to find a matching 
     fs.rmSync(projectDir, { recursive: true, force: true });
   }
 });
+
+for (const scenario of ['absent', 'already published', 'published during restore', 'unsupported links']) {
+  test(`post-claim token mismatch restores without replacing a newer flag: ${scenario}`, () => {
+    const projectDir = mkProjectDir();
+    const orchDir = mkOrchDir(projectDir);
+    const replacement = '# spawn_token: T2\nreplacement prompt';
+    const newest = '# spawn_token: T3\nnewest prompt';
+    const flagPath = writeFlag(orchDir, 'restore', '# spawn_token: T1\nold prompt');
+    const fsLib = Object.create(fs);
+    fsLib.renameSync = (source, destination) => {
+      if (source === flagPath) {
+        // Publish T2 after the T1 peek, immediately before the hook's claim.
+        fs.writeFileSync(flagPath, replacement);
+        fs.renameSync(source, destination);
+        if (scenario === 'already published') fs.writeFileSync(flagPath, newest);
+        return;
+      }
+      if (scenario === 'published during restore' && destination === flagPath) {
+        fs.writeFileSync(flagPath, newest);
+      }
+      return fs.renameSync(source, destination);
+    };
+    fsLib.linkSync = (source, destination) => {
+      if (scenario === 'published during restore') fs.writeFileSync(flagPath, newest);
+      if (scenario === 'unsupported links') {
+        throw Object.assign(new Error('hard links unavailable'), { code: 'ENOTSUP' });
+      }
+      return fs.linkSync(source, destination);
+    };
+    try {
+      assert.strictEqual(runHook({ projectDir, tabToken: 'T1', fsLib }), '{}');
+      assert.deepStrictEqual(listConsumingFiles(orchDir), []);
+      if (scenario === 'unsupported links') {
+        assert.strictEqual(fs.existsSync(flagPath), false);
+      } else {
+        const expected = scenario === 'absent' ? replacement : newest;
+        assert.strictEqual(fs.readFileSync(flagPath, 'utf8'), expected);
+        const tabToken = scenario === 'absent' ? 'T2' : 'T3';
+        assert.deepStrictEqual(
+          JSON.parse(runHook({ projectDir, tabToken })),
+          { additionalContext: expected.split('\n')[1] }
+        );
+      }
+    } finally {
+      fs.rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+}
