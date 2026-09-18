@@ -25,6 +25,11 @@ V2 QA needs matching completion and verdict reports. The verdict includes
 `P4`, and `P6`; all must pass with evidence for a passing verdict.
 Reports are worker evidence, not independently verified success.
 Historical attempts and review results remain immutable.
+`partial` or `blocked` QA without a valid fail verdict requires intervention
+immediately and remains blocked from automatic retry after process closure
+and restart. Invalid or missing verification cannot pass. Correcting an
+invalid report permits reconciliation; a valid fail verdict still consumes
+only a review round after safe release.
 
 All mutating roles, including QA, serialize by canonical checkout. A
 completed or idle worker retains its reservation until an exact
@@ -33,6 +38,14 @@ Read-only concurrency requires fixture-enforced capability restrictions.
 Pause records outcomes while preventing QA, recovery and all other new
 dispatches. Unknown liveness or ambiguous submission requires intervention
 without replaying a kickoff.
+Already-admitted queued retries resume under the same attempt ID and budget,
+including the last allowed retry. Dispatch rechecks current engine and
+read-only enforcement capabilities. A never-dispatched queued intent
+refreshes its launch host at the launch boundary after a reboot; after
+`launching`, that host identity is immutable and no kickoff is replayed.
+Terminal outcomes still accept adapter closure and additive descendant
+accounting while reservations remain held. Process-death samples must
+postdate dispatch/correlation and the identified process creation time.
 
 Do not reset V2 counters, edit accepted runtime structure, force a
 completion, or supply `role: operator` in a worker artifact. Those actions

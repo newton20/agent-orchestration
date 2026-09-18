@@ -65,14 +65,37 @@ requires a new run.
 Ordinary V2 restart, with or without `--resume`, retains the run ID,
 accepted revision, pause state, and history, even if the authoring file is
 invalid or drifted. `--rerun` explicitly creates a new run and retains the
-old record. The foundation rejects rerun once attempts exist until
-lifecycle reconciliation can establish safe closure. Completed V1 status
+old record. An untouched run can be replaced before dispatch. After any
+dispatch, every started phase must be completed or failed, and every historical
+attempt must have a terminal outcome and concrete release/closure evidence.
+Mutating reservations are reconciled under the old run before replacement;
+live, unknown, or queued attempts prevent rerun. Never-started pending or
+dependency-blocked phases do not hold worker ownership and may be replaced
+by the explicit new run. Completed V1 status
 can be imported as read-only history; active or ambiguous V1 state cannot
 be adopted. Do not edit active status directly or use V1 `--update` against
 V2 state. See [runtime state and ownership](runtime-state-reference.md) for
 the storage and ownership contracts.
 
+Fixture-backed lifecycle execution preserves already-admitted retries
+across restart, including at the retry limit, and rechecks engine/access
+capabilities before dispatch. Partial or blocked QA reports without a
+valid fail verdict require intervention; they neither pass verification
+nor trigger automatic execution recovery.
+Without an enabled `review_loop`, a valid negative QA verdict fails the
+phase without launch or execution retries. Closure reconciliation continues
+after that failure; a failed verdict does not itself release the checkout.
+
 ## V1 fields
+
+Updated V1 controllers use the same Windows named-pipe ownership as V2.
+They require Windows PowerShell and Git on PATH, but an existing non-Git
+workdir remains supported after positive non-repository detection. Git
+resolution errors do not authorize a directory fallback. An initially
+invalid manifest fails preflight because the controller cannot safely
+choose an ownership claim; it does not poll without owning the workspace.
+Live or uncertain legacy-owner contention returns exit code 2. Corrupt
+ownership metadata returns exit code 1 and requires investigation.
 
 This reference documents every field. Each is tagged with the unit that
 makes it active:

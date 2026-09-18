@@ -170,14 +170,20 @@ const MAX_CHECKPOINT_ENTRIES = 256;
  *   null  — invalid PID, or unknown error code (caller may surface)
  */
 function creationTimeKey(value) {
+  if (value === null || value === undefined) return null;
   const fraction = /\.(\d+)(?:Z|[+-]\d{2}:?\d{2})$/i.exec(value)?.[1] || '';
   // CIM timestamps carry finer precision than Date.parse's milliseconds.
   return `${Date.parse(value)}:${fraction.slice(3).replace(/0+$/, '')}`;
 }
 
 function observeProcessIdentity(identity, sample) {
-  if (!identity || !sample || !identity.hostname || identity.hostname !== sample.hostname) {
+  if (!identity || !sample || !sameHostname(identity.hostname, sample.hostname)) {
     return { state: 'unknown', reason: 'host identity unavailable or different' };
+  }
+  if (!Number.isFinite(Date.parse(sample.observed_at)) ||
+      (Number.isFinite(Date.parse(identity.creation_time)) &&
+        Date.parse(sample.observed_at) <= Date.parse(identity.creation_time))) {
+    return { state: 'unknown', reason: 'process table does not postdate process creation' };
   }
   if (identity.host_boot_id && sample.host_boot_id && identity.host_boot_id !== sample.host_boot_id) {
     return { state: 'dead', reason: 'host reboot' };
@@ -202,6 +208,10 @@ function observeProcessIdentity(identity, sample) {
     return { state: 'dead', reason: 'old PID creation identity replaced' };
   }
   return { state: 'live', reason: 'PID and creation identity match' };
+}
+
+function sameHostname(a, b) {
+  return typeof a === 'string' && a.length > 0 && typeof b === 'string' && a.toLowerCase() === b.toLowerCase();
 }
 
 function isPidAlive(pid, _killer) {
@@ -1295,7 +1305,9 @@ function main() {
 if (require.main === module) main();
 
 module.exports = {
+  creationTimeKey,
   observeProcessIdentity,
+  sameHostname,
   checkHealth,
   isPidAlive,
   parseHeartbeatTail,

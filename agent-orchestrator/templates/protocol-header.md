@@ -1,6 +1,6 @@
 ---
 required: [role, phase_id, project_name, workdir, phase_dir, completion_signal_path]
-optional: [prior_phase_dirs, heartbeat_path, suggested_commit_message, attempt_protocol_block, completion_identity_fields, heartbeat_example]
+optional: [prior_phase_dirs, heartbeat_path, suggested_commit_message, attempt_protocol_block, completion_identity_fields, heartbeat_example, heartbeat_instructions, heartbeat_identity_note, heartbeat_cadence]
 ---
 
 # Orchestration Protocol Header
@@ -37,7 +37,7 @@ Every input and output for this phase lives under a single phase directory:
 
 {{prior_phase_dirs}}
 
-Each path above points at an upstream phase's completion signal. Read
+Each path above points at an accepted upstream report. Read
 them before starting work. Paths are absolute — do not interpret
 relative paths against your shell's `cwd` for protocol files.
 
@@ -134,31 +134,24 @@ work behind, use `status: partial` and note what is incomplete under
 
 ## Heartbeat (secondary liveness signal)
 
-Heartbeat log path: `{{heartbeat_path}}`
+Heartbeat path: `{{heartbeat_path}}`
 
 If the path above is blank, heartbeats are disabled for this phase —
 skip the entire section.
 
-During long-running work you may append a single-line JSON record to
-the heartbeat log (JSONL — one compact JSON object per line, no
-trailing commas):
+{{heartbeat_instructions}}
 
 ```
 {{heartbeat_example}}
 ```
 
-The `pid` field is your own process PID (e.g., `process.pid` in Node,
-`os.getpid()` in Python, `$PID` in PowerShell). It lets a recovery
-agent that respawns this phase distinguish your entries from its own
-when reading the log, and lets the orchestrator correlate liveness
-checks against ground truth.
+{{heartbeat_identity_note}}
 
-**Cadence.** Append an entry approximately every 5 minutes of active
-work, or after every ~10 file edits, whichever comes first. You may be
+**Cadence.** {{heartbeat_cadence}} You may be
 more frequent; you should not be less. Skip heartbeats only when they
 would interfere with an atomic operation (a multi-file refactor, a
 failing-test investigation); the orchestrator's primary liveness check
-is PID + timeout, not heartbeat age, so a missed heartbeat is not
+uses OS process evidence and timeout, not heartbeat age, so a missed heartbeat is not
 itself cause for respawn.
 
 ## Git commit instructions

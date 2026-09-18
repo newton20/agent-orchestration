@@ -30,6 +30,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { assertArtifactPath } = require('./artifact-path');
 
 const {
   loadManifest,
@@ -135,6 +136,7 @@ function scaffoldProtocol({ manifestPath, pluginDir, dryRun = false, accepted, r
         { type: 'mkdir', path: path.join(protoDir, 'logs') },
         { type: 'touch', path: path.join(protoDir, 'logs', 'events.jsonl') },
       ];
+      for (const action of actions) assertArtifactPath(accepted.workspace.root, action.path);
       if (dryRun) return { ok: true, dryRun: true, protoDir, actions };
       for (const action of actions) {
         assertOwnership(owner, accepted.workspace);

@@ -139,11 +139,18 @@ variable that is not in the list below, the render must fail.
 | `phase_id` | string | Phase identifier matching `VALID_ID_RE` (`[A-Za-z0-9._-]+`). The character class is shared with `parse-manifest.js`'s `VALID_ID_RE` and `session-start.js`'s `FLAG_NAME_RE` — change all three sites or none. See `hooks/README.md` "Contract invariants" and `docs/todos/006` / `030` for context. |
 | `project_name` | string | Repo slug or user-facing project name. Displayed in the role preamble. |
 | `workdir` | absolute path | The spawned session's `cwd`. Every protocol file path is anchored here. |
-| `phase_dir` | absolute path | `${workdir}/docs/orchestration/phases/${phase_id}`. All inputs/outputs for this phase live under it. |
-| `completion_signal_path` | absolute path | Where the agent writes its completion signal. Unit 7 derives this as `${phase_dir}/${role}-complete.md` unless the manifest overrides it. |
-| `prior_phase_dirs` | block (newline-joined absolute paths) | Completion-signal paths from `depends_on` phases. Empty if no upstream deps. |
-| `heartbeat_path` | absolute path | `${phase_dir}/heartbeat.jsonl`. Optional — the role prompt may disable heartbeats by passing an empty value. |
+| `phase_dir` | absolute path | V1: `${workdir}/docs/orchestration/phases/${phase_id}`. V2: the assigned primary-checkout run/phase/role/iteration/attempt directory, which can differ from the worker's checkout. |
+| `completion_signal_path` | absolute path | V1: `${phase_dir}/${role}-complete.md` unless overridden. V2: the exact assigned `completion.json` path. |
+| `prior_phase_dirs` | block | Role-independent accepted upstream report paths. V2 also includes each report's full attempt identity, kind and SHA-256; rendered for coordinators as well as other roles. Empty if no accepted upstream reports. |
+| `heartbeat_path` | absolute path | V1: `${phase_dir}/heartbeat.jsonl`. V2: the assigned `heartbeat.json`. An empty value disables heartbeats. |
 | `suggested_commit_message` | string | A commit-message seed drawn from the manifest's phase entry. The agent is free to override it. |
+| `attempt_context` | string | V2 run, phase, role, zero-based review iteration and attempt assignment. Empty for V1; available to role templates and nested QA fragments. |
+| `attempt_protocol_block` | block | Universal V2 identity, exact artifact paths, verification and cooperative-release contract. Empty for V1. |
+| `completion_identity_fields` | block | Version-specific completion frontmatter. V2 includes the full assignment identity, `kind: completion` and `observed_at`; V1 includes schema, agent and phase. |
+| `heartbeat_example` | JSON example | V1 JSONL record or V2 single-object report with the full assignment identity. |
+| `heartbeat_instructions` | block | V1 append instructions or V2 atomic single-object replacement instructions; never both in the same render. |
+| `heartbeat_identity_note` | block | V1 PID guidance or V2 progress-only provenance and latest-value retention. |
+| `heartbeat_cadence` | string | Version-specific write operation at the shared five-minute / ten-edit cadence. |
 
 ### Impl-specific
 
@@ -186,6 +193,8 @@ variable that is not in the list below, the render must fail.
 | `prior_session_pid` | string | The crashed session's PID, for log correlation. `unknown` if the orchestrator never captured it. |
 | `completed_checkpoints_block` | block | Checkpoints reconstructed from prior-session artifacts; each entry is a one-line bullet with a verified-on-disk pointer. |
 | `remaining_work_block` | block | The plan excerpt for this phase with completed items marked `[x - done by prior session]` and the rest marked `[ ]`. |
+| `recovery_prompt_audit` | derived block | V1 audits the preserved `.original.md`; V2 audits the explicit immutable historical prompt without replaying its kickoff. |
+| `recovery_ownership_check` | derived block | V1 keeps its heartbeat PID check; V2 relies on controller-authorized engine/descendant closure and blocks on conflicting writes. |
 
 ## Empty-state rendering
 

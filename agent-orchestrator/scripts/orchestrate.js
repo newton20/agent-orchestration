@@ -623,12 +623,20 @@ function acquireLock(orchDir, opts = {}) {
   // tiebreaker falsely concluded "recycled PID" against ITSELF — a
   // second orchestrator could overwrite a live lock and run
   // concurrently.
+  const hostEvidence = Object.hasOwn(opts, '_hostEvidence') ? opts._hostEvidence
+    : !opts._pid && !opts._startTimeProbe ? require('./workspace-owner').getHostEvidence() : null;
+  const sameHost = hostEvidence && typeof hostEvidence.hostname === 'string' &&
+    hostEvidence.hostname.toLowerCase() === hostname.toLowerCase();
+  const creationTime = sameHost && hostEvidence.pid === ourPid &&
+    Number.isFinite(Date.parse(hostEvidence.creation_time)) ? hostEvidence.creation_time : null;
   const startTimeProbe = opts._startTimeProbe || probeProcessStartTime;
-  let osStartedAtMs = null;
-  try {
-    osStartedAtMs = startTimeProbe(ourPid);
-  } catch (_) {
-    osStartedAtMs = null;
+  let osStartedAtMs = creationTime ? Date.parse(creationTime) : null;
+  if (opts._startTimeProbe || !hostEvidence) {
+    try {
+      osStartedAtMs = startTimeProbe(ourPid);
+    } catch (_) {
+      osStartedAtMs = null;
+    }
   }
   // Persist the OS-reported start time as ISO when available; fall
   // back to the wall-clock `now` when the probe is inconclusive
@@ -639,7 +647,12 @@ function acquireLock(orchDir, opts = {}) {
       ? new Date(osStartedAtMs).toISOString()
       : now;
   const content = JSON.stringify(
-    { pid: ourPid, startedAt: startedAtIso, hostname },
+    {
+      pid: ourPid, startedAt: startedAtIso, hostname,
+      creation_time: creationTime || (typeof osStartedAtMs === 'number' && Number.isFinite(osStartedAtMs)
+        ? new Date(osStartedAtMs).toISOString() : null),
+      host_boot_id: sameHost && hostEvidence.host_boot_id || null,
+    },
     null,
     2
   );
@@ -3694,11 +3707,16 @@ function runOneTick(runState, opts) {
  */
 async function acquireLegacyOwner(manifestPath, manifest, opts) {
   const W = require('./workspace-owner');
+  const validation = validate(manifest);
+  if (!validation.valid) {
+    throw new Error(`invalid V1 manifest: ${validation.errors.map((error) => `${error.path}: ${error.message}`).join('; ')}`);
+  }
   const manifestDir = path.dirname(path.resolve(manifestPath));
   const workdir = path.resolve(manifestDir, manifest.workdir || '.');
-  const workspace = W.resolveWorkspace(workdir);
+  const workspace = W.resolveWorkspace(workdir, { allowNonGit: true });
   return W.acquireWorkspaceOwner(workspace, {
     _runtimeRoot: opts._runtimeRoot,
+    _probeLegacyProcess: opts._probeLegacyProcess,
     legacyLockPaths: [
       path.join(orchDirFor(manifestDir), LOCKFILE_NAME),
       path.join(orchDirFor(workdir), LOCKFILE_NAME),
@@ -3709,7 +3727,7 @@ async function acquireLegacyOwner(manifestPath, manifest, opts) {
 
 async function startV2Foundation(opts) {
   const { prepareV2Manifest } = require('./parse-manifest');
-  const { readState, createStateStore } = require('./state-store');
+  const { readState, createStateStore, assertRerunEligible } = require('./state-store');
   const W = require('./workspace-owner');
   const persisted = readState(opts.manifestPath);
   let accepted;
@@ -3750,19 +3768,31 @@ async function startV2Foundation(opts) {
       path.join(orchDirFor(manifestDir), LOCKFILE_NAME),
       path.join(orchDirFor(accepted.workdir), LOCKFILE_NAME),
       path.join(orchDirFor(accepted.workspace.root), LOCKFILE_NAME),
+      ...accepted.phases.flatMap((phase) => phase.agents)
+        .filter((agent) => agent.workspace.key === accepted.workspace.key)
+        .map((agent) => path.join(orchDirFor(agent.workdir), LOCKFILE_NAME)),
     ],
   });
   let lifecycle;
   try {
     const store = createStateStore({ manifestPath: opts.manifestPath, owner, _fs: opts._stateFs });
-    const state = opts.rerun
-      ? store.rerun({ expectedRevision: persisted?.revision, accepted })
-      : store.initialize(accepted);
-    lifecycle = await require('./attempt-lifecycle').createAttemptLifecycle({
+    const { createAttemptLifecycle } = require('./attempt-lifecycle');
+    if (opts.rerun) {
+      assertRerunEligible(store.read(), { allowUnclearedReservations: true });
+      if (accepted.workspace.key !== persisted.workspace.key) throw new Error('rerun cannot change workspace identity');
+      lifecycle = await createAttemptLifecycle({
+        owner, store, manifestPath: opts.manifestPath, _runtimeRoot: opts._runtimeRoot,
+      });
+      await lifecycle.close();
+      lifecycle = undefined;
+      store.rerun({ expectedRevision: store.read().revision, accepted });
+    } else store.initialize(accepted);
+    lifecycle = await createAttemptLifecycle({
       owner, store, manifestPath: opts.manifestPath, _runtimeRoot: opts._runtimeRoot,
       _fixtureAdapter: opts._fixtureAdapter, _lifecycleFault: opts._lifecycleFault,
       _hostEvidence: opts._hostEvidence,
     });
+    const state = store.read();
     const scaffold = scaffoldProtocol({ manifestPath: opts.manifestPath, accepted: state.accepted, runId: state.run_id, owner, pluginDir: opts.pluginDir });
     if (!scaffold.ok) throw new Error(scaffold.error || 'V2 run scaffold failed');
     owner.setReadiness('live_dispatch_disabled');
@@ -3821,7 +3851,11 @@ async function runOrchestrator(opts) {
     if (!opts.dryRun) {
       owner = await (opts._acquireLegacyOwner || acquireLegacyOwner)(opts.manifestPath, loaded.manifest, opts);
     }
-    return await runLegacyOrchestrator(opts);
+    return await runLegacyOrchestrator({
+      ...opts,
+      _hostEvidence: opts._hostEvidence || (owner && !opts._acquireLegacyOwner
+        ? require('./workspace-owner').ownerHostEvidence(owner) : null),
+    });
   } catch (error) {
     logger('error', error.message);
     return { ok: false, summary: error.code === 'ELOCKED' ? 'lock_contention' : 'preflight_failed', error: error.message, code: error.code === 'ELOCKED' ? 2 : 1, history: [] };

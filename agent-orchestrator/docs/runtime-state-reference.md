@@ -4,6 +4,9 @@ V2 supports Windows and Node >=20. Its Windows ownership tests run real
 competing Node processes. Production worker dispatch remains disabled.
 The lifecycle is exercised through an explicit programmatic fixture adapter;
 there is no CLI flag that enables it.
+Updated V1 and V2 controllers require Windows PowerShell, Git on PATH,
+and access to the current user's LocalApplicationData directory for their
+shared ownership primitive.
 
 ## Accepted configuration
 
@@ -77,6 +80,7 @@ the runner observes existing attempts but creates no new dispatches.
 | `read()` | Read and validate without writing; missing file returns `null`. |
 | `initialize(accepted)` | Create a run, or return the existing V2 record unchanged. Completed V1 phases are copied into `legacy_history`. |
 | `transact({ expectedRevision, command, mutate })` | Clone the current record, invoke a synchronous callback, and atomically publish state, command response, and events. |
+| `transactInternal({ expectedRevision, mutate })` | Commit an owner-internal transition with the same revision and publication guarantees, without storing a command deduplication result. |
 | `rerun({ expectedRevision, accepted })` | Create a new run ID and retain the prior record, without recursively nesting history. Reject different workspaces and attempts needing closure reconciliation. |
 
 Example owner-side transition:
@@ -101,6 +105,11 @@ sorted object keys. An identical command returns its original response
 before checking the caller's now-stale revision. Reusing an ID with a
 different payload fails. Deduplication is per run; old results remain in
 history after rerun.
+
+Internal transactions return the same `{ revision, result }` response but
+do not accept commands. Health-sample and progress-only updates persist
+without adding command results or domain events. Lifecycle transitions
+still commit their pending events with the state change.
 
 The callback cannot change canonical identities, previous runs, imported
 history, command results, outbox bookkeeping, or the accepted snapshot.
@@ -172,12 +181,29 @@ This endpoint is an inspection surface, not operator-command authorization.
 
 Updated V1 and V2 runners share the controller pipe claim. Before
 activation, the owner inspects legacy lock records at the manifest protocol
-directory, declared primary workdir protocol directory, and canonical
-worktree protocol directory. Live or uncertain owners block activation.
+directory, declared workdir protocol directories, and canonical
+worktree protocol directory. Additional writable checkouts check their
+root and every declared agent workdir. Live or uncertain owners block activation.
+These refusals return `lock_contention` with exit code 2; corrupt lock
+records remain preflight failures with exit code 1.
 Confirmed process absence, reliable creation-time mismatch, or a changed
 known host boot identity permits draining matching stale records. Legacy
 `startedAt` alone is insufficient for PID-reuse proof because older writers
 could store a wall-clock fallback.
+Updated V1 lock writers also persist explicit OS `creation_time` and
+`host_boot_id` when known, reusing the owner's captured evidence. Unknown
+evidence stays null; a fallback `startedAt` is never promoted to creation
+evidence. Existing lock candidates are deduplicated by native realpath and
+Windows case normalization before draining, with a byte-for-byte recheck.
+
+V1 also accepts an existing non-Git workdir. `resolveWorkspace(workdir,
+{ allowNonGit: true })` returns a `kind: 'directory'` identity only after
+Git reports that it is not a repository and an ancestor check finds no
+Git metadata. Git errors, missing tools, permissions failures, and
+unresolved metadata are not permission to fall back. Git-backed V1 uses
+the same worktree key as V2; V2 remains Git-only. An initially invalid V1
+manifest fails before ownership acquisition rather than guessing which
+workspace to claim.
 
 Operators must stop using pre-upgrade binaries for that workspace. An old
 binary launched after the drain check is outside this upgrade guarantee.
@@ -188,6 +214,8 @@ Deleting lock metadata does not release a live named pipe.
 `startV2Foundation(options)` acquires ownership, initializes/resumes state,
 reacquires prior checkout reservations, creates run-scoped directories,
 and returns `{ owner, store, state, lifecycle, authoring, summary }`.
+The returned `state` is the latest persisted snapshot after startup
+reservation reconciliation, including its current revision on zero-tick runs.
 Callers must `await lifecycle.close()` and then `await owner.release()`
 in `finally`. Closing a lifecycle releases additional kernel handles but
 does not erase unresolved reservations. Close cannot overlap a tick.
@@ -198,6 +226,10 @@ Artifacts are scoped beneath
 `<workspace-root>\docs\orchestration\runs\<run-id>\`.
 Scaffolding requires the persisted accepted snapshot and a live owner;
 dry-run preview needs an accepted snapshot and a run ID but writes nothing.
+`artifact-path.assertArtifactPath(root, file)` checks containment and rejects
+redirected path components. Scaffolding validates every target before
+creating any directory or event file; attempt reads and prompt publication
+use the same guard.
 Ordinary restarts preserve artifacts, events, paused state, and the
 accepted snapshot. Authoring validation errors/drift are reported
 separately, without replacing the run.
@@ -217,7 +249,7 @@ Each attempt has `lifecycle_version: 1` and the following additional fields:
 ```js
 {
   intended_review_stage, retry_category, previous_attempt_id,
-  status, created_at, started_at, launch_host,
+  status, created_at, started_at, launch_host, process_sample_watermark,
   intent: {
     launch_token, session_name, timeout_minutes, required_verification,
     prompt_options, prompt_text, prompt_sha256, prompt_warnings
@@ -243,12 +275,20 @@ the fixture adapter once. Restart may continue a queued intent under its
 original attempt ID. Once `launching` is durable, missing acknowledgement
 requires reconciliation and never automatic replay. A thrown adapter call
 leaves its durable intent and reservations available for the next tick.
+An already-admitted queued retry retains its spent allowance and can
+resume at the budget limit. Dispatch checks the adapter's engine and
+read-only capabilities again, including on queued resumption. A queued
+intent may refresh its launch-host identity before dispatch; the identity
+is immutable after launch begins.
 
 The state store rejects changes to historical identities, dispatch intent,
 recorded process/session/submission identities, outcomes, evidence history,
 or released reservations. Retry counters must agree with recorded attempts.
-Histories are bounded to 64 attempts per role, 64 observations and 64
-accepted artifact versions per attempt, and 64 tracked descendants.
+Histories are bounded to 64 attempts per role, 64 observations, 64 terminal
+artifact versions per attempt, and 64 tracked descendants. Heartbeat and
+checkpoint evidence keeps only its latest accepted provenance. Existing
+history may retain up to 64 legacy progress entries separately from the
+terminal-artifact limit.
 Reaching a bound fails explicitly; history is not silently discarded.
 The canonical 16 MiB state limit still applies.
 
@@ -296,6 +336,9 @@ different evidence fails. Late callbacks after the adapter call has
 returned are rejected. `reconcile` may supply late acknowledgements for
 the same attempt, or supported closure evidence for an unidentified
 launch, without resubmitting work. It must not perform launch effects.
+Dispatched attempts remain eligible for closure reconciliation after an
+outcome until their reservation is released. Additive descendant/closure
+observations cannot rewrite that outcome or its process/submission identity.
 No observation or artifact-provided role label grants operator authority.
 
 ## Attempt artifacts and review
@@ -322,14 +365,27 @@ Accepted evidence records retain the path, SHA-256, full identity, and
 `source: worker_report`. This is reported completion, not independent
 verification.
 
+Malformed, oversized, incomplete, or invalidly shaped worker reports
+produce per-attempt diagnostics and require intervention while other
+attempts remain observable. Corrected reports can be reconciled later.
+Infrastructure read failures still fail explicitly; they are not treated
+as missing or invalid worker reports.
+
 Completion requires `status: complete`. Blocked or partial work requires
 intervention. QA also requires an attempt-bound verdict containing
 `verdict: pass|fail` and `verification: [{ id, status, evidence }]`.
 Required rows are `scope`, `P1`, `P2`, `P3`, `P4`, and `P6`. A pass needs
 exactly one passing entry with nonempty evidence for every required row.
-Skipped or missing verification cannot pass. Valid QA failures advance the
-review iteration only after safe release. Successful and failed review
+Skipped or missing verification cannot pass. With an enabled review loop,
+valid QA failures advance the review iteration only after safe release.
+Without a review loop, a valid negative verdict fails the phase, including
+QA-only and mixed-role phases, without charging launch or execution retries.
+Terminal outcomes retain their evidence and continue reconciling closure.
+Successful and failed review
 rounds retain their evidence in `review_history`.
+An incomplete QA report without a valid fail verdict remains an
+intervention condition even after process closure; it does not spend an
+execution retry or bypass missing verification.
 
 Review iterations are zero-based. `review_loop.max_iterations` bounds QA
 rounds. Each role separately has two launch/delivery retries and two
@@ -344,6 +400,11 @@ Persisted pause continues to accept reports and reconcile closure while
 suppressing every new dispatch, including QA, retries and recovery.
 Recovery prompts retain immutable prior prompt references and point all
 new writes to the new attempt. They do not copy or replay an old kickoff.
+V2 recovery uses the explicit historical prompt for context audits and the
+controller's closure decision, not V1's local `.original.md` or heartbeat
+PID instructions. V1 recovery retains those legacy instructions.
+Every role, including coordinator, receives accepted upstream artifact
+identities, paths, and hashes in its rendered prompt.
 
 ## Process evidence and durable checkout reservations
 
@@ -353,6 +414,11 @@ Each process row has `pid`, `creation_time`, and `parent_pid`. The full
 Windows CIM query is unfiltered; the existing V1 name lookup still returns
 a numeric PID or null. `check-health.observeProcessIdentity(identity, sample)`
 returns `{ state: 'live'|'dead'|'unknown', reason }`.
+Both successful and failed probes use Node's host name; host-name
+comparisons are case-insensitive.
+Creation-time identity uses the shared precision-aware `creationTimeKey`:
+equivalent timestamp formats deduplicate, submillisecond differences remain
+distinct, and missing creation evidence never matches known creation evidence.
 
 Complete, successful tables prove an identified engine dead when its PID
 is absent or its creation time differs. Missing creation/boot evidence,
@@ -361,11 +427,20 @@ unknown. Changed known boot identity proves the old local processes dead.
 PID reuse never authorizes targeting the replacement process. This module
 does not issue process cancellation.
 
+`process_sample_watermark` stores the sample ID and observation time at
+dispatch or later process correlation. Termination evidence must be newer
+than that watermark and cannot predate the identified process's creation.
+Reusing an empty pre-launch table never proves that a newly launched
+worker is dead. The watermark survives controller restart.
+
 Health records retain sample ID and observation time; duplicate or older
 samples do not increase unknown counts. Failed probes persist
 `process_diagnostic`, set `runtime_status: process_observation_failed`,
 and are logged by the runner. Storage failures throw without successful
 acknowledgement or dispatch.
+The next healthy sample removes that diagnostic. Fresh health-only updates
+may advance the revision but add no outbox events or command results;
+an identical repeated sample produces no new revision.
 
 Engine termination and checkout release are distinct. Tracked descendants,
 including children first observed when their parent disappears, retain the
@@ -376,6 +451,25 @@ worker and its descendants will perform no further project writes without
 a new assignment. Completion and idle state alone do not provide this
 promise. Cooperative release uses the trusted-worker model; it does not
 revoke OS permissions.
+
+Process closure retains its decisive health sample in the immutable
+`reservation.closure.process_evidence` record, including confirmation that
+descendants are closed. Later health observations or repaired completion
+reports do not invalidate that proof when deciding whether to rerun.
+A conclusive reboot can use correlated launcher boot evidence even when
+the engine session was never identified; same-boot launcher disappearance
+alone remains insufficient.
+
+Process-only closure requires an eligible complete descendant scan, not a
+skipped scan interpreted as an empty result. A correlated engine's known
+boot identity takes precedence over launcher and dispatch boot evidence
+on the same host, so late correlation cannot disable descendant tracking.
+Same-boot engine termination still requires its creation identity.
+The controller's own boot evidence is not a substitute. Without trustworthy
+scan association, the reservation stays held until explicit closure or
+cooperative release; a complete observation of a changed known host boot
+can independently establish reboot closure. Dispatch/correlation watermarks
+still fence all negative process evidence.
 
 There is one durable private record per reserved checkout:
 
@@ -390,6 +484,9 @@ has the current-user-only ACL. Publication uses a flushed temporary file
 and atomic rename while holding the checkout's `controller` kernel claim.
 `readCheckoutReservation`, `reserveCheckout`, and `releaseCheckout` require
 the actual live owner handle. Metadata cannot substitute for that handle.
+Manifest paths use the same absolute, case-normalized comparison during
+acquisition and reservation updates on Windows, including existing
+mixed-case records.
 
 The canonical manifest-sibling status file is not a workspace registry.
 The private record survives controller exit and blocks unrelated V1/V2
@@ -405,5 +502,19 @@ removed. A crash between those operations is reconciled on restart.
 then startup reacquires even a released attempt's additional checkout.
 Unresolved records are retained on storage errors or shutdown. Additional
 checkout handles are conservatively retained until lifecycle close.
-Explicit rerun remains subject to the state store's conservative attempt
-closure gate; it cannot be used to discard attempt history or reservations.
+Explicit rerun can replace an untouched, undispatched run. Otherwise every
+started phase must be completed or failed, and every historical attempt must have a
+supported terminal lifecycle outcome and concrete cooperative, adapter,
+no-external-effect, or process closure evidence. Mutating attempts also need
+confirmed private reservation cleanup. Never-started pending or
+dependency-blocked phases have no worker ownership to drain and do not
+prevent rerun. Live, unknown, queued, or
+uncleared work cannot be discarded through rerun.
+
+Startup first checks canonical closure eligibility, then synchronizes
+reservations under the **old run ID**, without invoking its fixture adapter.
+Only after cleanup succeeds does `store.rerun` publish the new ID and retain
+the complete prior run in immutable history. Imported V1 history remains
+available in the current `legacy_history` array as well. Additional old-run checkout
+handles are closed before the replacement lifecycle is constructed. Failed
+cleanup or publication never authorizes dispatch under a new identity.

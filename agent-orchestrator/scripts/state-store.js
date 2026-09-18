@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const yaml = require('js-yaml');
 const { randomUUID, createHash } = require('node:crypto');
-const { assertOwnership, validateWorkspace } = require('./workspace-owner');
+const { assertOwnership, validateWorkspace, readCheckoutReservation } = require('./workspace-owner');
 const { statusPathFor, validate, normalizePhases, findDanglingDeps, V2_ENGINES, V2_ACCESS } = require('./parse-manifest');
 
 const STATE_SCHEMA_VERSION = 2;
@@ -108,11 +108,20 @@ function validateLifecycleAttempt(attempt, record) {
   requireShape(isObject(attempt.reservation) && ['pending', 'held', 'released'].includes(attempt.reservation.state),
     'attempt reservation is required');
   if (attempt.reservation.state === 'released') requireShape(isObject(attempt.reservation.closure), 'released attempt needs concrete closure');
+  if (attempt.reservation_cleared !== undefined) requireShape(
+    typeof attempt.reservation_cleared === 'boolean' && attempt.reservation.state === 'released',
+    'reservation cleanup acknowledgement requires release');
   requireShape(isObject(attempt.observations) && Object.keys(attempt.observations).length <= 64 &&
-    isObject(attempt.evidence) && Array.isArray(attempt.evidence_history) && attempt.evidence_history.length <= 64 &&
+    isObject(attempt.evidence) && Array.isArray(attempt.evidence_history) &&
+    attempt.evidence_history.filter((e) => ['heartbeat', 'checkpoint'].includes(e?.kind)).length <= 64 &&
+    attempt.evidence_history.filter((e) => !['heartbeat', 'checkpoint'].includes(e?.kind)).length <= 64 &&
     Array.isArray(attempt.descendants) && attempt.descendants.length <= 64 &&
     typeof attempt.descendant_tracking_complete === 'boolean' &&
     isObject(attempt.health) && nonnegative(attempt.health.unknown_samples), 'bounded observations and health identity are required');
+  if (attempt.process_sample_watermark !== undefined) requireShape(
+    isObject(attempt.process_sample_watermark) && isId(attempt.process_sample_watermark.sample_id) &&
+    typeof attempt.process_sample_watermark.observed_at === 'string' &&
+    Number.isFinite(Date.parse(attempt.process_sample_watermark.observed_at)), 'invalid process sample watermark');
   const phase = record.accepted.phases.find((p) => p.id === attempt.phase_id);
   const agent = phase.agents.find((a) => a.role === attempt.role) || {
     engine: record.accepted.manifest.defaults.engine, access: 'mutating',
@@ -149,8 +158,18 @@ function preserveLifecycle(previous, next) {
         const current = later.attempts.find((a) => a.attempt_id === attempt.attempt_id);
         requireShape(Boolean(current), 'historical attempts cannot be removed');
         for (const field of ['lifecycle_version', 'attempt_id', 'run_id', 'phase_id', 'role', 'review_iteration', 'engine', 'access',
-          'workdir', 'workspace', 'intent', 'artifacts', 'created_at', 'intended_review_stage', 'retry_category', 'previous_attempt_id', 'launch_host']) {
+          'workdir', 'workspace', 'intent', 'artifacts', 'created_at', 'intended_review_stage', 'retry_category', 'previous_attempt_id']) {
           requireShape(canonicalJson(attempt[field]) === canonicalJson(current[field]), `immutable attempt field ${field}`);
+        }
+        if (attempt.status !== 'queued' || attempt.started_at ||
+            !['queued', 'launching'].includes(current.status)) {
+          requireShape(canonicalJson(attempt.launch_host) === canonicalJson(current.launch_host), 'immutable attempt field launch_host');
+        }
+        if (attempt.process_sample_watermark) {
+          const before = attempt.process_sample_watermark;
+          const after = current.process_sample_watermark;
+          requireShape(after && (canonicalJson(before) === canonicalJson(after) ||
+            Date.parse(after.observed_at) > Date.parse(before.observed_at)), 'process sample watermark cannot move backward');
         }
         for (const field of ['outcome', 'launch_process', 'engine_process', 'session_id', 'submission', 'adapter_closure']) {
           if (Object.hasOwn(attempt, field)) requireShape(canonicalJson(attempt[field]) === canonicalJson(current[field]), `immutable attempt observation ${field}`);
@@ -165,6 +184,8 @@ function preserveLifecycle(previous, next) {
         if (attempt.started_at) requireShape(attempt.started_at === current.started_at, 'attempt start clock cannot change');
         if (attempt.reservation.state === 'released') requireShape(canonicalJson(attempt.reservation) === canonicalJson(current.reservation),
           'released reservation cannot be reacquired by the old attempt');
+        if (attempt.reservation_cleared === true) requireShape(current.reservation_cleared === true,
+          'reservation cleanup acknowledgement cannot be reset');
       }
       for (const category of ['launch', 'execution']) {
         requireShape((later.budgets?.[category] || 0) >= (entry.budgets?.[category] || 0), 'retry budgets cannot reset');
@@ -327,6 +348,43 @@ function newRun(accepted, revision, history = [], legacyHistory = []) {
   return state;
 }
 
+function assertRerunEligible(state, { allowUnclearedReservations = false } = {}) {
+  requireShape(state?.schema_version === 2, 'explicit rerun requires an existing V2 run');
+  const phases = Object.values(state.phases);
+  const attempts = phases.flatMap((phase) => Object.values(phase.roles).flatMap((role) => role.attempts));
+  if (!attempts.length && phases.every((phase) => phase.status === 'pending')) return;
+  if (phases.some((phase) => {
+    const unstarted = Object.values(phase.roles).every((role) => role.attempts.length === 0);
+    if (unstarted && (phase.status === 'pending' ||
+        (phase.status === 'blocked' && phase.blocker?.category === 'dependency'))) return false;
+    return !['completed', 'failed'].includes(phase.status);
+  })) {
+    throw new Error('rerun requires terminal started phases without active work');
+  }
+  for (const attempt of attempts) {
+    const outcome = attempt.outcome;
+    const terminal = attempt.lifecycle_version === 1 && Number.isFinite(Date.parse(outcome?.at)) &&
+      ((attempt.status === 'completed' && (outcome.type === 'completed' || (attempt.role === 'qa' && outcome.type === 'qa_failed'))) ||
+        (attempt.status === 'failed' && outcome.type === 'failed' && ['launch', 'execution'].includes(outcome.category)));
+    const closure = attempt.reservation?.closure;
+    const processProof = closure?.process_evidence;
+    const concrete = attempt.reservation?.state === 'released' && isObject(closure) &&
+      Number.isFinite(Date.parse(closure.at)) && isId(closure.sample_id) &&
+      ((closure.type === 'cooperative_release' && attempt.evidence?.release?.kind === 'release') ||
+        (closure.type === 'no_external_effect' && attempt.no_external_effect === true) ||
+        (closure.type === 'adapter_closure' && attempt.adapter_closure &&
+          attempt.observations?.[attempt.adapter_closure.observation_id]?.kind === 'closure') ||
+        (closure.type === 'process_closure' && (processProof
+          ? processProof.sample_id === closure.sample_id && processProof.observed_at === closure.at &&
+            processProof.engine?.state === 'dead' && processProof.descendants_closed === true
+          : attempt.health?.sample_id === closure.sample_id && attempt.health.observed_at === closure.at)));
+    if (!terminal || !concrete || (!allowUnclearedReservations &&
+        attempt.access === 'mutating' && attempt.reservation_cleared !== true)) {
+      throw new Error('rerun requires terminal attempt outcomes, concrete closure and cleared mutating reservations');
+    }
+  }
+}
+
 function createStateStore({ manifestPath, owner, _fs = {} }) {
   const statusPath = statusPathFor(path.resolve(manifestPath));
   const io = { ...fs, ..._fs };
@@ -361,6 +419,45 @@ function createStateStore({ manifestPath, owner, _fs = {} }) {
     }
     return clone(state);
   }
+  function transact({ expectedRevision, command, mutate }, internal = false) {
+    const current = readRecord(manifestPath);
+    requireShape(current.state?.schema_version === 2, 'initialize a V2 run before transacting');
+    owned(current.state.workspace);
+    let hash;
+    if (internal) {
+      requireShape(command === undefined, 'internal transactions do not accept commands');
+    } else {
+      requireShape(isObject(command) && isId(command.id) && Object.hasOwn(command, 'payload'), 'command id and payload are required');
+      hash = fingerprint(command.payload);
+      const prior = current.state.command_results[command.id];
+      if (prior) {
+        if (prior.fingerprint !== hash) throw new Error('command ID reuse with differing payload fingerprint is rejected');
+        return clone(prior.response);
+      }
+    }
+    if (!positive(expectedRevision) || expectedRevision !== current.state.revision) throw new Error('state revision conflict');
+    if (typeof mutate !== 'function') throw new Error('synchronous transaction callback is required');
+    const draft = clone(current.state);
+    mutating = true;
+    try {
+      const outcome = mutate(draft);
+      if (outcome && typeof outcome.then === 'function') throw new Error('transaction callback must be synchronous, not async');
+      requireShape(isObject(outcome) && Object.hasOwn(outcome, 'result'), 'transaction result is required');
+      for (const field of ['schema_version', 'run_id', 'workspace', 'history', 'legacy_history', 'created_at', 'command_results', 'outbox', 'next_event_sequence', 'revision']) {
+        if (canonicalJson(draft[field]) !== canonicalJson(current.state[field])) throw new Error(`immutable transaction field: ${field}`);
+      }
+      // Structural acceptance belongs to the later human-command contract.
+      if (canonicalJson(draft.accepted) !== canonicalJson(current.state.accepted)) throw new Error('accepted snapshot is immutable in foundation transactions');
+      preserveLifecycle(current.state, draft);
+      draft.revision++;
+      draft.updated_at = new Date().toISOString();
+      const response = { revision: draft.revision, result: clone(outcome.result) };
+      if (!internal) draft.command_results[command.id] = { fingerprint: hash, response };
+      appendEvents(draft, outcome.events);
+      publish(draft, current.bytes);
+      return clone(response);
+    } finally { mutating = false; }
+  }
   return Object.freeze({
     read: () => readState(manifestPath),
     initialize(accepted) {
@@ -371,54 +468,18 @@ function createStateStore({ manifestPath, owner, _fs = {} }) {
       const state = newRun(accepted, 1, [], current.state ? [current.state] : []);
       return publish(state, current.bytes);
     },
-    transact({ expectedRevision, command, mutate }) {
-      const current = readRecord(manifestPath);
-      requireShape(current.state?.schema_version === 2, 'initialize a V2 run before transacting');
-      owned(current.state.workspace);
-      requireShape(isObject(command) && isId(command.id) && Object.hasOwn(command, 'payload'), 'command id and payload are required');
-      const hash = fingerprint(command.payload);
-      const prior = current.state.command_results[command.id];
-      if (prior) {
-        if (prior.fingerprint !== hash) throw new Error('command ID reuse with differing payload fingerprint is rejected');
-        return clone(prior.response);
-      }
-      if (!positive(expectedRevision) || expectedRevision !== current.state.revision) throw new Error('state revision conflict');
-      if (typeof mutate !== 'function') throw new Error('synchronous transaction callback is required');
-      const draft = clone(current.state);
-      mutating = true;
-      try {
-        const outcome = mutate(draft);
-        if (outcome && typeof outcome.then === 'function') throw new Error('transaction callback must be synchronous, not async');
-        requireShape(isObject(outcome) && Object.hasOwn(outcome, 'result'), 'transaction result is required');
-        for (const field of ['schema_version', 'run_id', 'workspace', 'history', 'legacy_history', 'created_at', 'command_results', 'outbox', 'next_event_sequence', 'revision']) {
-          if (canonicalJson(draft[field]) !== canonicalJson(current.state[field])) throw new Error(`immutable transaction field: ${field}`);
-        }
-        // Structural acceptance belongs to the later human-command contract.
-        if (canonicalJson(draft.accepted) !== canonicalJson(current.state.accepted)) throw new Error('accepted snapshot is immutable in foundation transactions');
-        preserveLifecycle(current.state, draft);
-        draft.revision++;
-        draft.updated_at = new Date().toISOString();
-        const response = { revision: draft.revision, result: clone(outcome.result) };
-        draft.command_results[command.id] = { fingerprint: hash, response };
-        appendEvents(draft, outcome.events);
-        publish(draft, current.bytes);
-        return clone(response);
-      } finally { mutating = false; }
-    },
+    transact: (options) => transact(options),
+    transactInternal: (options) => transact(options, true),
     rerun({ expectedRevision, accepted }) {
       const current = readRecord(manifestPath);
       requireShape(current.state?.schema_version === 2, 'explicit rerun requires an existing V2 run');
       owned(current.state.workspace);
       if (expectedRevision !== current.state.revision) throw new Error('state revision conflict');
       if (accepted.workspace.key !== current.state.workspace.key) throw new Error('rerun cannot change workspace identity');
-      for (const phase of Object.values(current.state.phases)) {
-        if (!['pending', 'completed', 'failed', 'blocked'].includes(phase.status) ||
-            Object.values(phase.roles).some((role) => role.attempts.length > 0)) {
-          throw new Error('rerun requires attempt closure reconciliation before replacing an active run');
-        }
-      }
+      assertRerunEligible(current.state);
+      if (readCheckoutReservation(owner)) throw new Error('rerun requires private reservation cleanup under the old run owner');
       const { history, ...prior } = current.state;
-      const next = newRun(accepted, current.state.revision + 1, [...history, prior]);
+      const next = newRun(accepted, current.state.revision + 1, [...history, prior], current.state.legacy_history);
       return publish(next, current.bytes);
     },
   });
@@ -427,4 +488,5 @@ function createStateStore({ manifestPath, owner, _fs = {} }) {
 module.exports = {
   STATE_SCHEMA_VERSION, MAX_STATE_BYTES, canonicalJson, fingerprint,
   validateAccepted, validateState, readState, createStateStore,
+  assertRerunEligible,
 };

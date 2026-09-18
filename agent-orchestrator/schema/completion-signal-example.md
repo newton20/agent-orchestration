@@ -39,12 +39,23 @@ heartbeat, checkpoint, verdict and cooperative release repeats the full
 identity tuple with its own `kind` and `observed_at`. V2 heartbeats are
 atomically replaced JSON objects, not an appended shared JSONL stream.
 Reads are bounded to 256 KiB and reject identity mismatches.
+Malformed, partially written, oversized or invalid reports put only their
+attempt in `needs_operator`; they cannot authorize success or automatic
+retry. Correct invalid reports at their assigned paths to reconcile again.
+Filesystem I/O failures remain explicit infrastructure errors. Heartbeats
+and checkpoints retain only their latest accepted provenance; they do not
+consume immutable terminal completion/verdict/release history.
 
 QA completion also needs `verdict.json`, with `kind: verdict`,
 `verdict: pass|fail`, and `verification: [{ id, status, evidence }]`.
 Rows `scope`, `P1`, `P2`, `P3`, `P4`, and `P6` are mandatory. A pass
 requires one passing entry with evidence for each row; a role label or
 an operator/approval field cannot waive required verification.
+Null and non-object verification rows are invalid. A `partial` or `blocked`
+QA completion without a valid fail verdict requires intervention, even
+after the engine exits or the controller restarts. A valid, fully evidenced
+fail verdict still enters the bounded review loop after safe release.
+A `complete` QA report without required verification cannot pass.
 
 Completion does not release a writable checkout. To release cooperatively,
 write `release.json` with the same identity, `kind: release`,

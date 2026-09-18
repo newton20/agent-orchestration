@@ -6,9 +6,10 @@ const { randomUUID, createHash } = require('node:crypto');
 const yaml = require('js-yaml');
 const W = require('./workspace-owner');
 const { canonicalJson, fingerprint } = require('./state-store');
-const { observeProcessIdentity } = require('./check-health');
+const { observeProcessIdentity, sameHostname, creationTimeKey } = require('./check-health');
 const { observeProcessTable } = require('./spawn-session');
 const { generatePrompt, atomicWrite } = require('./generate-prompt');
+const { assertArtifactPath } = require('./artifact-path');
 
 const MAX_ARTIFACT_BYTES = 256 * 1024;
 const MAX_ATTEMPTS_PER_ROLE = 64;
@@ -25,6 +26,39 @@ const sameIdentity = (a, b) => ID_FIELDS.every((key) => a[key] === b[key]);
 const currentAttempt = (role) => role.attempts.find((a) => a.attempt_id === role.current_attempt_id);
 const allAttempts = (state) => Object.values(state.phases).flatMap((p) => Object.values(p.roles).flatMap((r) => r.attempts));
 const unreleased = (a) => a.access === 'mutating' && a.reservation.state !== 'released';
+const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+const isProgress = (kind) => ['heartbeat', 'checkpoint'].includes(kind);
+const sameProcess = (a, b) => a.pid === b.pid && creationTimeKey(a.creation_time) === creationTimeKey(b.creation_time) &&
+  a.host_boot_id === b.host_boot_id && sameHostname(a.hostname, b.hostname);
+
+function newerSample(sample, watermark) {
+  return !watermark || (sample.sample_id !== watermark.sample_id &&
+    Date.parse(sample.observed_at) > Date.parse(watermark.observed_at));
+}
+
+function afterProcessWatermark(attempt, sample) {
+  return newerSample(sample, attempt.process_sample_watermark ||
+    (attempt.started_at ? { observed_at: attempt.started_at } : null));
+}
+
+function advanceProcessWatermark(attempt, sample) {
+  for (const candidate of [attempt.health, sample]) {
+    if (candidate.sample_id && newerSample(candidate, attempt.process_sample_watermark)) {
+      attempt.process_sample_watermark = { sample_id: candidate.sample_id, observed_at: candidate.observed_at };
+    }
+  }
+}
+
+function domainState(state) {
+  const phases = copy(state.phases);
+  for (const a of allAttempts({ phases })) {
+    delete a.health;
+    delete a.evidence.heartbeat;
+    delete a.evidence.checkpoint;
+  }
+  return canonicalJson({ phases, runtime_status: state.runtime_status,
+    process_error: state.process_diagnostic?.error || null });
+}
 
 function artifactPaths(workspace, identity) {
   W.validateWorkspace(workspace);
@@ -38,30 +72,11 @@ function artifactPaths(workspace, identity) {
   };
 }
 
-function checkArtifactPath(root, file) {
-  const canonicalRoot = W.canonicalPath(root);
-  if (canonicalRoot !== root) throw new Error('artifact workspace identity changed');
-  const relative = path.relative(root, file);
-  if (relative.startsWith('..') || path.isAbsolute(relative)) throw new Error('artifact path escapes canonical workspace');
-  let directory = root;
-  for (const part of relative.split(path.sep)) {
-    directory = path.join(directory, part);
-    let stat;
-    try { stat = fs.lstatSync(directory); } catch (error) {
-      if (error.code === 'ENOENT') break;
-      throw error;
-    }
-    if (stat.isSymbolicLink() || W.canonicalPath(directory) !== (process.platform === 'win32' ? directory.toLowerCase() : directory)) {
-      throw new Error('artifact path contains a redirected link');
-    }
-  }
-}
-
 function readAttemptArtifact(state, attempt, kind) {
   if (!ARTIFACT_KINDS.includes(kind)) throw new Error('unknown attempt artifact kind');
   const expected = artifactPaths(state.workspace, attempt)[kind];
   if (expected !== attempt.artifacts[kind]) throw new Error('persisted artifact path disagrees with attempt identity');
-  checkArtifactPath(state.workspace.root, expected);
+  assertArtifactPath(state.workspace.root, expected);
   let fd;
   try { fd = fs.openSync(expected, 'r'); } catch (error) {
     if (error.code === 'ENOENT') return null;
@@ -70,7 +85,7 @@ function readAttemptArtifact(state, attempt, kind) {
   let bytes;
   try {
     const stat = fs.fstatSync(fd);
-    if (!stat.isFile() || stat.size > MAX_ARTIFACT_BYTES) throw new Error('artifact exceeds bounded regular-file contract');
+    if (!stat.isFile() || stat.size > MAX_ARTIFACT_BYTES) return { rejected: 'artifact exceeds bounded regular-file contract' };
     const buffer = Buffer.alloc(Math.min(stat.size + 1, MAX_ARTIFACT_BYTES + 1));
     let length = 0;
     while (length < buffer.length) {
@@ -78,7 +93,7 @@ function readAttemptArtifact(state, attempt, kind) {
       if (!count) break;
       length += count;
     }
-    if (length > stat.size) throw new Error('artifact changed size during bounded read');
+    if (length !== stat.size) return { rejected: 'artifact changed size during bounded read' };
     bytes = buffer.subarray(0, length);
   } finally { fs.closeSync(fd); }
   const text = bytes.toString('utf8');
@@ -86,14 +101,19 @@ function readAttemptArtifact(state, attempt, kind) {
   try {
     if (text.startsWith('---')) {
       const match = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(text);
-      if (!match) throw new Error('incomplete artifact frontmatter');
+      if (!match) return { rejected: `invalid ${kind} artifact: incomplete artifact frontmatter` };
       data = yaml.load(match[1], { schema: yaml.JSON_SCHEMA });
     } else data = JSON.parse(text);
-  } catch (error) { throw new Error(`invalid ${kind} artifact: ${error.message}`); }
-  if (!data || data.schema_version !== 2 || data.kind !== kind || !sameIdentity(data, attempt)) {
+  } catch (error) {
+    if (!(error instanceof SyntaxError) && !(error instanceof yaml.YAMLException)) throw error;
+    return { rejected: `invalid ${kind} artifact: ${error.message}`.slice(0, 1024) };
+  }
+  if (!isObject(data) || data.schema_version !== 2 || data.kind !== kind || !sameIdentity(data, attempt)) {
     return { rejected: 'artifact provenance does not match active attempt' };
   }
-  if (!Number.isFinite(Date.parse(data.observed_at))) return { rejected: 'artifact observed_at is required' };
+  if (typeof data.observed_at !== 'string' || !Number.isFinite(Date.parse(data.observed_at))) {
+    return { rejected: 'artifact observed_at is required' };
+  }
   return { data, provenance: {
     ...identityOf(attempt), kind, path: expected, sha256: createHash('sha256').update(bytes).digest('hex'),
     observed_at: data.observed_at, source: 'worker_report',
@@ -129,12 +149,15 @@ function processRecord(value) {
 
 function acceptArtifacts(state, attempt) {
   for (const kind of ARTIFACT_KINDS) {
-    if (attempt.evidence[kind] && !['heartbeat', 'checkpoint'].includes(kind)) continue;
+    if (attempt.evidence[kind] && !isProgress(kind)) continue;
     const artifact = readAttemptArtifact(state, attempt, kind);
     if (!artifact) continue;
     if (artifact.rejected) { attempt.diagnostics[kind] = artifact.rejected; continue; }
     const { data, provenance } = artifact;
-    if (attempt.evidence[kind]?.sha256 === provenance.sha256) continue;
+    if (attempt.evidence[kind]?.sha256 === provenance.sha256) {
+      delete attempt.diagnostics[kind];
+      continue;
+    }
     let valid = true;
     if (kind === 'completion') {
       valid = ['complete', 'partial', 'blocked'].includes(data.status);
@@ -144,6 +167,7 @@ function acceptArtifacts(state, attempt) {
     } else if (kind === 'verdict') {
       valid = attempt.role === 'qa' && ['pass', 'fail'].includes(data.verdict) &&
         Array.isArray(data.verification) && data.verification.length <= 64 &&
+        data.verification.every(isObject) &&
         attempt.intent.required_verification.every((id) => data.verification.some((row) =>
           row.id === id && ['pass', 'fail'].includes(row.status) &&
           typeof row.evidence === 'string' && row.evidence.trim()));
@@ -155,16 +179,28 @@ function acceptArtifacts(state, attempt) {
       if (valid) attempt.qa_verdict = data.verdict;
     }
     if (!valid) { attempt.diagnostics[kind] = `invalid ${kind} report or missing required verification`; continue; }
-    if (attempt.evidence_history.length >= MAX_OBSERVATIONS) throw new Error('attempt evidence history limit reached; intervention required');
-    attempt.evidence_history.push(provenance);
+    if (!isProgress(kind)) {
+      if (attempt.evidence_history.filter((e) => !isProgress(e.kind)).length >= MAX_OBSERVATIONS) {
+        attempt.diagnostics[kind] = 'attempt terminal evidence history limit reached; intervention required';
+        continue;
+      }
+      attempt.evidence_history.push(provenance);
+    }
     attempt.evidence[kind] = provenance;
     delete attempt.diagnostics[kind];
   }
 }
 
-function addDescendants(attempt, sample) {
-  if (!sample.complete || sample.error) return;
-  if (sample.hostname !== attempt.launch_host.hostname || sample.host_boot_id !== attempt.launch_host.host_boot_id) return;
+function descendantHost(attempt) {
+  return [attempt.engine_process, attempt.launch_process].find((process) =>
+    process?.host_boot_id && sameHostname(process.hostname, attempt.launch_host.hostname)) || attempt.launch_host;
+}
+
+function addDescendants(attempt, sample, host) {
+  if (sample.complete !== true || sample.error ||
+      !sample.processes.every((row) => Number.isSafeInteger(row?.pid) && row.pid >= 0)) return false;
+  if (!sameHostname(sample.hostname, host.hostname) ||
+      !sample.host_boot_id || sample.host_boot_id !== host.host_boot_id) return false;
   // A child can first appear in the scan that observes its parent gone.
   // A reused parent PID may over-reserve; it must never under-reserve.
   let parents = [attempt.engine_process, attempt.launch_process, ...attempt.descendants].filter(Boolean);
@@ -174,28 +210,35 @@ function addDescendants(attempt, sample) {
       if (!Number.isSafeInteger(row.pid) || row.pid <= 0 || !parents.some((p) => row.parent_pid === p.pid)) continue;
       const process = { pid: row.pid, creation_time: row.creation_time ?? null, hostname: sample.hostname, host_boot_id: sample.host_boot_id };
       if ([attempt.engine_process, attempt.launch_process, ...attempt.descendants].filter(Boolean)
-        .some((p) => canonicalJson(p) === canonicalJson(process))) continue;
+        .some((p) => sameProcess(p, process))) continue;
       if (attempt.descendants.length >= MAX_OBSERVATIONS) throw new Error('descendant tracking limit reached; intervention required');
       attempt.descendants.push(process);
       found.push(process);
     }
     parents = found;
   }
+  return true;
 }
 
 function reconcileAttempt(state, attempt, sample) {
-  if (attempt.outcome && attempt.reservation.state === 'released') return;
+  if (attempt.status === 'queued' || (attempt.outcome && attempt.reservation.state === 'released')) return;
   acceptArtifacts(state, attempt);
-  const fresh = sample.sample_id !== attempt.health.sample_id &&
-    (!attempt.health.observed_at || Date.parse(sample.observed_at) > Date.parse(attempt.health.observed_at));
+  const fresh = newerSample(sample, attempt.health.observed_at ? attempt.health : null);
+  const negativeEligible = afterProcessWatermark(attempt, sample);
   let engine = attempt.health.engine || { state: 'unknown', reason: 'no process observation yet' };
   let closed = false;
   if (fresh) {
-    addDescendants(attempt, sample);
+    const host = descendantHost(attempt);
+    const scanned = negativeEligible && addDescendants(attempt, sample, host);
     engine = observeProcessIdentity(attempt.engine_process || attempt.launch_host, sample);
-    const rebooted = attempt.launch_host.hostname === sample.hostname && attempt.launch_host.host_boot_id &&
-      sample.host_boot_id && attempt.launch_host.host_boot_id !== sample.host_boot_id;
-    closed = Boolean(rebooted || (engine.state === 'dead' && attempt.descendant_tracking_complete &&
+    if (!negativeEligible && engine.state === 'dead') {
+      engine = { state: 'unknown', reason: 'awaiting a process sample after dispatch or correlation' };
+    }
+    const rebooted = negativeEligible && engine.state !== 'live' && sample.complete === true && !sample.error &&
+      sameHostname(host.hostname, sample.hostname) && host.host_boot_id &&
+      sample.host_boot_id && host.host_boot_id !== sample.host_boot_id;
+    if (rebooted) engine = { state: 'dead', reason: 'host reboot' };
+    closed = Boolean(rebooted || (scanned && engine.state === 'dead' && attempt.descendant_tracking_complete &&
       attempt.descendants.every((p) => observeProcessIdentity(p, sample).state === 'dead')));
     attempt.health = {
       sample_id: sample.sample_id, observed_at: sample.observed_at, engine,
@@ -203,7 +246,10 @@ function reconcileAttempt(state, attempt, sample) {
     };
   }
   if (!attempt.outcome) {
-    if (attempt.evidence.completion && (attempt.role !== 'qa' || attempt.evidence.verdict)) {
+    if (Object.keys(attempt.diagnostics).length) {
+      attempt.status = 'needs_operator';
+      attempt.reason = 'worker artifact rejected; correct the reported diagnostics';
+    } else if (attempt.evidence.completion) {
       if (attempt.reported_status === 'complete' && (attempt.role !== 'qa' || attempt.qa_verdict === 'pass')) {
         attempt.outcome = { type: 'completed', at: sample.observed_at, assurance: 'worker_reported' };
         attempt.status = 'completed';
@@ -212,7 +258,9 @@ function reconcileAttempt(state, attempt, sample) {
         attempt.status = 'completed';
       } else {
         attempt.status = 'needs_operator';
-        attempt.reason = 'worker reported incomplete or blocked work';
+        attempt.reason = attempt.reported_status === 'complete'
+          ? 'QA completion requires a valid verdict with all required verification'
+          : 'worker reported incomplete or blocked work';
       }
     } else if (((fresh && engine.state === 'dead') || attempt.adapter_closure) && attempt.status !== 'queued') {
       const category = attempt.submission?.acknowledged ? 'execution' : 'launch';
@@ -230,10 +278,12 @@ function reconcileAttempt(state, attempt, sample) {
     }
   }
   if (attempt.reservation.state !== 'released' && (attempt.evidence.release || closed || attempt.no_external_effect || attempt.adapter_closure)) {
+    const type = attempt.evidence.release ? 'cooperative_release' : attempt.no_external_effect ? 'no_external_effect'
+      : attempt.adapter_closure ? 'adapter_closure' : 'process_closure';
     attempt.reservation = { state: 'released', closure: {
-      type: attempt.evidence.release ? 'cooperative_release' : attempt.no_external_effect ? 'no_external_effect'
-        : attempt.adapter_closure ? 'adapter_closure' : 'process_closure',
+      type,
       at: sample.observed_at, sample_id: sample.sample_id,
+      ...(type === 'process_closure' ? { process_evidence: { ...copy(attempt.health), descendants_closed: true } } : {}),
     } };
   }
 }
@@ -285,6 +335,9 @@ function aggregate(state) {
     const entries = roles.map((role) => runtime.roles[role]);
     if (!phase.review_loop.enabled && entries.every((entry) => currentAttempt(entry)?.outcome?.type === 'completed')) {
       runtime.status = 'completed';
+    } else if (!phase.review_loop.enabled && entries.some((entry) => currentAttempt(entry)?.outcome?.type === 'qa_failed')) {
+      runtime.status = 'failed';
+      runtime.failure = 'QA verification failed';
     } else if (entries.some((entry) => {
       const a = currentAttempt(entry);
       return a?.outcome?.type === 'failed' && (entry.budgets?.[a.outcome.category] || 0) >= RETRY_LIMITS[a.outcome.category];
@@ -299,7 +352,6 @@ function aggregate(state) {
 async function createAttemptLifecycle({ owner, store, manifestPath, _runtimeRoot, _fixtureAdapter, _lifecycleFault, _hostEvidence }) {
   validateFixtureAdapter(_fixtureAdapter);
   const adapter = _fixtureAdapter;
-  const capabilities = adapter ? copy(adapter.capabilities) : null;
   const primary = store.read().workspace;
   const context = { manifest_path: path.resolve(manifestPath), run_id: store.read().run_id };
   const owners = new Map([[primary.key, owner]]);
@@ -311,21 +363,25 @@ async function createAttemptLifecycle({ owner, store, manifestPath, _runtimeRoot
     const next = copy(state);
     mutate(next);
     if (canonicalJson(next) === canonicalJson(state)) return state;
-    const payload = { operation, next_sha256: fingerprint(next) };
-    store.transact({
-      expectedRevision: state.revision, command: { id: `u2-${state.revision + 1}-${fingerprint(payload).slice(0, 16)}`, payload },
+    const events = domainState(next) === domainState(state) ? [] : [{ type: 'attempt_lifecycle', payload: { operation } }];
+    store.transactInternal({
+      expectedRevision: state.revision,
       mutate(draft) {
+        for (const key of Object.keys(draft)) if (!Object.hasOwn(next, key)) delete draft[key];
         Object.assign(draft, next);
-        return { result: { operation }, events: [{ type: 'attempt_lifecycle', payload: { operation } }] };
+        return { result: { operation }, events };
       },
     });
     return store.read();
   }
   async function ensureOwner(workspace) {
     if (W.resolveWorkspace(workspace.root).key !== workspace.key) throw new Error('reserved checkout identity changed');
+    const workdirs = store.read().accepted.phases.flatMap((phase) => phase.agents)
+      .filter((agent) => agent.workspace.key === workspace.key).map((agent) => agent.workdir);
     if (!owners.has(workspace.key)) owners.set(workspace.key, await W.acquireWorkspaceOwner(workspace, {
       _runtimeRoot, reservationContext: context,
-      legacyLockPaths: [path.join(workspace.root, 'docs', 'orchestration', '.orchestrator.lock')],
+      legacyLockPaths: [workspace.root, ...workdirs]
+        .map((directory) => path.join(directory, 'docs', 'orchestration', '.orchestrator.lock')),
     }));
     const held = owners.get(workspace.key);
     W.assertOwnership(held, workspace);
@@ -364,35 +420,44 @@ async function createAttemptLifecycle({ owner, store, manifestPath, _runtimeRoot
         if (prior.sha256 !== hash) throw new Error('observation ID reused with different evidence');
         return;
       }
-      if (attempt.outcome || attempt.status === 'queued') throw new Error('new observations require an active dispatched attempt');
+      if (attempt.status === 'queued' || (attempt.outcome &&
+        (attempt.reservation.state === 'released' || !['descendants', 'closure'].includes(observation.kind)))) {
+        throw new Error('new observations require an active attempt or terminal closure accounting');
+      }
       if (Object.keys(attempt.observations).length >= MAX_OBSERVATIONS) throw new Error('attempt observation limit reached');
       switch (observation.kind) {
         case 'launch_process':
           if (attempt.launch_process) throw new Error('launch process identity is immutable');
           attempt.launch_process = processRecord(observation.process);
+          advanceProcessWatermark(attempt, sample);
           break;
         case 'session':
           if (attempt.engine_process || typeof observation.session_id !== 'string' || !observation.session_id) throw new Error('invalid or replaced session identity');
           attempt.engine_process = processRecord(observation.process);
           attempt.session_id = observation.session_id;
+          advanceProcessWatermark(attempt, sample);
           break;
         case 'submission':
           if (attempt.submission || observation.acknowledged !== true) throw new Error('submission observation must explicitly acknowledge delivery once');
           attempt.submission = { acknowledged: true, observation_id: observation.id, at: sample.observed_at };
           break;
         case 'descendants':
-          if (!capabilities.tracks_descendants || !Array.isArray(observation.processes) ||
+          if (!adapter.capabilities.tracks_descendants || !Array.isArray(observation.processes) ||
               observation.processes.length > MAX_OBSERVATIONS || observation.complete !== true) throw new Error('descendant closure capability is required');
           for (const process of observation.processes.map(processRecord)) {
-            if (!attempt.descendants.some((p) => canonicalJson(p) === canonicalJson(process))) attempt.descendants.push(process);
+            if (!attempt.descendants.some((p) => sameProcess(p, process))) {
+              attempt.descendants.push(process);
+              advanceProcessWatermark(attempt, sample);
+            }
           }
           attempt.descendant_tracking_complete = true;
           break;
         case 'closure':
-          if (!capabilities.tracks_descendants || observation.launch_settled !== true || observation.engine_closed !== true ||
+          if (!adapter.capabilities.tracks_descendants || observation.launch_settled !== true || observation.engine_closed !== true ||
               observation.descendants_closed !== true) throw new Error('adapter closure must cover the settled launch, engine and all descendants');
-          if (observeProcessIdentity(attempt.engine_process, sample).state === 'live' ||
-              attempt.descendants.some((p) => observeProcessIdentity(p, sample).state === 'live')) throw new Error('adapter closure contradicts live process evidence');
+          if (afterProcessWatermark(attempt, sample) && newerSample(sample, attempt.health.observed_at ? attempt.health : null) &&
+              [attempt.engine_process, attempt.launch_process, ...attempt.descendants]
+                .some((p) => observeProcessIdentity(p, sample).state === 'live')) throw new Error('adapter closure contradicts live process evidence');
           attempt.adapter_closure = { observation_id: observation.id, at: sample.observed_at };
           break;
         case 'launch_failed':
@@ -421,6 +486,7 @@ async function createAttemptLifecycle({ owner, store, manifestPath, _runtimeRoot
     let a = find(store.read(), attemptId);
     if (!adapter) throw new Error('production V2 dispatch is disabled');
     if (a.status !== 'queued' || store.read().operator.paused) return;
+    assertCapabilities(a);
     if (W.resolveWorkspace(a.workdir).key !== a.workspace.key || W.canonicalPath(a.workdir) !== a.workdir) {
       throw new Error('attempt working directory identity changed');
     }
@@ -430,7 +496,7 @@ async function createAttemptLifecycle({ owner, store, manifestPath, _runtimeRoot
     }
     commit('reservation_acquired', (state) => { find(state, attemptId).reservation.state = 'held'; });
     fault('after_reservation');
-    checkArtifactPath(primary.root, a.artifacts.prompt);
+    assertArtifactPath(primary.root, a.artifacts.prompt);
     fs.mkdirSync(a.artifacts.directory, { recursive: true });
     atomicWrite(a.artifacts.prompt, a.intent.prompt_text);
     if (store.read().operator.paused) return;
@@ -438,6 +504,8 @@ async function createAttemptLifecycle({ owner, store, manifestPath, _runtimeRoot
       const attempt = find(state, attemptId);
       attempt.status = 'launching';
       attempt.started_at = sample.observed_at;
+      attempt.launch_host = launchHost(sample);
+      advanceProcessWatermark(attempt, sample);
     });
     fault('before_launch');
     a = find(store.read(), attemptId);
@@ -451,15 +519,29 @@ async function createAttemptLifecycle({ owner, store, manifestPath, _runtimeRoot
     });
   }
 
+  function assertCapabilities(agent) {
+    validateFixtureAdapter(adapter);
+    if (!adapter.capabilities.engines.includes(agent.engine) ||
+        (agent.access === 'read-only' && !adapter.capabilities.read_only_enforced)) {
+      throw new Error('fixture adapter cannot enforce the accepted engine/access capability');
+    }
+  }
+
+  function launchHost(sample) {
+    const host = _hostEvidence || W.ownerHostEvidence(owner);
+    return {
+      hostname: sample.hostname || host.hostname,
+      host_boot_id: sample.host_boot_id || null,
+    };
+  }
+
   function createIntent(state, phase, role, sample) {
     const runtime = state.phases[phase.id];
     const entry = runtime.roles[role];
     const previous = currentAttempt(entry);
     const category = retryCategory(entry, runtime.review_iteration);
     const agent = agentFor(state, phase, role);
-    if (!capabilities.engines.includes(agent.engine) || (agent.access === 'read-only' && !capabilities.read_only_enforced)) {
-      throw new Error('fixture adapter cannot enforce the accepted engine/access capability');
-    }
+    assertCapabilities(agent);
     if (entry.attempts.length >= MAX_ATTEMPTS_PER_ROLE) throw new Error('immutable attempt history limit reached; intervention required');
     const identity = { run_id: state.run_id, phase_id: phase.id, role, review_iteration: runtime.review_iteration, attempt_id: randomUUID() };
     const artifacts = artifactPaths(state.workspace, identity);
@@ -485,6 +567,8 @@ async function createAttemptLifecycle({ owner, store, manifestPath, _runtimeRoot
       planUnits: raw.plan_units || raw.title || `Fixture scope: accepted phase ${phase.id}; no detailed implementation scope supplied.`,
       outputPaths: raw.output_paths || raw.completion_signal,
       previousPhaseBriefing: priorArtifacts.map((item) => `${item.role}: ${item.path} (sha256 ${item.sha256})`).join('\n'),
+      priorPhaseDirsBlock: priorArtifacts.map((item) =>
+        `${JSON.stringify(identityOf(item))}: ${item.path} (sha256 ${item.sha256}, kind ${item.kind})`).join('\n'),
       prOrBranchUnderTest: raw.review_loop?.pr_or_branch || 'accepted checkout HEAD',
       qaScopeRows: raw.review_loop?.qa_scope_rows || 'Verify the accepted phase scope and implementation report.',
       testCommandsBlock: raw.review_loop?.test_commands_block || '',
@@ -498,16 +582,12 @@ async function createAttemptLifecycle({ owner, store, manifestPath, _runtimeRoot
         priorPromptPath: previous.artifacts.prompt,
       } : {}),
     };
-    const host = _hostEvidence || W.ownerHostEvidence(owner);
     const attempt = {
       lifecycle_version: 1, ...identity, ...agent, artifacts, status: 'queued',
       intended_review_stage: phase.review_loop.enabled ? runtime.review_stage : role, retry_category: category,
       previous_attempt_id: previous?.attempt_id || null,
       created_at: sample.observed_at, started_at: null,
-      launch_host: {
-        hostname: sample.hostname || host.hostname,
-        host_boot_id: sample.host_boot_id || host.host_boot_id,
-      },
+      launch_host: launchHost(sample),
       intent: {
         launch_token: randomUUID(), session_name: `orch-${identity.attempt_id}`,
         timeout_minutes: phase.timeout_minutes, required_verification: role === 'qa' ? [...QA_VERIFICATION] : [],
@@ -552,7 +632,8 @@ async function createAttemptLifecycle({ owner, store, manifestPath, _runtimeRoot
           throw new Error('health sample identity, timestamp and process table are required');
         }
         if (adapter?.reconcile) {
-          for (const a of allAttempts(state).filter((attempt) => !attempt.outcome && attempt.status !== 'queued')) {
+          for (const a of allAttempts(state).filter((attempt) => attempt.status !== 'queued' &&
+            (!attempt.outcome || attempt.reservation.state !== 'released'))) {
             await invokeAdapter('reconcile', a, sample);
           }
         }
@@ -586,8 +667,9 @@ async function createAttemptLifecycle({ owner, store, manifestPath, _runtimeRoot
             if (store.read().operator.paused) break;
             const entry = store.read().phases[phase.id].roles[role];
             const category = retryCategory(entry, runtime.review_iteration);
-            if (!category || (Object.hasOwn(RETRY_LIMITS, category) && (entry.budgets?.[category] || 0) >= RETRY_LIMITS[category])) continue;
             const previous = currentAttempt(entry);
+            if (!category || (previous?.status !== 'queued' && Object.hasOwn(RETRY_LIMITS, category) &&
+              (entry.budgets?.[category] || 0) >= RETRY_LIMITS[category])) continue;
             const agent = agentFor(latest, phase, role);
             if (allAttempts(store.read()).some((a) => unreleased(a) && a.workspace.key === agent.workspace.key &&
                 a.attempt_id !== (previous?.status === 'queued' ? previous.attempt_id : null)) && agent.access === 'mutating') continue;

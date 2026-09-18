@@ -19,7 +19,7 @@ const yaml = require('js-yaml');
 test('U2 process observation requires creation and boot identity; only complete tables establish absence or reuse', () => {
   const { observeProcessIdentity: observe } = require('./check-health');
   const identity = { pid: 42, creation_time: '2026-09-17T00:00:00Z', hostname: 'host', host_boot_id: 'boot' };
-  const sample = { complete: true, hostname: 'host', host_boot_id: 'boot', processes: [identity] };
+  const sample = { complete: true, hostname: 'host', host_boot_id: 'boot', processes: [identity], observed_at: '2026-09-17T00:01:00Z' };
   assert.equal(observe(identity, sample).state, 'live');
   assert.equal(observe(identity, { ...sample, processes: [] }).state, 'dead');
   assert.equal(observe(identity, { ...sample, processes: [{ ...identity, creation_time: '2026-09-17T00:00:01Z' }] }).state, 'dead');
@@ -32,6 +32,20 @@ test('U2 process observation requires creation and boot identity; only complete 
   const precise = { ...identity, creation_time: '2026-09-17T00:00:00.0000001Z' };
   assert.equal(observe(precise, { ...sample, processes: [{ ...precise, creation_time: '2026-09-17T00:00:00.0000002Z' }] }).state, 'dead');
   assert.equal(observe(identity, { ...sample, processes: [{ ...identity, creation_time: '2026-09-17T00:00:00.0000000+00:00' }] }).state, 'live');
+});
+
+test('U2 correction: process evidence is case-insensitive and cannot predate process creation', () => {
+  const { observeProcessIdentity: observe } = require('./check-health');
+  const identity = { pid: 42, creation_time: '2026-09-17T00:01:00Z', hostname: 'Long-DNS-Hostname', host_boot_id: 'boot' };
+  const sample = { complete: true, hostname: identity.hostname.toUpperCase(), host_boot_id: 'boot',
+    observed_at: '2026-09-17T00:02:00Z', processes: [identity] };
+  assert.equal(observe(identity, sample).state, 'live');
+  assert.equal(observe(identity, { ...sample, processes: [] }).state, 'dead');
+  for (const processes of [[], [{ ...identity, creation_time: '2026-09-17T00:00:00Z' }]]) {
+    assert.equal(observe(identity, { ...sample, processes, observed_at: '2026-09-17T00:00:00Z' }).state, 'unknown');
+    assert.equal(observe(identity, { ...sample, processes, observed_at: undefined }).state, 'unknown');
+  }
+  assert.equal(observe(identity, { ...sample, host_boot_id: null }).state, 'unknown');
 });
 
 const {

@@ -547,7 +547,7 @@ function buildProcessTableArgs() {
     "$rows=@(Get-CimInstance Win32_Process | Select-Object @{n='pid';e={[int]$_.ProcessId}}, " +
     "@{n='parent_pid';e={[int]$_.ParentProcessId}}, " +
     "@{n='creation_time';e={if ($_.CreationDate) {$_.CreationDate.ToUniversalTime().ToString('o')}}}); " +
-    "@{complete=$true; hostname=[Environment]::MachineName; host_boot_id=$boot.ToUniversalTime().ToString('o'); processes=$rows} | ConvertTo-Json -Compress -Depth 4"];
+    "@{complete=$true; host_boot_id=$boot.ToUniversalTime().ToString('o'); processes=$rows} | ConvertTo-Json -Compress -Depth 4"];
 }
 
 function observeProcessTable({ _runner, sampleId = require('node:crypto').randomUUID(), observedAt = new Date().toISOString() } = {}) {
@@ -556,13 +556,13 @@ function observeProcessTable({ _runner, sampleId = require('node:crypto').random
   }));
   try {
     const result = JSON.parse(runner('powershell.exe', buildProcessTableArgs()));
-    if (result?.complete !== true || typeof result.hostname !== 'string' ||
+    if (result?.complete !== true ||
         !Number.isFinite(Date.parse(result.host_boot_id)) || !Array.isArray(result.processes) ||
         !result.processes.every((p) => Number.isSafeInteger(p?.pid) && p.pid >= 0 &&
           (p.creation_time === null || Number.isFinite(Date.parse(p.creation_time))))) {
       throw new Error('incomplete or invalid OS process table');
     }
-    return { ...result, sample_id: sampleId, observed_at: observedAt };
+    return { ...result, hostname: require('node:os').hostname(), sample_id: sampleId, observed_at: observedAt };
   } catch (error) {
     return { sample_id: sampleId, observed_at: observedAt, complete: false, processes: [],
       hostname: require('node:os').hostname(), host_boot_id: null, error: `OS process observation failed: ${error.message}` };

@@ -21,11 +21,12 @@ test('U2 full OS table probe preserves identity evidence and surfaces failures w
   const value = { complete: true, hostname: 'host', host_boot_id: '2026-09-17T00:00:00Z',
     processes: [{ pid: 42, parent_pid: 7, creation_time: '2026-09-17T01:00:00Z' }] };
   const observed = observeProcessTable({ _runner: () => JSON.stringify(value), sampleId: 'sample-1', observedAt: '2026-09-17T02:00:00Z' });
-  assert.deepStrictEqual(observed, { ...value, sample_id: 'sample-1', observed_at: '2026-09-17T02:00:00Z' });
+  assert.deepStrictEqual(observed, { ...value, hostname: os.hostname(), sample_id: 'sample-1', observed_at: '2026-09-17T02:00:00Z' });
   assert.ok(!buildProcessTableArgs().join(' ').includes('CommandLine LIKE'), 'full absence proof cannot use a name-filtered table');
   for (const run of [() => '{', () => '{"complete":true}', () => { throw new Error('access denied'); }]) {
     const unknown = observeProcessTable({ _runner: run });
     assert.equal(unknown.complete, false);
+    assert.equal(unknown.hostname, os.hostname());
     assert.ok(unknown.error);
   }
   const pid = require('./spawn-session').parsePidLookupOutput(JSON.stringify([

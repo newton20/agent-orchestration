@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const net = require('node:net');
 const os = require('node:os');
-const { execFileSync } = require('node:child_process');
+const childProcess = require('node:child_process');
 const { createHash, randomUUID, randomBytes } = require('node:crypto');
 
 const handles = new WeakMap();
@@ -16,23 +16,48 @@ function canonicalPath(value) {
   return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
 }
 
-function resolveWorkspace(workdir) {
+function assertNoGitAncestors(directory) {
+  for (let current = directory; ; current = path.dirname(current)) {
+    try {
+      fs.lstatSync(path.join(current, '.git'));
+      throw new Error(`unresolved Git metadata at ${current}`);
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+    if (path.dirname(current) === current) return;
+  }
+}
+
+function resolveWorkspace(workdir, { allowNonGit = false } = {}) {
   try {
     const directory = canonicalPath(workdir);
     if (!fs.statSync(directory).isDirectory()) throw new Error('workdir is not a directory');
     // Ambient Git overrides must not turn a different checkout into this owner.
     const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.toUpperCase().startsWith('GIT_')));
-    const root = canonicalPath(execFileSync('git', ['-C', directory, 'rev-parse', '--show-toplevel'], {
-      encoding: 'utf8', timeout: 5000, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env,
-    }).trim());
+    let output;
+    try {
+      output = childProcess.execFileSync('git', ['-C', directory, 'rev-parse', '--show-toplevel'], {
+        encoding: 'utf8', timeout: 5000, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+        env: { ...env, LC_ALL: 'C', LANG: 'C' },
+      });
+    } catch (error) {
+      // A generic Git failure cannot authorize a different ownership identity.
+      if (!allowNonGit || error.code || error.signal || error.status !== 128 ||
+          String(error.stdout || '').trim() ||
+          String(error.stderr || '').trim() !== 'fatal: not a git repository (or any of the parent directories): .git') throw error;
+      assertNoGitAncestors(directory);
+      return Object.freeze({ identity_version: 1, kind: 'directory', root: directory, key: directory });
+    }
+    const root = canonicalPath(output.trim());
     return Object.freeze({ identity_version: 1, kind: 'git-worktree', root, key: root });
   } catch (error) {
     throw new Error(`cannot resolve Git worktree identity for ${workdir}: ${error.message}`);
   }
 }
 
-function validateWorkspace(workspace) {
-  if (!workspace || workspace.identity_version !== 1 || workspace.kind !== 'git-worktree' ||
+function validateWorkspace(workspace, { allowNonGit = false } = {}) {
+  if (!workspace || workspace.identity_version !== 1 ||
+      (workspace.kind !== 'git-worktree' && !(allowNonGit && workspace.kind === 'directory')) ||
       typeof workspace.root !== 'string' || !path.isAbsolute(workspace.root) || workspace.key !== workspace.root ||
       path.normalize(workspace.root) !== workspace.root ||
       (process.platform === 'win32' && workspace.root !== workspace.root.toLowerCase())) {
@@ -41,14 +66,14 @@ function validateWorkspace(workspace) {
 }
 
 function pipeNameFor(workspace, namespace = 'controller') {
-  validateWorkspace(workspace);
+  validateWorkspace(workspace, { allowNonGit: true });
   if (!/^[a-z][a-z0-9-]{0,31}$/.test(namespace)) throw new Error('invalid owner namespace');
   const hash = createHash('sha256').update(workspace.key).digest('hex');
   return `\\\\.\\pipe\\agent-orchestrator-${namespace}-${hash}`;
 }
 
 function powershell(script) {
-  return execFileSync('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], {
+  return childProcess.execFileSync('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], {
     encoding: 'utf8', timeout: 15000, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
   }).trim();
 }
@@ -124,7 +149,15 @@ function readDiscovery(file) {
 
 function inspectLegacyLocks(lockPaths, { host = getHostEvidence(), probeProcess: probe = probeProcess } = {}) {
   const drained = [];
-  for (const file of [...new Set(lockPaths.map((p) => path.resolve(p)))]) {
+  const seen = new Set();
+  for (const candidate of lockPaths) {
+    let file;
+    try { file = canonicalPath(candidate); } catch (error) {
+      if (error.code === 'ENOENT') continue;
+      throw new Error(`cannot inspect legacy lock ${candidate}: ${error.message}`);
+    }
+    if (seen.has(file)) continue;
+    seen.add(file);
     let bytes;
     try {
       if (fs.statSync(file).size > MAX_DISCOVERY_BYTES) throw new Error('oversized legacy lock');
@@ -137,8 +170,14 @@ function inspectLegacyLocks(lockPaths, { host = getHostEvidence(), probeProcess:
     try { previous = JSON.parse(bytes); } catch (error) {
       throw new Error(`corrupt legacy lock ${file}: ${error.message}`);
     }
+    if (!previous || !Number.isSafeInteger(previous.pid) || previous.pid <= 0 ||
+        typeof previous.hostname !== 'string' || !previous.hostname.trim() ||
+        ['host_boot_id', 'creation_time'].some((key) =>
+          previous[key] != null && (typeof previous[key] !== 'string' || !previous[key].trim()))) {
+      throw new Error(`corrupt legacy lock ${file}: invalid process identity`);
+    }
     let state = 'unknown';
-    if (previous && previous.hostname === host.hostname && Number.isSafeInteger(previous.pid) && previous.pid > 0) {
+    if (typeof host.hostname === 'string' && previous.hostname.toLowerCase() === host.hostname.toLowerCase()) {
       if (previous.host_boot_id && host.host_boot_id && previous.host_boot_id !== host.host_boot_id) {
         state = 'dead';
       } else {
@@ -152,7 +191,11 @@ function inspectLegacyLocks(lockPaths, { host = getHostEvidence(), probeProcess:
             Date.parse(previous.creation_time) !== Date.parse(observed.creation_time)) state = 'dead';
       }
     }
-    if (state !== 'dead') throw new Error(`legacy owner is ${state} at ${file}; drain pre-upgrade controllers before activation`);
+    if (state !== 'dead') {
+      const error = new Error(`legacy owner is ${state} at ${file}; drain pre-upgrade controllers before activation`);
+      error.code = 'ELOCKED';
+      throw error;
+    }
     drained.push({ path: file, bytes });
   }
   return drained;
@@ -169,7 +212,7 @@ function restrictDirectory(directory, sid) {
 }
 
 function assertOwnership(owner, workspace, namespace = 'controller') {
-  validateWorkspace(workspace);
+  validateWorkspace(workspace, { allowNonGit: true });
   const held = handles.get(owner);
   if (!held || !held.active || !held.server.listening || held.workspace.key !== workspace.key || held.namespace !== namespace) {
     throw new Error('live kernel workspace ownership is required for mutation');
@@ -189,7 +232,13 @@ function readCheckoutReservation(owner) {
     throw new Error(`cannot read checkout reservation: ${error.message}`);
   }
   validateReservation(record, owner.workspace);
+  record.manifest_path = manifestKey(record.manifest_path);
   return record;
+}
+
+function manifestKey(file) {
+  const resolved = path.resolve(file);
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
 }
 
 function validateReservation(record, workspace) {
@@ -206,7 +255,7 @@ function reserveCheckout(owner, identity) {
   const file = reservationPath(owner);
   const record = {
     schema_version: 1, workspace_key: owner.workspace.key,
-    manifest_path: path.resolve(identity.manifest_path), run_id: identity.run_id,
+    manifest_path: manifestKey(identity.manifest_path), run_id: identity.run_id,
     phase_id: identity.phase_id, role: identity.role, review_iteration: identity.review_iteration,
     attempt_id: identity.attempt_id,
   };
@@ -249,9 +298,11 @@ function ownerHostEvidence(owner) {
 }
 
 async function acquireWorkspaceOwner(workspace, options = {}) {
-  validateWorkspace(workspace);
+  validateWorkspace(workspace, { allowNonGit: true });
   workspace = Object.freeze({ ...workspace });
-  if (resolveWorkspace(workspace.root).key !== workspace.key) throw new Error('workspace identity changed before ownership acquisition');
+  if (resolveWorkspace(workspace.root, { allowNonGit: workspace.kind === 'directory' }).key !== workspace.key) {
+    throw new Error('workspace identity changed before ownership acquisition');
+  }
   const info = getPlatformInfo();
   const namespace = options.namespace || 'controller';
   const pipeName = pipeNameFor(workspace, namespace);
@@ -353,7 +404,6 @@ async function acquireWorkspaceOwner(workspace, options = {}) {
     if (namespace === 'controller') {
       const reservation = readCheckoutReservation(owner);
       const context = options.reservationContext;
-      const manifestKey = (file) => process.platform === 'win32' ? path.resolve(file).toLowerCase() : path.resolve(file);
       if (reservation && (!context || reservation.run_id !== context.run_id ||
           manifestKey(reservation.manifest_path) !== manifestKey(context.manifest_path))) {
         const error = new Error('checkout has an unresolved attempt reservation; resume its original manifest and run');

@@ -58,6 +58,16 @@ test('U1 command result, pause state and outbox publish together; dedup precedes
   assert.equal(fx.store.read().revision, 2);
 });
 
+test('round4 rerun keeps imported V1 history in the current read contract', async (t) => {
+  const fx = await setup(t);
+  const legacy = { phases: { p1: { status: 'completed' } } };
+  fs.writeFileSync(P.statusPathFor(fx.manifestPath), JSON.stringify(legacy));
+  const first = fx.store.initialize(fx.accepted);
+  const next = fx.store.rerun({ expectedRevision: first.revision, accepted: first.accepted });
+  assert.deepEqual(next.legacy_history, [legacy]);
+  assert.deepEqual(next.history[0].legacy_history, [legacy]);
+});
+
 for (const failure of ['writeFileSync', 'fsyncSync', 'renameSync']) {
   test(`U1 ${failure} failure leaves the complete previous record and no acknowledgement`, async (t) => {
     const fx = await setup(t);
@@ -149,4 +159,26 @@ test('U1 same-payload key order deduplicates and independent-store reentrancy is
   }), /fenc|revision/i);
   assert.ok(fx.store.read().command_results.inner);
   assert.equal(fx.store.read().command_results.outer, undefined);
+});
+
+test('U2 internal transactions retain atomicity and ownership without command dedup records', async (t) => {
+  const fx = await setup(t);
+  const first = fx.store.initialize(fx.accepted);
+  const mutate = (draft) => {
+    draft.process_diagnostic = { error: 'fixture unavailable' };
+    return { result: {}, events: [] };
+  };
+  const result = fx.store.transactInternal({ expectedRevision: 1, mutate });
+  assert.equal(result.revision, 2);
+  assert.deepEqual(fx.store.read().command_results, {});
+  assert.deepEqual(fx.store.read().outbox, first.outbox);
+  assert.throws(() => fx.store.transactInternal({ expectedRevision: 1, mutate }), /revision/);
+  assert.throws(() => fx.store.transactInternal({ expectedRevision: 2, mutate: async () => ({ result: {}, events: [] }) }), /synchronous/);
+  const failing = S.createStateStore({ manifestPath: fx.manifestPath, owner: fx.owner, _fs: {
+    renameSync() { throw new Error('internal EIO'); },
+  } });
+  assert.throws(() => failing.transactInternal({ expectedRevision: 2, mutate }), /internal EIO/);
+  assert.equal(fx.store.read().revision, 2);
+  await fx.owner.release();
+  assert.throws(() => fx.store.transactInternal({ expectedRevision: 2, mutate }), /ownership|owner/);
 });
