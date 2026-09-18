@@ -33,6 +33,95 @@ test('U4 restart drains a full outbox before reservation cleanup can append', as
   assert.equal(fx.calls.length, 1);
 });
 
+test('U4 startup retries projection after hard-cap compaction before reservation cleanup', async (t) => {
+  const E = require('./event-log');
+  const S = require('./state-store');
+  for (const rerun of [false, true]) {
+    await t.test(rerun ? 'rerun' : 'resume', async (t) => {
+      let interrupt = false;
+      const fx = await fixture(t, { fault(point) {
+        if (interrupt && point === 'after_reconcile') throw new Error('closure stop');
+      } });
+      await fx.tick();
+      fx.complete(fx.current());
+      interrupt = true;
+      await assert.rejects(fx.tick(), /closure stop/);
+      const store = fx.runtime.store;
+      store.projectOutbox({ expectedRevision: store.read().revision });
+      const blocked = S.createStateStore({ manifestPath: fx.manifestPath, owner: fx.runtime.owner,
+        _eventFs: { renameSync() { throw Object.assign(new Error('retention busy'), { code: 'EBUSY' }); } } });
+      const file = E.eventLogPath(store.read());
+      let bytes = fs.statSync(file).size;
+      while (E.MAX_LOG_BYTES - bytes > E.MAX_EVENT_BYTES) {
+        const count = Math.min(60, Math.floor((E.MAX_LOG_BYTES - bytes) / E.MAX_EVENT_BYTES));
+        store.transactInternal({ expectedRevision: store.read().revision, mutate: () => ({
+          result: {}, events: Array.from({ length: count }, () => ({
+            type: 'event', payload: { text: 'x'.repeat(E.MAX_EVENT_BYTES - 1024) },
+          })),
+        }) });
+        blocked.projectOutbox({ expectedRevision: store.read().revision });
+        assert.equal(store.read().outbox.length, 0);
+        const nextBytes = fs.statSync(file).size;
+        assert.ok(nextBytes > bytes, 'failed retention must leave acknowledged history on disk');
+        bytes = nextBytes;
+      }
+      store.transactInternal({ expectedRevision: store.read().revision, mutate: () => ({
+        result: {}, events: Array.from({ length: E.MAX_OUTBOX_EVENTS }, () => ({ type: 'event', payload: {} })),
+      }) });
+      const before = store.read();
+      assert.equal(before.outbox.length, E.MAX_OUTBOX_EVENTS);
+      assert.ok(bytes + Buffer.byteLength(before.outbox.map(E.eventLine).join('')) > E.MAX_LOG_BYTES);
+      assert.equal(fx.current().reservation.state, 'released');
+      assert.notEqual(fx.current().reservation_cleared, true);
+      await fx.close();
+      await fx.open({ rerun });
+      const after = fx.runtime.store.read();
+      const oldRun = rerun ? after.history.at(-1) : after;
+      assert.equal(oldRun.run_id, before.run_id);
+      assert.equal(oldRun.phases.p1.roles.impl.attempts[0].reservation_cleared, true);
+      assert.deepEqual(oldRun.phases.p1.roles.impl.attempts[0].outcome, before.phases.p1.roles.impl.attempts[0].outcome);
+      assert.equal(oldRun.outbox.length, 0);
+      assert.equal(after.outbox.length, 0);
+      assert.equal(after.projection.status, 'healthy');
+      assert.ok(fs.statSync(file).size <= E.RETAIN_LOG_BYTES);
+      assert.equal(fx.calls.length, 1, 'startup cleanup must not replay the worker');
+      assert.equal(after.run_id === before.run_id, !rerun);
+    });
+  }
+});
+
+test('U4 bounded startup projection retries preserve degraded monitoring when cleanup has capacity', async (t) => {
+  let interrupt = false;
+  const fx = await fixture(t, { fault(point) {
+    if (interrupt && point === 'after_reconcile') throw new Error('closure stop');
+  } });
+  await fx.tick();
+  fx.complete(fx.current());
+  interrupt = true;
+  await assert.rejects(fx.tick(), /closure stop/);
+  const runId = fx.runtime.store.read().run_id;
+  await fx.close();
+  let denied = 0;
+  await fx.open({ _eventFs: { openSync(file, flags, ...args) {
+    if (flags === 'a') {
+      denied++;
+      throw Object.assign(new Error('projection denied'), { code: 'EACCES' });
+    }
+    return fs.openSync(file, flags, ...args);
+  } } });
+  const state = fx.runtime.store.read();
+  assert.equal(state.run_id, runId);
+  assert.equal(state.projection.status, 'degraded');
+  assert.equal(state.projection.diagnostic.code, 'EACCES');
+  assert.ok(state.outbox.length > 0);
+  assert.equal(fx.current().reservation_cleared, true);
+  assert.ok(denied > 0 && denied <= 3, 'persistent projection errors must not create an unbounded retry loop');
+  interrupt = false;
+  await fx.tick();
+  assert.equal(fx.calls.length, 1);
+  assert.equal(fx.current().status, 'completed');
+});
+
 test('U4 degraded projection observes current work but leaves new and queued dispatch untouched', async (t) => {
   let failIntent = true;
   const fx = await fixture(t, { fault(point) {

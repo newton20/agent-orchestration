@@ -81,7 +81,8 @@ the runner observes existing attempts but creates no new dispatches.
 | `initialize(accepted)` | Create a run, or return the existing V2 record unchanged. Completed V1 phases are copied into `legacy_history`. |
 | `transact({ expectedRevision, command, mutate })` | Clone the current record, invoke a synchronous callback, and atomically publish state, command response, and events. |
 | `transactInternal({ expectedRevision, mutate })` | Commit an owner-internal transition with the same revision and publication guarantees, without storing a command deduplication result. |
-| `rerun({ expectedRevision, accepted })` | Create a new run ID and retain the prior record, without recursively nesting history. Reject different workspaces and attempts needing closure reconciliation. |
+| `projectOutbox({ expectedRevision })` | Project committed events under live ownership, publish acknowledgements/status, and return the latest canonical state. |
+| `rerun({ expectedRevision, accepted })` | Create a new run ID and retain the prior record, without recursively nesting history. Require drained, non-degraded projection, matching workspace, and resolved attempt ownership. |
 
 Example owner-side transition:
 
@@ -112,17 +113,17 @@ without adding command results or domain events. Lifecycle transitions
 still commit their pending events with the state change.
 
 The callback cannot change canonical identities, previous runs, imported
-history, command results, outbox bookkeeping, or the accepted snapshot.
-Structural acceptance and outbox draining need dedicated owned
-transactions in their respective feature implementations. The callback
+history, command results, projection/outbox bookkeeping, or the accepted
+snapshot. `projectOutbox` owns projection bookkeeping; structural acceptance
+remains a separate future owner-validated operation. The callback
 must return JSON data and an event array; it must not perform external
 launch effects.
 
 Events have `{ sequence, event_id, run_id, revision, type, payload }`.
 `event_id` is `<run_id>:<sequence>`. Sequence numbers increase within a run;
-the canonical revision increases across reruns. JSONL projection is not
-implemented by the foundation. An existing JSONL file is preserved, but
-its presence does not prove that any canonical event was projected.
+the canonical revision increases across reruns and projection acknowledgements.
+`projectOutbox` projects committed events to the run-scoped JSONL log.
+File existence alone does not establish complete or acknowledged history.
 
 Publication creates a unique same-directory temporary file, writes and
 flushes it, checks live ownership and the unchanged previous record, then
@@ -133,6 +134,107 @@ a guarantee against filesystem or device failure during machine power
 loss. Invalid/newer records are rejected without repair or rewriting.
 V1 `loadStatus` retains its compatibility normalization; V2 uses strict
 validation, and V1 `runUpdate` refuses V2 even with cached V1 injection data.
+
+## Event projection and reconnect
+
+`store.projectOutbox({ expectedRevision })` validates the live owner and
+revision before writing. It appends committed pending events, flushes them,
+then publishes canonical acknowledgements. Replaying after a crash
+deduplicates against the committed pending events. Generic transactions
+cannot rewrite this bookkeeping, and unpublished commands never return
+success.
+
+Canonical `projection` records `status: healthy|degraded`,
+`acknowledged_sequence`, `retained_through`, `updated_at`, and a nullable
+diagnostic. `updated_at` changes only when projection state changes durably;
+it is not a heartbeat or the time of an unchanged check. Projection
+acknowledgements advance canonical revisions without creating new event
+identities.
+
+Projection storage failures persist an explicit degraded diagnostic where
+canonical publication remains possible. Lifecycle observation continues
+within persistence bounds, but new and already-queued dispatch are blocked
+while projection is degraded. Outbox capacity is checked before launch
+effects. Canonical storage/ownership failures remain errors, not successful
+degraded operations.
+
+`event-log.eventLogPath(state)` resolves:
+
+```text
+<workspace-root>\docs\orchestration\runs\<run-id>\logs\events.jsonl
+```
+
+`readEvents({ state, after = null, limit = 100 })` returns:
+
+```js
+{
+  run_id, revision, events, cursor, latest_cursor, has_more, reset_required,
+  history: { status, gaps, diagnostic }
+}
+```
+
+Cursors are event IDs, not canonical revisions. Resume with the returned
+`cursor`; `latest_cursor` identifies the latest committed event and may be
+ahead of the projected log. Wrong-run, invalid, unavailable, or
+missing-history cursors request snapshot fallback through `reset_required`.
+History distinguishes pending projection, retention, and missing
+acknowledged records. A drained outbox cannot reconstruct lost acknowledged
+events.
+
+Readers never repair logs. The owner repairs only interrupted tails that
+can be proved replayable from canonical pending events; other corruption
+is surfaced. Ordinary log-read failures produce history diagnostics while
+readable canonical snapshots remain available. Artifact path-boundary
+violations fail closed rather than becoming ordinary history gaps.
+
+| Bound | Limit |
+|---|---|
+| Serialized event line | 16 KiB |
+| Pending outbox | 256 events and 1 MiB |
+| Log read | 4 MiB |
+| Retained acknowledged history | Latest 512 events within 2 MiB |
+| Read page | At most 256 events and 256 KiB of event lines |
+
+Retention removes older acknowledged records without creating an automatic
+archive. Its intent is persisted before removal, so gaps remain visible
+across a crash. A trimming failure cannot revoke a published append
+acknowledgement. At the hard log cap, a matching on-disk pending prefix is
+flushed and acknowledged before compaction; remaining events drain in a
+subsequent projection pass.
+
+## Read-only progress snapshots
+
+`read-model` exports `SNAPSHOT_SCHEMA_VERSION = 1` and
+`createSnapshot({ manifestPath, runId = null, controller = null, now })`.
+`now` defaults to the reader's current ISO-8601 timestamp.
+The immutable allowlisted result has status `ready`, `legacy`, or `no_run`.
+An unknown selected run throws instead of silently selecting the current
+run. Legacy state is read-only and uncorrelated.
+
+Phase and role arrays preserve dependencies, review history, blockers,
+current-attempt progress, historical attempts, and accepted artifact
+provenance. Worker-reported completion and QA evidence remain distinct
+from unknown independent verification. Snapshots expose collection limits
+and truncation metadata; raw prompts, command responses, credentials, PIDs,
+and arbitrary worker diagnostic text are excluded.
+
+The snapshot's `event_cursor` is the latest committed event identity,
+which can lead projection. Consumers must inspect `projection` and
+`history` and handle event-read snapshot fallback without silently skipping
+unavailable events.
+
+`updated_at` is canonical state time; `reader_observed_at` records the
+reader's successful read. A supplied controller observation must include
+`run_id`, `status`, and a non-future `observed_at`. Controller status is
+unknown without matching evidence. A responsive reader does not establish
+controller or worker liveness.
+
+Concrete snapshot fixtures are in `scripts\read-model.test.js`; event and
+cursor fixtures are in `scripts\event-log.test.js`. The U4 cases in
+`scripts\orchestrate.test.js` exercise fixture lifecycle, canonical
+transaction, projection, and snapshot together. These contracts do not
+define the later dashboard's HTTP/SSE/authentication interface or establish
+live engine acceptance.
 
 ## Kernel ownership and discovery
 
@@ -212,15 +314,26 @@ Deleting lock metadata does not release a live named pipe.
 ## Integration boundaries
 
 `startV2Foundation(options)` acquires ownership, initializes/resumes state,
-reacquires prior checkout reservations, creates run-scoped directories,
-and returns `{ owner, store, state, lifecycle, authoring, summary }`.
+projects pending events before lifecycle reservation cleanup, reacquires
+prior checkout reservations, creates run-scoped directories, and projects
+cleanup transitions. It returns
+`{ owner, store, state, lifecycle, authoring, summary }`.
 The returned `state` is the latest persisted snapshot after startup
-reservation reconciliation, including its current revision on zero-tick runs.
+reservation reconciliation and projection, including its current revision
+on zero-tick runs.
+Both resume and rerun make one bounded follow-up projection pass before
+lifecycle construction when pending events remain. Hard-cap compaction can
+make physical progress without draining the outbox or changing its revision.
+Persistent degradation does not force an unbounded retry or prevent
+monitoring when bounded persistence still permits cleanup.
 Callers must `await lifecycle.close()` and then `await owner.release()`
 in `finally`. Closing a lifecycle releases additional kernel handles but
 does not erase unresolved reservations. Close cannot overlap a tick.
 `runOrchestrator` reconciles on every V2 tick and holds the handles until
 shutdown or its tick limit; it never enters the V1 dispatcher for V2.
+Each V2 tick projects before and after lifecycle reconciliation. The runner
+reports `event projection degraded`, `event history gap`, and
+`outbox backpressure` diagnostics without enabling production dispatch.
 
 Artifacts are scoped beneath
 `<workspace-root>\docs\orchestration\runs\<run-id>\`.
@@ -234,8 +347,9 @@ Ordinary restarts preserve artifacts, events, paused state, and the
 accepted snapshot. Authoring validation errors/drift are reported
 separately, without replacing the run.
 
-Live engine acceptance, event projection, authenticated operator mutations,
-and dashboard services remain separate integrations.
+Live engine acceptance, authenticated operator mutations, and dashboard
+services remain separate integrations. Event projection and read-only
+snapshots do not satisfy those gates.
 
 ## Attempt lifecycle
 
@@ -515,8 +629,10 @@ dependency-blocked phases have no worker ownership to drain and do not
 prevent rerun. Live, unknown, queued, or
 uncleared work cannot be discarded through rerun.
 
-Startup first checks canonical closure eligibility, then synchronizes
-reservations under the **old run ID**, without invoking its fixture adapter.
+Rerun startup first checks canonical closure eligibility, projects pending
+events, then synchronizes reservations under the **old run ID**, without
+invoking its fixture adapter. Cleanup transitions are projected before
+`store.rerun`; rerun requires a drained, non-degraded projection.
 Only after cleanup succeeds does `store.rerun` publish the new ID and retain
 the complete prior run in immutable history. Imported V1 history remains
 available in the current `legacy_history` array as well. Additional old-run checkout

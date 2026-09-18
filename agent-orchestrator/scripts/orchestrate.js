@@ -3725,6 +3725,13 @@ async function acquireLegacyOwner(manifestPath, manifest, opts) {
   });
 }
 
+function projectBeforeLifecycle(store) {
+  let state = store.projectOutbox({ expectedRevision: store.read().revision });
+  // Hard-cap recovery can compact acknowledged history without draining pending events.
+  if (state.outbox.length) state = store.projectOutbox({ expectedRevision: state.revision });
+  return state;
+}
+
 async function startV2Foundation(opts) {
   const { prepareV2Manifest } = require('./parse-manifest');
   const { readState, createStateStore, assertRerunEligible } = require('./state-store');
@@ -3783,7 +3790,7 @@ async function startV2Foundation(opts) {
     if (opts.rerun) {
       assertRerunEligible(store.read(), { allowUnclearedReservations: true });
       if (accepted.workspace.key !== persisted.workspace.key) throw new Error('rerun cannot change workspace identity');
-      store.projectOutbox({ expectedRevision: store.read().revision });
+      projectBeforeLifecycle(store);
       lifecycle = await createAttemptLifecycle({
         owner, store, manifestPath: opts.manifestPath, _runtimeRoot: opts._runtimeRoot,
       });
@@ -3795,7 +3802,7 @@ async function startV2Foundation(opts) {
     } else {
       store.initialize(accepted);
     }
-    store.projectOutbox({ expectedRevision: store.read().revision });
+    projectBeforeLifecycle(store);
     lifecycle = await createAttemptLifecycle({
       owner, store, manifestPath: opts.manifestPath, _runtimeRoot: opts._runtimeRoot,
       _fixtureAdapter: opts._fixtureAdapter, _lifecycleFault: opts._lifecycleFault,

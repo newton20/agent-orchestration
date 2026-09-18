@@ -102,6 +102,30 @@ test('U4 stable projection errors do not churn revisions because temporary paths
   assert.deepEqual(faulty.projectOutbox({ expectedRevision: degraded.revision }), degraded);
 });
 
+test('U4 physical retention recovery can succeed without a canonical revision change', async (t) => {
+  const E = require('./event-log');
+  const fx = await setup(t);
+  fx.store.initialize(fx.accepted);
+  for (let i = 0; i < 2; i++) {
+    fx.store.transactInternal({ expectedRevision: fx.store.read().revision,
+      mutate: () => ({ result: {}, events: Array.from({ length: 255 }, () => ({ type: 'event', payload: {} })) }) });
+    fx.store.projectOutbox({ expectedRevision: fx.store.read().revision });
+  }
+  fx.store.transactInternal({ expectedRevision: fx.store.read().revision,
+    mutate: () => ({ result: {}, events: Array.from({ length: 3 }, () => ({ type: 'event', payload: {} })) }) });
+  const interrupted = S.createStateStore({ manifestPath: fx.manifestPath, owner: fx.owner,
+    _projectionFault(point) { if (point === 'before_retention') throw new Error('retention interrupted'); } });
+  assert.throws(() => interrupted.projectOutbox({ expectedRevision: fx.store.read().revision }), /retention interrupted/);
+  const before = fx.store.read();
+  const file = E.eventLogPath(before);
+  const bytes = fs.statSync(file).size;
+  assert.equal(before.outbox.length, 0);
+  assert.ok(before.projection.retained_through > 0);
+  const after = fx.store.projectOutbox({ expectedRevision: before.revision });
+  assert.ok(fs.statSync(file).size < bytes);
+  assert.deepEqual(after, before, 'physical compaction is not guaranteed to publish a new state revision');
+});
+
 test('U4 recovered retention can drain pending events after the hard log cap is reached', async (t) => {
   const E = require('./event-log');
   const fx = await setup(t);
