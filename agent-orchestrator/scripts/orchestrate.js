@@ -3744,23 +3744,31 @@ async function startV2Foundation(opts) {
   const owner = await W.acquireWorkspaceOwner(accepted.workspace, {
     _runtimeRoot: opts._runtimeRoot,
     _probeLegacyProcess: opts._probeLegacyProcess,
+    reservationContext: persisted?.schema_version === 2
+      ? { manifest_path: path.resolve(opts.manifestPath), run_id: persisted.run_id } : undefined,
     legacyLockPaths: [
       path.join(orchDirFor(manifestDir), LOCKFILE_NAME),
       path.join(orchDirFor(accepted.workdir), LOCKFILE_NAME),
       path.join(orchDirFor(accepted.workspace.root), LOCKFILE_NAME),
     ],
   });
+  let lifecycle;
   try {
     const store = createStateStore({ manifestPath: opts.manifestPath, owner, _fs: opts._stateFs });
     const state = opts.rerun
       ? store.rerun({ expectedRevision: persisted?.revision, accepted })
       : store.initialize(accepted);
+    lifecycle = await require('./attempt-lifecycle').createAttemptLifecycle({
+      owner, store, manifestPath: opts.manifestPath, _runtimeRoot: opts._runtimeRoot,
+      _fixtureAdapter: opts._fixtureAdapter, _lifecycleFault: opts._lifecycleFault,
+      _hostEvidence: opts._hostEvidence,
+    });
     const scaffold = scaffoldProtocol({ manifestPath: opts.manifestPath, accepted: state.accepted, runId: state.run_id, owner, pluginDir: opts.pluginDir });
     if (!scaffold.ok) throw new Error(scaffold.error || 'V2 run scaffold failed');
     owner.setReadiness('live_dispatch_disabled');
-    return { owner, store, state, authoring, summary: 'live_dispatch_disabled' };
+    return { owner, store, state, lifecycle, authoring, summary: 'live_dispatch_disabled' };
   } catch (error) {
-    await owner.release();
+    try { if (lifecycle) await lifecycle.close(); } finally { await owner.release(); }
     throw error;
   }
 }
@@ -3771,6 +3779,7 @@ async function runOrchestrator(opts) {
   }
   const logger = opts.logger || makeDefaultLogger();
   let owner;
+  let lifecycle;
   try {
     const status = loadStatus(opts.manifestPath);
     if (!status.ok) throw new Error(status.error);
@@ -3785,21 +3794,25 @@ async function runOrchestrator(opts) {
       }
       const runtime = await startV2Foundation(opts);
       owner = runtime.owner;
+      lifecycle = runtime.lifecycle;
       logger('warn', 'V2 accepted state is ready; live_dispatch_disabled until engine adapter acceptance.');
       if (runtime.authoring.status !== 'unchanged') {
         logger('warn', `authoring manifest is ${runtime.authoring.status}; continuing with the persisted accepted snapshot`);
       }
       const limit = Number.isSafeInteger(opts.maxTicks) ? opts.maxTicks : Infinity;
-      for (let tick = 1; tick < limit && !opts.signal?.aborted; tick++) {
+      for (let tick = 0; tick < limit && !opts.signal?.aborted; tick++) {
         require('./workspace-owner').assertOwnership(owner, runtime.state.workspace);
+        runtime.state = await lifecycle.tick(opts._healthSample ? { sample: await opts._healthSample() } : {});
+        if (runtime.state.process_diagnostic) logger('warn', runtime.state.process_diagnostic.error);
+        if (tick + 1 >= limit) break;
         await new Promise((resolve) => {
           const finish = () => { clearTimeout(timer); opts.signal?.removeEventListener('abort', finish); resolve(); };
-          const timer = setTimeout(finish, opts.idleIntervalMs || 1000);
+          const timer = setTimeout(finish, opts.activeIntervalMs || 30000);
           opts.signal?.addEventListener('abort', finish, { once: true });
           if (opts.signal?.aborted) finish();
         });
       }
-      return { ok: true, summary: 'live_dispatch_disabled', run_id: runtime.state.run_id, revision: runtime.state.revision, authoring: runtime.authoring, history: [] };
+      return { ok: true, summary: runtime.state.runtime_status, run_id: runtime.state.run_id, revision: runtime.state.revision, authoring: runtime.authoring, history: [] };
     }
     if (loaded.manifest?.schema_version !== undefined && loaded.manifest.schema_version !== 1) {
       throw new Error('unsupported manifest schema_version; use 1 or 2');
@@ -3813,7 +3826,7 @@ async function runOrchestrator(opts) {
     logger('error', error.message);
     return { ok: false, summary: error.code === 'ELOCKED' ? 'lock_contention' : 'preflight_failed', error: error.message, code: error.code === 'ELOCKED' ? 2 : 1, history: [] };
   } finally {
-    if (owner) await owner.release();
+    try { if (lifecycle) await lifecycle.close(); } finally { if (owner) await owner.release(); }
   }
 }
 

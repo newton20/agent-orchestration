@@ -10,6 +10,52 @@ dispatcher_advisories: 0
 
 # Phase phase-0-scaffold — impl complete
 
+## V2 attempt-bound reports
+
+The frontmatter at the top of this file is the V1 example. V2 workers use
+the exact paths and identity supplied by their generated prompt, under
+`docs\orchestration\runs\<run_id>\phases\<phase_id>\<role>\<review_iteration>\<attempt_id>\`.
+The manifest's conventional completion path is not V2 authority.
+
+Example `completion.json`:
+
+```json
+{
+  "schema_version": 2,
+  "run_id": "run-example",
+  "phase_id": "phase-0-scaffold",
+  "role": "impl",
+  "review_iteration": 0,
+  "attempt_id": "attempt-example",
+  "kind": "completion",
+  "observed_at": "2026-09-17T12:00:00Z",
+  "status": "complete"
+}
+```
+
+YAML frontmatter with these same fields is also accepted. Include the
+narrative sections below when reporting implementation details. Every
+heartbeat, checkpoint, verdict and cooperative release repeats the full
+identity tuple with its own `kind` and `observed_at`. V2 heartbeats are
+atomically replaced JSON objects, not an appended shared JSONL stream.
+Reads are bounded to 256 KiB and reject identity mismatches.
+
+QA completion also needs `verdict.json`, with `kind: verdict`,
+`verdict: pass|fail`, and `verification: [{ id, status, evidence }]`.
+Rows `scope`, `P1`, `P2`, `P3`, `P4`, and `P6` are mandatory. A pass
+requires one passing entry with evidence for each row; a role label or
+an operator/approval field cannot waive required verification.
+
+Completion does not release a writable checkout. To release cooperatively,
+write `release.json` with the same identity, `kind: release`,
+`released: true`, and `no_further_writes: true`, after all mutating
+descendants have stopped or relinquished writes. Perform no further
+project writes without a new assignment. The terminal may remain open
+for inspection. The controller otherwise retains the reservation until
+engine and descendant closure is established.
+
+## V1 example
+
 > **This file is the canonical example of the completion signal format
 > a spawned agent must write at the path specified by `phase.completion_signal`
 > in the manifest. The orchestrator polls for this file every 30s–2min

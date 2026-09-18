@@ -1,8 +1,9 @@
 # Runtime state and ownership
 
-The V2 foundation supports Windows and Node >=20. Its Windows ownership
-tests run real competing Node processes. Worker dispatch remains disabled
-until engine adapters pass their acceptance checks.
+V2 supports Windows and Node >=20. Its Windows ownership tests run real
+competing Node processes. Production worker dispatch remains disabled.
+The lifecycle is exercised through an explicit programmatic fixture adapter;
+there is no CLI flag that enables it.
 
 ## Accepted configuration
 
@@ -66,8 +67,8 @@ include `impl` and `qa` role records even when one role was implicit in the
 manifest. Lifecycle code fills the attempt arrays. Each attempt must have
 `attempt_id`, `run_id`, `phase_id`, `role`, `review_iteration`, `engine`,
 `access`, `workdir`, and `workspace`. Additional lifecycle fields belong
-on that record; PID alone is not process identity. No attempt is created or
-dispatched by the foundation.
+on that record; PID alone is not process identity. Without a fixture adapter,
+the runner observes existing attempts but creates no new dispatches.
 
 `createStateStore({ manifestPath, owner })` returns synchronous methods:
 
@@ -128,8 +129,10 @@ validation, and V1 `runUpdate` refuses V2 even with cached V1 injection data.
 
 `acquireWorkspaceOwner(workspace, options)` binds a Windows named-pipe
 listener whose name contains the namespace and SHA-256 of the full key.
-The default namespace is `controller`; the same primitive accepts other
-namespaces for companion services and future writable-checkout claims.
+The default namespace is `controller`; writable-checkout reservations use
+this same namespace, so a primary V1 controller and a V2 attempt cannot
+own competing claims on the checkout. Other namespaces remain available
+for companion services.
 The returned handle stays live until `await owner.release()` or process
 death. A bind failure is contention or a permissions error. Metadata is
 never used to steal the claim.
@@ -183,10 +186,13 @@ Deleting lock metadata does not release a live named pipe.
 ## Integration boundaries
 
 `startV2Foundation(options)` acquires ownership, initializes/resumes state,
-creates run-scoped directories, and returns
-`{ owner, store, state, authoring, summary }`. Its caller must release the
-owner in `finally`. `runOrchestrator` holds that handle until shutdown or
-its tick limit; it never enters the V1 dispatcher for V2.
+reacquires prior checkout reservations, creates run-scoped directories,
+and returns `{ owner, store, state, lifecycle, authoring, summary }`.
+Callers must `await lifecycle.close()` and then `await owner.release()`
+in `finally`. Closing a lifecycle releases additional kernel handles but
+does not erase unresolved reservations. Close cannot overlap a tick.
+`runOrchestrator` reconciles on every V2 tick and holds the handles until
+shutdown or its tick limit; it never enters the V1 dispatcher for V2.
 
 Artifacts are scoped beneath
 `<workspace-root>\docs\orchestration\runs\<run-id>\`.
@@ -196,10 +202,208 @@ Ordinary restarts preserve artifacts, events, paused state, and the
 accepted snapshot. Authoring validation errors/drift are reported
 separately, without replacing the run.
 
-Lifecycle implementation must establish attempt and descendant closure,
-retain uncertain reservations, and use kernel claims for every writable
-checkout before enabling new dispatch. State remains keyed by manifest
-path while ownership is keyed by worktree: switching to a different
-manifest is not proof that old workers have stopped. Live engine
-acceptance, event projection, authenticated operator mutations, and
-dashboard services are separate integrations.
+Live engine acceptance, event projection, authenticated operator mutations,
+and dashboard services remain separate integrations.
+
+## Attempt lifecycle
+
+`attempt-lifecycle.js` exports `createAttemptLifecycle`, `artifactPaths`,
+`identityOf`, `readAttemptArtifact`, the retry limits and the bounded-history
+constants. `createAttemptLifecycle({ owner, store, manifestPath, ... })`
+returns `{ tick({ sample }?), close() }`. Ticks cannot overlap.
+
+Each attempt has `lifecycle_version: 1` and the following additional fields:
+
+```js
+{
+  intended_review_stage, retry_category, previous_attempt_id,
+  status, created_at, started_at, launch_host,
+  intent: {
+    launch_token, session_name, timeout_minutes, required_verification,
+    prompt_options, prompt_text, prompt_sha256, prompt_warnings
+  },
+  artifacts: { directory, prompt, completion, heartbeat, verdict, checkpoint, release },
+  reservation: { state: 'pending' /* held | released */, closure },
+  reservation_cleared,
+  launch_process, engine_process, session_id, submission,
+  observations, descendants, descendant_tracking_complete,
+  evidence, evidence_history, diagnostics, health, outcome
+}
+```
+
+Optional observations and outcomes are absent until established. The
+queued intent includes the rendered prompt bytes and their hash before
+any prompt publication or launch. The launcher process, correlated engine
+session, and acknowledged submission are separate observations. A shell
+or session-name match does not establish submission.
+
+Dispatch order is: publish queued intent, acquire and durably record the
+checkout reservation, publish the prompt, publish `launching`, then call
+the fixture adapter once. Restart may continue a queued intent under its
+original attempt ID. Once `launching` is durable, missing acknowledgement
+requires reconciliation and never automatic replay. A thrown adapter call
+leaves its durable intent and reservations available for the next tick.
+
+The state store rejects changes to historical identities, dispatch intent,
+recorded process/session/submission identities, outcomes, evidence history,
+or released reservations. Retry counters must agree with recorded attempts.
+Histories are bounded to 64 attempts per role, 64 observations and 64
+accepted artifact versions per attempt, and 64 tracked descendants.
+Reaching a bound fails explicitly; history is not silently discarded.
+The canonical 16 MiB state limit still applies.
+
+## Fixture adapter contract
+
+Only the `_fixtureAdapter` programmatic option enables lifecycle dispatch:
+
+```js
+{
+  kind: 'fixture',
+  capabilities: {
+    engines: ['agency-copilot'],
+    read_only_enforced: false,
+    tracks_descendants: true
+  },
+  async launch(attempt, { observe }) { /* fixture effects only */ },
+  async reconcile(attempt, { observe }) { /* optional, observation only */ }
+}
+```
+
+This injection is trusted test code, not a worker-accessible capability or
+a production adapter. It cannot be selected in a manifest or on the CLI.
+Read-only declarations require `read_only_enforced: true`; QA otherwise
+reserves the checkout as a writer. `tracks_descendants` means the fixture
+can account for the engine's entire mutating descendant lifetime, including
+children that outlive the engine. Missing tracking capability prevents
+process-only release; matching cooperative release or reboot can still
+establish closure.
+
+`observe` requires `id`, `kind`, and the exact
+`{ run_id, phase_id, role, review_iteration, attempt_id }` tuple. Supported
+kinds are:
+
+| Kind | Required evidence |
+|---|---|
+| `launch_process` | `process: { pid, creation_time, hostname, host_boot_id }` |
+| `session` | `session_id` and the engine `process` identity |
+| `submission` | `acknowledged: true` |
+| `descendants` | `processes: [processIdentity]`, `complete: true` |
+| `launch_failed` | `no_external_effect: true`, nonempty `reason`, and no previously observed external process/session/submission |
+| `closure` | `launch_settled: true`, `engine_closed: true`, `descendants_closed: true`; rejected if the current OS sample proves a tracked process live |
+
+Observation IDs deduplicate by payload fingerprint. Reusing an ID with
+different evidence fails. Late callbacks after the adapter call has
+returned are rejected. `reconcile` may supply late acknowledgements for
+the same attempt, or supported closure evidence for an unidentified
+launch, without resubmitting work. It must not perform launch effects.
+No observation or artifact-provided role label grants operator authority.
+
+## Attempt artifacts and review
+
+`artifactPaths(primaryWorkspace, identity)` returns paths under:
+
+```text
+<primary-root>\docs\orchestration\runs\<run_id>\phases\<phase_id>\
+  <role>\<review_iteration>\<attempt_id>\
+    <role>-prompt.md
+    completion.json
+    heartbeat.json
+    verdict.json
+    checkpoint.json
+    release.json
+```
+
+Artifact reads require an ordinary file, reject redirected path components,
+and read at most 256 KiB. JSON or YAML-frontmatter reports must include
+`schema_version: 2`, the exact identity tuple, `kind`, and `observed_at`.
+Old-run, old-attempt, sibling-role and wrong-iteration reports are rejected.
+Conventional V1 paths and mtimes are never V2 completion authority.
+Accepted evidence records retain the path, SHA-256, full identity, and
+`source: worker_report`. This is reported completion, not independent
+verification.
+
+Completion requires `status: complete`. Blocked or partial work requires
+intervention. QA also requires an attempt-bound verdict containing
+`verdict: pass|fail` and `verification: [{ id, status, evidence }]`.
+Required rows are `scope`, `P1`, `P2`, `P3`, `P4`, and `P6`. A pass needs
+exactly one passing entry with nonempty evidence for every required row.
+Skipped or missing verification cannot pass. Valid QA failures advance the
+review iteration only after safe release. Successful and failed review
+rounds retain their evidence in `review_history`.
+
+Review iterations are zero-based. `review_loop.max_iterations` bounds QA
+rounds. Each role separately has two launch/delivery retries and two
+execution-recovery retries for the run; those counts do not reset between
+review rounds. QA launch failure preserves the completed impl attempt,
+QA stage, and review iteration. Each role has its own process identity and
+start clock, and all role observations are reconciled before scheduling.
+Dependency-only blockers are recomputed after upstream completion;
+operator/configuration blockers are preserved.
+
+Persisted pause continues to accept reports and reconcile closure while
+suppressing every new dispatch, including QA, retries and recovery.
+Recovery prompts retain immutable prior prompt references and point all
+new writes to the new attempt. They do not copy or replay an old kickoff.
+
+## Process evidence and durable checkout reservations
+
+`spawn-session.observeProcessTable()` returns
+`{ sample_id, observed_at, complete, hostname, host_boot_id, processes, error? }`.
+Each process row has `pid`, `creation_time`, and `parent_pid`. The full
+Windows CIM query is unfiltered; the existing V1 name lookup still returns
+a numeric PID or null. `check-health.observeProcessIdentity(identity, sample)`
+returns `{ state: 'live'|'dead'|'unknown', reason }`.
+
+Complete, successful tables prove an identified engine dead when its PID
+is absent or its creation time differs. Missing creation/boot evidence,
+failed or incomplete tables, and unacknowledged session-name misses remain
+unknown. Changed known boot identity proves the old local processes dead.
+PID reuse never authorizes targeting the replacement process. This module
+does not issue process cancellation.
+
+Health records retain sample ID and observation time; duplicate or older
+samples do not increase unknown counts. Failed probes persist
+`process_diagnostic`, set `runtime_status: process_observation_failed`,
+and are logged by the runner. Storage failures throw without successful
+acknowledgement or dispatch.
+
+Engine termination and checkout release are distinct. Tracked descendants,
+including children first observed when their parent disappears, retain the
+reservation until they also close. A matching `release` report with
+`released: true` and `no_further_writes: true` permits handoff while keeping
+the interactive terminal available for inspection. It promises that the
+worker and its descendants will perform no further project writes without
+a new assignment. Completion and idle state alone do not provide this
+promise. Cooperative release uses the trusted-worker model; it does not
+revoke OS permissions.
+
+There is one durable private record per reserved checkout:
+
+```text
+<LocalApplicationData>\agent-orchestrator\runtime\<workspace-hash>\
+  controller\reservation.json
+```
+
+Its fields are `{ schema_version: 1, workspace_key, manifest_path, run_id,
+phase_id, role, review_iteration, attempt_id }`. The containing directory
+has the current-user-only ACL. Publication uses a flushed temporary file
+and atomic rename while holding the checkout's `controller` kernel claim.
+`readCheckoutReservation`, `reserveCheckout`, and `releaseCheckout` require
+the actual live owner handle. Metadata cannot substitute for that handle.
+
+The canonical manifest-sibling status file is not a workspace registry.
+The private record survives controller exit and blocks unrelated V1/V2
+controllers even after the pipe is gone. Only the recorded manifest and
+run may reacquire its claim; that run must find the exact attempt in
+canonical state before doing work. Every additional writable checkout
+uses the same kernel claim and private record, not just an in-memory map.
+Conflicting ownership is refused rather than stolen.
+
+Closure is committed in canonical state before the private reservation is
+removed. A crash between those operations is reconciled on restart.
+`reservation_cleared` acknowledges removal only after it succeeds; until
+then startup reacquires even a released attempt's additional checkout.
+Unresolved records are retained on storage errors or shutdown. Additional
+checkout handles are conservatively retained until lifecycle close.
+Explicit rerun remains subject to the state store's conservative attempt
+closure gate; it cannot be used to discard attempt history or reservations.

@@ -16,6 +16,34 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
+test('U2 full OS table probe preserves identity evidence and surfaces failures without changing V1 PID output', () => {
+  const { observeProcessTable, buildProcessTableArgs } = require('./spawn-session');
+  const value = { complete: true, hostname: 'host', host_boot_id: '2026-09-17T00:00:00Z',
+    processes: [{ pid: 42, parent_pid: 7, creation_time: '2026-09-17T01:00:00Z' }] };
+  const observed = observeProcessTable({ _runner: () => JSON.stringify(value), sampleId: 'sample-1', observedAt: '2026-09-17T02:00:00Z' });
+  assert.deepStrictEqual(observed, { ...value, sample_id: 'sample-1', observed_at: '2026-09-17T02:00:00Z' });
+  assert.ok(!buildProcessTableArgs().join(' ').includes('CommandLine LIKE'), 'full absence proof cannot use a name-filtered table');
+  for (const run of [() => '{', () => '{"complete":true}', () => { throw new Error('access denied'); }]) {
+    const unknown = observeProcessTable({ _runner: run });
+    assert.equal(unknown.complete, false);
+    assert.ok(unknown.error);
+  }
+  const pid = require('./spawn-session').parsePidLookupOutput(JSON.stringify([
+    { ProcessId: 42, CommandLine: 'claude --name test', CreationTime: value.processes[0].creation_time },
+  ]), 'test');
+  assert.equal(pid, 42);
+  assert.match(buildPidLookupArgs().join(' '), /CreationTime/);
+});
+
+test('U2 Windows full process probe identifies this real Node process with creation and boot evidence', { skip: process.platform !== 'win32' }, () => {
+  const sample = require('./spawn-session').observeProcessTable();
+  assert.equal(sample.complete, true, sample.error);
+  const processRow = sample.processes.find((row) => row.pid === process.pid);
+  assert.ok(processRow);
+  assert.ok(Number.isFinite(Date.parse(processRow.creation_time)));
+  assert.ok(Number.isFinite(Date.parse(sample.host_boot_id)));
+});
+
 const {
   spawnSession,
   getSessionPid,

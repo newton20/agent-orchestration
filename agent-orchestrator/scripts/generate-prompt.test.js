@@ -31,6 +31,33 @@ const {
 // drift between the catalog and the renderer surfaces as a CI failure.
 const TEMPLATES_DIR = path.resolve(__dirname, '..', 'templates');
 
+test('U2 nested QA and recovery rendering binds every artifact to the actual attempt without kickoff files', (t) => {
+  const { runtimeFixture } = require('./test-support/runtime-fixture');
+  const fx = runtimeFixture(t);
+  const workspace = require('./workspace-owner').resolveWorkspace(fx.workdir);
+  const { artifactPaths } = require('./attempt-lifecycle');
+  for (const recovery of [false, true]) {
+    const identity = { run_id: 'run-test', phase_id: 'phase-7', role: 'qa', review_iteration: 2, attempt_id: recovery ? 'qa-recovery' : 'qa-first' };
+    const artifacts = artifactPaths(workspace, identity);
+    const opts = makeBaseOpts({
+      role: recovery ? 'recovery' : 'qa', ...(recovery ? { recoveryRole: 'qa' } : {}),
+      workdir: fx.workdir, phaseDir: artifacts.directory, completionSignalPath: artifacts.completion,
+      heartbeatPath: artifacts.heartbeat, attemptIdentity: identity, artifactPaths: artifacts, artifactWorkspace: workspace,
+      dryRun: true, includeText: true, priorPromptPath: 'prior-prompt-for-inspection',
+    });
+    const rendered = generatePrompt(opts);
+    assert.ok(rendered.text.includes(identity.attempt_id));
+    assert.ok(rendered.text.includes(artifacts.release));
+    assert.ok(rendered.text.includes('QA playbook'));
+    assert.ok(rendered.text.includes('schema_version: 2'));
+    assert.ok(!rendered.text.includes('{{attempt_context}}'));
+    assert.deepStrictEqual(rendered.warnings, []);
+    assert.equal(fs.existsSync(artifacts.directory), false);
+    assert.throws(() => generatePrompt({ ...opts, phaseDir: fx.workdir }), /identity/);
+    assert.throws(() => generatePrompt({ ...opts, qaPlaybookBlock: 'old identity' }), /identity-aware/);
+  }
+});
+
 // -------------------- Helpers --------------------
 
 function mkTmp(prefix) {

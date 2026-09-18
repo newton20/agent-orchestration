@@ -10,6 +10,39 @@ const net = require('node:net');
 const { runtimeFixture } = require('./test-support/runtime-fixture');
 const W = require('./workspace-owner');
 
+test('U2 real competing processes respect live checkout claims and durable unresolved reservations after owner shutdown', { timeout: 60000 }, async (t) => {
+  const fx = runtimeFixture(t);
+  const workspace = W.resolveWorkspace(fx.workdir);
+  let owner = await W.acquireWorkspaceOwner(workspace, { _runtimeRoot: fx.runtimeRoot });
+  t.after(() => owner.release());
+  const identity = { manifest_path: fx.manifestPath, run_id: 'run', phase_id: 'p1', role: 'qa', review_iteration: 0, attempt_id: 'attempt' };
+  W.reserveCheckout(owner, identity);
+  assert.throws(() => W.reserveCheckout(owner, { ...identity, attempt_id: 'other' }), /unresolved/);
+  assert.throws(() => W.releaseCheckout(owner, { ...identity, attempt_id: 'other' }), /different/);
+  for (const held of [true, false]) {
+    if (!held) await owner.release();
+    const child = fork(path.join(__dirname, 'test-support', 'owner-child.js'), [], { stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
+    const exited = once(child, 'exit');
+    t.after(async () => {
+      if (child.exitCode === null && child.signalCode === null) { child.kill(); await exited; }
+    });
+    await once(child, 'message');
+    const reply = once(child, 'message');
+    child.send({ workdir: fx.workdir, runtimeRoot: fx.runtimeRoot });
+    const [result] = await reply;
+    assert.equal(result.acquired, false);
+    assert.equal(result.code, 'ELOCKED');
+    if (!held) assert.match(result.error, /unresolved attempt reservation/);
+    await exited;
+  }
+  owner = await W.acquireWorkspaceOwner(workspace, { _runtimeRoot: fx.runtimeRoot, reservationContext: identity });
+  assert.equal(W.readCheckoutReservation(owner).attempt_id, identity.attempt_id);
+  W.releaseCheckout(owner, identity);
+  await owner.release();
+  owner = await W.acquireWorkspaceOwner(workspace, { _runtimeRoot: fx.runtimeRoot });
+  assert.equal(W.readCheckoutReservation(owner), null);
+});
+
 test('U1 identities collapse subdirectories, casing and junctions, not separate Git worktrees', (t) => {
   const fx = runtimeFixture(t);
   const sub = path.join(fx.workdir, 'sub');

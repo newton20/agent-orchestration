@@ -91,6 +91,90 @@ function validateLegacyCompleted(record) {
   }
 }
 
+function validateLifecycleAttempt(attempt, record) {
+  requireShape(attempt.lifecycle_version === 1, 'unsupported attempt lifecycle version');
+  requireShape(['queued', 'launching', 'running', 'needs_operator', 'completed', 'failed', 'cancelled'].includes(attempt.status),
+    'invalid attempt lifecycle status');
+  requireShape(['initial', 'launch', 'execution', 'review'].includes(attempt.retry_category) &&
+    typeof attempt.intended_review_stage === 'string' && isObject(attempt.intent) &&
+    isId(attempt.intent.launch_token) && isId(attempt.intent.session_name) &&
+    positive(attempt.intent.timeout_minutes) && Array.isArray(attempt.intent.required_verification) &&
+    isObject(attempt.intent.prompt_options) && typeof attempt.intent.prompt_text === 'string' &&
+    attempt.intent.prompt_sha256 === createHash('sha256').update(attempt.intent.prompt_text).digest('hex'),
+    'complete immutable dispatch intent is required');
+  requireShape(isObject(attempt.launch_host) && typeof attempt.launch_host.hostname === 'string' &&
+    !Object.hasOwn(attempt.launch_host, 'pid') && !Object.hasOwn(attempt.launch_host, 'creation_time') &&
+    (attempt.launch_host.host_boot_id === null || typeof attempt.launch_host.host_boot_id === 'string'), 'attempt launch host is required and cannot identify the controller as the engine');
+  requireShape(isObject(attempt.reservation) && ['pending', 'held', 'released'].includes(attempt.reservation.state),
+    'attempt reservation is required');
+  if (attempt.reservation.state === 'released') requireShape(isObject(attempt.reservation.closure), 'released attempt needs concrete closure');
+  requireShape(isObject(attempt.observations) && Object.keys(attempt.observations).length <= 64 &&
+    isObject(attempt.evidence) && Array.isArray(attempt.evidence_history) && attempt.evidence_history.length <= 64 &&
+    Array.isArray(attempt.descendants) && attempt.descendants.length <= 64 &&
+    typeof attempt.descendant_tracking_complete === 'boolean' &&
+    isObject(attempt.health) && nonnegative(attempt.health.unknown_samples), 'bounded observations and health identity are required');
+  const phase = record.accepted.phases.find((p) => p.id === attempt.phase_id);
+  const agent = phase.agents.find((a) => a.role === attempt.role) || {
+    engine: record.accepted.manifest.defaults.engine, access: 'mutating',
+    workdir: record.accepted.workdir, workspace: record.workspace,
+  };
+  requireShape(['engine', 'access', 'workdir'].every((key) => attempt[key] === agent[key]) &&
+    canonicalJson(attempt.workspace) === canonicalJson(agent.workspace) &&
+    attempt.intent.timeout_minutes === phase.timeout_minutes, 'attempt differs from accepted execution configuration');
+  requireShape(canonicalJson(attempt.intent.required_verification) ===
+    canonicalJson(attempt.role === 'qa' ? ['scope', 'P1', 'P2', 'P3', 'P4', 'P6'] : []), 'required verification cannot be weakened');
+  requireShape(isObject(attempt.artifacts), 'attempt artifact paths are required');
+  const directory = path.join(record.workspace.root, 'docs', 'orchestration', 'runs', attempt.run_id,
+    'phases', attempt.phase_id, attempt.role, String(attempt.review_iteration), attempt.attempt_id);
+  requireShape(attempt.artifacts.directory === directory &&
+    attempt.artifacts.prompt === path.join(directory, `${attempt.role}-prompt.md`), 'attempt prompt path mismatch');
+  for (const kind of ['completion', 'heartbeat', 'verdict', 'checkpoint', 'release']) {
+    requireShape(attempt.artifacts[kind] === path.join(directory, `${kind}.json`), 'attempt artifact path mismatch');
+  }
+  const options = attempt.intent.prompt_options;
+  requireShape(options.phaseDir === directory && options.phaseId === attempt.phase_id &&
+    options.completionSignalPath === attempt.artifacts.completion && options.heartbeatPath === attempt.artifacts.heartbeat &&
+    isObject(options.attemptIdentity) &&
+    ['run_id', 'phase_id', 'role', 'review_iteration', 'attempt_id'].every((key) => options.attemptIdentity[key] === attempt[key]),
+  'prompt intent identity mismatch');
+}
+
+function preserveLifecycle(previous, next) {
+  for (const [phaseId, phase] of Object.entries(previous.phases)) {
+    const updated = next.phases[phaseId];
+    requireShape(updated.review_iteration >= phase.review_iteration, 'review iteration cannot be reset');
+    for (const [role, entry] of Object.entries(phase.roles)) {
+      const later = updated.roles[role];
+      for (const attempt of entry.attempts.filter((a) => a.lifecycle_version === 1)) {
+        const current = later.attempts.find((a) => a.attempt_id === attempt.attempt_id);
+        requireShape(Boolean(current), 'historical attempts cannot be removed');
+        for (const field of ['lifecycle_version', 'attempt_id', 'run_id', 'phase_id', 'role', 'review_iteration', 'engine', 'access',
+          'workdir', 'workspace', 'intent', 'artifacts', 'created_at', 'intended_review_stage', 'retry_category', 'previous_attempt_id', 'launch_host']) {
+          requireShape(canonicalJson(attempt[field]) === canonicalJson(current[field]), `immutable attempt field ${field}`);
+        }
+        for (const field of ['outcome', 'launch_process', 'engine_process', 'session_id', 'submission', 'adapter_closure']) {
+          if (Object.hasOwn(attempt, field)) requireShape(canonicalJson(attempt[field]) === canonicalJson(current[field]), `immutable attempt observation ${field}`);
+        }
+        for (const [id, observation] of Object.entries(attempt.observations)) {
+          requireShape(canonicalJson(observation) === canonicalJson(current.observations[id]), 'historical observation cannot change');
+        }
+        requireShape(canonicalJson(attempt.evidence_history) === canonicalJson(current.evidence_history.slice(0, attempt.evidence_history.length)),
+          'historical artifact evidence cannot change');
+        requireShape(attempt.descendants.every((process) => current.descendants.some((p) => canonicalJson(p) === canonicalJson(process))),
+          'tracked descendants cannot be discarded');
+        if (attempt.started_at) requireShape(attempt.started_at === current.started_at, 'attempt start clock cannot change');
+        if (attempt.reservation.state === 'released') requireShape(canonicalJson(attempt.reservation) === canonicalJson(current.reservation),
+          'released reservation cannot be reacquired by the old attempt');
+      }
+      for (const category of ['launch', 'execution']) {
+        requireShape((later.budgets?.[category] || 0) >= (entry.budgets?.[category] || 0), 'retry budgets cannot reset');
+      }
+    }
+    if (phase.review_history) requireShape(canonicalJson(phase.review_history) ===
+      canonicalJson(updated.review_history?.slice(0, phase.review_history.length)), 'review history cannot change');
+  }
+}
+
 function validateRun(record) {
   requireShape(isObject(record) && record.schema_version === STATE_SCHEMA_VERSION, `unsupported state schema_version ${record?.schema_version}`);
   canonicalJson(record);
@@ -116,6 +200,8 @@ function validateRun(record) {
     for (const role of requiredRoles) requireShape(Object.hasOwn(phase.roles, role), `missing role ${phaseId}/${role}`);
     for (const [role, entry] of Object.entries(phase.roles)) {
       requireShape(isId(role) && isObject(entry) && Array.isArray(entry.attempts), 'roles require attempt arrays');
+      requireShape(entry.attempts.length <= 64, 'role attempt history limit exceeded');
+      if (entry.budgets) requireShape(nonnegative(entry.budgets.launch) && nonnegative(entry.budgets.execution), 'invalid role retry budgets');
       requireShape(entry.current_attempt_id === null || isId(entry.current_attempt_id), 'invalid current_attempt_id');
       for (const attempt of entry.attempts) {
         requireShape(isObject(attempt) && isId(attempt.attempt_id) && !attempts.has(attempt.attempt_id), 'invalid or duplicate attempt_id');
@@ -124,10 +210,16 @@ function validateRun(record) {
         requireShape(V2_ENGINES.includes(attempt.engine) && V2_ACCESS.includes(attempt.access), 'invalid attempt engine/access');
         requireShape(typeof attempt.workdir === 'string' && path.isAbsolute(attempt.workdir), 'attempt workdir must be absolute');
         validateWorkspace(attempt.workspace);
+        if (attempt.lifecycle_version !== undefined) validateLifecycleAttempt(attempt, record);
         attempts.add(attempt.attempt_id);
       }
       requireShape(entry.current_attempt_id === null || entry.attempts.some((attempt) => attempt.attempt_id === entry.current_attempt_id),
         'current attempt is missing');
+      if (entry.attempts.some((a) => a.lifecycle_version === 1)) {
+        requireShape(entry.current_attempt_id === entry.attempts.at(-1).attempt_id, 'current lifecycle attempt must be the latest historical attempt');
+        requireShape(entry.budgets && ['launch', 'execution'].every((category) =>
+          entry.budgets[category] === entry.attempts.filter((a) => a.retry_category === category).length), 'retry budgets disagree with immutable attempts');
+      }
     }
   }
   requireShape(isObject(record.command_results), 'command_results must be a map');
@@ -303,6 +395,7 @@ function createStateStore({ manifestPath, owner, _fs = {} }) {
         }
         // Structural acceptance belongs to the later human-command contract.
         if (canonicalJson(draft.accepted) !== canonicalJson(current.state.accepted)) throw new Error('accepted snapshot is immutable in foundation transactions');
+        preserveLifecycle(current.state, draft);
         draft.revision++;
         draft.updated_at = new Date().toISOString();
         const response = { revision: draft.revision, result: clone(outcome.result) };

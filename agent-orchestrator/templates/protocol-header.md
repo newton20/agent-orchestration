@@ -1,6 +1,6 @@
 ---
 required: [role, phase_id, project_name, workdir, phase_dir, completion_signal_path]
-optional: [prior_phase_dirs, heartbeat_path, suggested_commit_message]
+optional: [prior_phase_dirs, heartbeat_path, suggested_commit_message, attempt_protocol_block, completion_identity_fields, heartbeat_example]
 ---
 
 # Orchestration Protocol Header
@@ -25,6 +25,8 @@ Code session spawned by agent-orchestrator. Your working directory is
 **{{workdir}}**.
 
 ## File protocol
+
+{{attempt_protocol_block}}
 
 Every input and output for this phase lives under a single phase directory:
 
@@ -55,9 +57,7 @@ Write the completion signal file as YAML frontmatter + markdown body:
 
 ```
 ---
-schema_version: 1
-agent: {{role}}
-phase: {{phase_id}}
+{{completion_identity_fields}}
 status: complete          # complete | blocked | partial
 ended_at: <ISO 8601 UTC>
 git_commit: <short SHA, or "none" if you did not commit>
@@ -144,7 +144,7 @@ the heartbeat log (JSONL — one compact JSON object per line, no
 trailing commas):
 
 ```
-{"ts": "<ISO 8601 UTC>", "pid": <your OS process PID>, "role": "{{role}}", "phase_id": "{{phase_id}}", "message": "<short status>"}
+{{heartbeat_example}}
 ```
 
 The `pid` field is your own process PID (e.g., `process.pid` in Node,

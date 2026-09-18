@@ -169,6 +169,41 @@ const MAX_CHECKPOINT_ENTRIES = 256;
  *   false — kernel returned ESRCH (no such process)
  *   null  — invalid PID, or unknown error code (caller may surface)
  */
+function creationTimeKey(value) {
+  const fraction = /\.(\d+)(?:Z|[+-]\d{2}:?\d{2})$/i.exec(value)?.[1] || '';
+  // CIM timestamps carry finer precision than Date.parse's milliseconds.
+  return `${Date.parse(value)}:${fraction.slice(3).replace(/0+$/, '')}`;
+}
+
+function observeProcessIdentity(identity, sample) {
+  if (!identity || !sample || !identity.hostname || identity.hostname !== sample.hostname) {
+    return { state: 'unknown', reason: 'host identity unavailable or different' };
+  }
+  if (identity.host_boot_id && sample.host_boot_id && identity.host_boot_id !== sample.host_boot_id) {
+    return { state: 'dead', reason: 'host reboot' };
+  }
+  if (!Number.isSafeInteger(identity.pid) || identity.pid <= 0 ||
+      !Number.isFinite(Date.parse(identity.creation_time)) ||
+      !identity.host_boot_id || !sample.host_boot_id) {
+    return { state: 'unknown', reason: 'process creation or boot identity unavailable' };
+  }
+  if (sample.complete !== true || !Array.isArray(sample.processes) || sample.error) {
+    return { state: 'unknown', reason: sample.error || 'incomplete process table' };
+  }
+  if (!sample.processes.every((p) => Number.isSafeInteger(p?.pid) && p.pid >= 0)) {
+    return { state: 'unknown', reason: 'malformed process table' };
+  }
+  const matches = sample.processes.filter((p) => p.pid === identity.pid);
+  if (matches.length === 0) return { state: 'dead', reason: 'identified PID absent from complete table' };
+  if (matches.length !== 1 || !Number.isFinite(Date.parse(matches[0].creation_time))) {
+    return { state: 'unknown', reason: 'observed creation identity unavailable' };
+  }
+  if (creationTimeKey(matches[0].creation_time) !== creationTimeKey(identity.creation_time)) {
+    return { state: 'dead', reason: 'old PID creation identity replaced' };
+  }
+  return { state: 'live', reason: 'PID and creation identity match' };
+}
+
 function isPidAlive(pid, _killer) {
   if (!Number.isInteger(pid) || pid <= 0) return null;
   const killer = _killer || ((p, sig) => process.kill(p, sig));
@@ -1260,6 +1295,7 @@ function main() {
 if (require.main === module) main();
 
 module.exports = {
+  observeProcessIdentity,
   checkHealth,
   isPidAlive,
   parseHeartbeatTail,

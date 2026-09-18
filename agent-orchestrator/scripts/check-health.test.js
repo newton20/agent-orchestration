@@ -16,6 +16,24 @@ const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const yaml = require('js-yaml');
 
+test('U2 process observation requires creation and boot identity; only complete tables establish absence or reuse', () => {
+  const { observeProcessIdentity: observe } = require('./check-health');
+  const identity = { pid: 42, creation_time: '2026-09-17T00:00:00Z', hostname: 'host', host_boot_id: 'boot' };
+  const sample = { complete: true, hostname: 'host', host_boot_id: 'boot', processes: [identity] };
+  assert.equal(observe(identity, sample).state, 'live');
+  assert.equal(observe(identity, { ...sample, processes: [] }).state, 'dead');
+  assert.equal(observe(identity, { ...sample, processes: [{ ...identity, creation_time: '2026-09-17T00:00:01Z' }] }).state, 'dead');
+  assert.equal(observe(identity, { ...sample, complete: false, processes: [] }).state, 'unknown');
+  assert.equal(observe(identity, { ...sample, error: 'access denied', processes: [] }).state, 'unknown');
+  assert.equal(observe({ ...identity, creation_time: null }, { ...sample, processes: [] }).state, 'unknown');
+  assert.equal(observe(identity, { ...sample, processes: [{ pid: 42, creation_time: null }] }).state, 'unknown');
+  assert.equal(observe({ ...identity, pid: null, creation_time: null }, { ...sample, host_boot_id: 'reboot' }).state, 'dead');
+  assert.equal(observe(identity, { ...sample, hostname: 'other' }).state, 'unknown');
+  const precise = { ...identity, creation_time: '2026-09-17T00:00:00.0000001Z' };
+  assert.equal(observe(precise, { ...sample, processes: [{ ...precise, creation_time: '2026-09-17T00:00:00.0000002Z' }] }).state, 'dead');
+  assert.equal(observe(identity, { ...sample, processes: [{ ...identity, creation_time: '2026-09-17T00:00:00.0000000+00:00' }] }).state, 'live');
+});
+
 const {
   checkHealth,
   isPidAlive,

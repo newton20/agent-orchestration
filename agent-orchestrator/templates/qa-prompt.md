@@ -1,6 +1,6 @@
 ---
 required: [phase_id, pr_or_branch_under_test, qa_scope_rows, qa_playbook_block, completion_signal_path]
-optional: [previous_phase_briefing, test_commands_block]
+optional: [previous_phase_briefing, test_commands_block, attempt_context]
 ---
 
 # Phase {{phase_id}} — QA assignment
@@ -10,6 +10,8 @@ optional: [previous_phase_briefing, test_commands_block]
 > This template layers the QA-specific assignment on top.
 
 ## Role preamble
+
+{{attempt_context}}
 
 You are the QA agent for phase **{{phase_id}}**. Your job is to verify
 the work described under **Scope rows** below against the playbook that

@@ -106,8 +106,17 @@ function probeProcess(pid) {
 function readDiscovery(file) {
   const fd = fs.openSync(file, 'r');
   try {
-    if (fs.fstatSync(fd).size > MAX_DISCOVERY_BYTES) throw new Error(`oversized discovery record: ${file}`);
-    return JSON.parse(fs.readFileSync(fd, 'utf8'));
+    const size = fs.fstatSync(fd).size;
+    if (size > MAX_DISCOVERY_BYTES) throw new Error(`oversized discovery record: ${file}`);
+    const buffer = Buffer.alloc(size + 1);
+    let length = 0;
+    while (length < buffer.length) {
+      const count = fs.readSync(fd, buffer, length, buffer.length - length, null);
+      if (!count) break;
+      length += count;
+    }
+    if (length > size) throw new Error(`discovery record changed during read: ${file}`);
+    return JSON.parse(buffer.subarray(0, length).toString('utf8'));
   } finally {
     fs.closeSync(fd);
   }
@@ -165,6 +174,78 @@ function assertOwnership(owner, workspace, namespace = 'controller') {
   if (!held || !held.active || !held.server.listening || held.workspace.key !== workspace.key || held.namespace !== namespace) {
     throw new Error('live kernel workspace ownership is required for mutation');
   }
+}
+
+function reservationPath(owner) {
+  assertOwnership(owner, owner.workspace);
+  return path.join(path.dirname(path.dirname(owner.discoveryPath)), 'reservation.json');
+}
+
+function readCheckoutReservation(owner) {
+  const file = reservationPath(owner);
+  let record;
+  try { record = readDiscovery(file); } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw new Error(`cannot read checkout reservation: ${error.message}`);
+  }
+  validateReservation(record, owner.workspace);
+  return record;
+}
+
+function validateReservation(record, workspace) {
+  if (record?.schema_version !== 1 || record.workspace_key !== workspace.key ||
+      typeof record.manifest_path !== 'string' || !path.isAbsolute(record.manifest_path) ||
+      !['run_id', 'phase_id', 'role', 'attempt_id'].every((key) =>
+        typeof record[key] === 'string' && /^(?!\.+$)[A-Za-z0-9._-]+$/.test(record[key])) ||
+      !Number.isSafeInteger(record.review_iteration) || record.review_iteration < 0) {
+    throw new Error('invalid checkout reservation identity');
+  }
+}
+
+function reserveCheckout(owner, identity) {
+  const file = reservationPath(owner);
+  const record = {
+    schema_version: 1, workspace_key: owner.workspace.key,
+    manifest_path: path.resolve(identity.manifest_path), run_id: identity.run_id,
+    phase_id: identity.phase_id, role: identity.role, review_iteration: identity.review_iteration,
+    attempt_id: identity.attempt_id,
+  };
+  validateReservation(record, owner.workspace);
+  const previous = readCheckoutReservation(owner);
+  if (previous) {
+    if (Object.keys(record).some((key) => record[key] !== previous[key])) throw new Error('checkout has an unresolved attempt reservation');
+    return previous;
+  }
+  const temp = `${file}.tmp-${randomUUID()}`;
+  let fd;
+  try {
+    fd = fs.openSync(temp, 'wx', 0o600);
+    fs.writeFileSync(fd, JSON.stringify(record));
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = undefined;
+    assertOwnership(owner, owner.workspace);
+    fs.renameSync(temp, file);
+  } catch (error) {
+    if (fd !== undefined) fs.closeSync(fd);
+    try { fs.unlinkSync(temp); } catch (cleanup) { if (cleanup.code !== 'ENOENT') throw new AggregateError([error, cleanup]); }
+    throw new Error(`cannot persist checkout reservation: ${error.message}`);
+  }
+  return readCheckoutReservation(owner);
+}
+
+function releaseCheckout(owner, identity) {
+  const record = readCheckoutReservation(owner);
+  if (!record) return;
+  if (!['run_id', 'phase_id', 'role', 'review_iteration', 'attempt_id'].every((key) => record[key] === identity[key])) {
+    throw new Error('cannot release a different attempt reservation');
+  }
+  fs.unlinkSync(reservationPath(owner));
+}
+
+function ownerHostEvidence(owner) {
+  assertOwnership(owner, owner.workspace, owner.namespace);
+  return { ...handles.get(owner).evidence };
 }
 
 async function acquireWorkspaceOwner(workspace, options = {}) {
@@ -252,9 +333,11 @@ async function acquireWorkspaceOwner(workspace, options = {}) {
   server.on('error', () => { held.active = false; });
   try {
     evidence = getHostEvidence();
+    held.evidence = evidence;
     const locks = inspectLegacyLocks(options.legacyLockPaths || [], { host: evidence, probeProcess: options._probeLegacyProcess || probeProcess });
     fs.mkdirSync(partition, { recursive: true });
     for (const entry of fs.readdirSync(partition, { withFileTypes: true })) {
+      if (namespace === 'controller' && (entry.name === 'reservation.json' || /^reservation\.json\.tmp-/.test(entry.name))) continue;
       if (!entry.isDirectory()) throw new Error('invalid owner discovery partition');
       const recordPath = path.join(partition, entry.name, 'owner.json');
       let record;
@@ -266,6 +349,18 @@ async function acquireWorkspaceOwner(workspace, options = {}) {
           record.pipe_name !== pipeName || record.service_id !== entry.name) {
         throw new Error('owner discovery full-key collision or namespace mismatch');
       }
+    }
+    if (namespace === 'controller') {
+      const reservation = readCheckoutReservation(owner);
+      const context = options.reservationContext;
+      const manifestKey = (file) => process.platform === 'win32' ? path.resolve(file).toLowerCase() : path.resolve(file);
+      if (reservation && (!context || reservation.run_id !== context.run_id ||
+          manifestKey(reservation.manifest_path) !== manifestKey(context.manifest_path))) {
+        const error = new Error('checkout has an unresolved attempt reservation; resume its original manifest and run');
+        error.code = 'ELOCKED';
+        throw error;
+      }
+      restrictDirectory(partition, info.sid);
     }
     restrictDirectory(instanceDir, info.sid);
     fs.writeFileSync(capabilityPath, JSON.stringify({
@@ -316,4 +411,5 @@ function queryOwner(workspace, { namespace = 'controller' } = {}) {
 module.exports = {
   canonicalPath, resolveWorkspace, validateWorkspace, pipeNameFor, acquireWorkspaceOwner,
   assertOwnership, queryOwner, inspectLegacyLocks, getHostEvidence, probeProcess,
+  ownerHostEvidence, readCheckoutReservation, reserveCheckout, releaseCheckout,
 };

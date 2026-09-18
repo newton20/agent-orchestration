@@ -1,6 +1,6 @@
 ---
 required: [role, phase_id, recovery_checkpoint_path, crash_timestamp, remaining_work_block]
-optional: [last_heartbeat_timestamp, prior_session_pid, output_paths, heartbeat_path, previous_phase_briefing, qa_scope_rows, qa_playbook_block, pr_or_branch_under_test, test_commands_block, completed_checkpoints_block]
+optional: [last_heartbeat_timestamp, prior_session_pid, output_paths, heartbeat_path, previous_phase_briefing, qa_scope_rows, qa_playbook_block, pr_or_branch_under_test, test_commands_block, completed_checkpoints_block, attempt_context]
 ---
 
 # Phase {{phase_id}} — recovery / resume
@@ -12,6 +12,8 @@ optional: [last_heartbeat_timestamp, prior_session_pid, output_paths, heartbeat_
 > see `templates/README.md` for the full catalog.
 
 ## Role preamble
+
+{{attempt_context}}
 
 You are the **{{role}}** agent for phase **{{phase_id}}**, respawned
 after the prior session crashed or timed out. Your job is to finish the
