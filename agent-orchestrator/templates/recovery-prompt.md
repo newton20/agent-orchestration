@@ -1,6 +1,6 @@
 ---
 required: [role, phase_id, recovery_checkpoint_path, crash_timestamp, remaining_work_block]
-optional: [last_heartbeat_timestamp, prior_session_pid, output_paths, heartbeat_path, previous_phase_briefing, qa_scope_rows, qa_playbook_block, pr_or_branch_under_test, test_commands_block, completed_checkpoints_block]
+optional: [last_heartbeat_timestamp, prior_session_pid, output_paths, heartbeat_path, previous_phase_briefing, qa_scope_rows, qa_playbook_block, pr_or_branch_under_test, test_commands_block, completed_checkpoints_block, attempt_context, recovery_prompt_audit, recovery_ownership_check]
 ---
 
 # Phase {{phase_id}} — recovery / resume
@@ -12,6 +12,8 @@ optional: [last_heartbeat_timestamp, prior_session_pid, output_paths, heartbeat_
 > see `templates/README.md` for the full catalog.
 
 ## Role preamble
+
+{{attempt_context}}
 
 You are the **{{role}}** agent for phase **{{phase_id}}**, respawned
 after the prior session crashed or timed out. Your job is to finish the
@@ -76,26 +78,7 @@ no `depends_on` entries.
 
 If empty AND your role (`{{role}}`) is `impl` or `qa`: audit whether
 the original (non-recovery) prompt also had an empty briefing. The
-recovery dispatcher MUST preserve the prior session's prompt at
-`${phase_dir}/{{role}}-prompt.original.md` before overwriting
-`${phase_dir}/{{role}}-prompt.md` with this recovery prompt — the
-`.original.md` suffix disambiguates "your current recovery prompt"
-from "the prompt the prior session was running." Read that
-preserved-original file and inspect its **Previous phase context**
-(impl) or **Upstream context** (qa) block:
-- If the original block was also empty (this phase had no `depends_on`
-  entries), proceed: the empty briefing is correct for the phase, and
-  the branch HEAD plus the crash context above are the full context.
-- If the original block was non-empty (the prior dispatch did inline
-  upstream completion signals), the recovery dispatch dropped
-  mandatory context. Write a `status: blocked` signal asking the
-  coord to redispatch with the briefing intact rather than guessing.
-- If `${phase_dir}/{{role}}-prompt.original.md` is missing or
-  unreadable: the recovery dispatcher failed its preservation
-  contract. Treat the briefing as potentially-required and write
-  `status: blocked` — the coord can re-issue with the original
-  context. Do not assume empty-equals-correct on a phase you can't
-  audit.
+{{recovery_prompt_audit}}
 
 If your role is `coord`: skip this block (coord briefings have no
 upstream completion-signal context by design).
@@ -180,16 +163,7 @@ missing, incomplete, or inconsistent with the plan's expected output.
 
 Before touching any file:
 
-1. **Confirm the prior session is actually dead.** Read the last entry
-   in `{{heartbeat_path}}` (if present) and extract its `pid` field.
-   Look that PID up in the OS process table (`tasklist /FI "PID eq
-   <pid>"` on Windows, `ps -p <pid>` elsewhere). If the PID is still
-   running, **stop and write a `status: blocked` signal** — the
-   orchestrator's death-detection was wrong, and writing into a phase
-   directory the prior agent still owns will corrupt its work. Do not
-   proceed under any circumstances. If the heartbeat log is absent or
-   empty, the prior session never emitted one; proceed but note the
-   absence under **Decisions** in your completion signal.
+{{recovery_ownership_check}}
 2. **Check for `.tmp-*` or `.consuming-*` artifacts** in the phase
    directory or the paths the prior session was writing to. These
    indicate a mid-write crash — a file-rename was in flight when the

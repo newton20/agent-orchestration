@@ -1,6 +1,6 @@
 ---
 required: []
-optional: [test_commands_block]
+optional: [test_commands_block, attempt_context]
 ---
 
 # QA playbook (reusable)
@@ -12,6 +12,8 @@ optional: [test_commands_block]
 > rows**. Keep this file free of project-specific paths or commit SHAs.
 
 ## Ground rules
+
+{{attempt_context}}
 
 - You are the QA agent. You test, you report. You do not modify
   application code, push commits, touch the plan, or fix bugs you find.

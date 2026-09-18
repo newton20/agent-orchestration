@@ -12,6 +12,72 @@ const path = require('node:path');
 const yaml = require('js-yaml');
 
 const { scaffoldProtocol } = require('./scaffold-protocol');
+const { runtimeFixture } = require('./test-support/runtime-fixture');
+
+test('U1 V2 scaffold requires persisted run identity and preserves run-scoped artifacts', (t) => {
+  const fx = runtimeFixture(t);
+  const P = require('./parse-manifest');
+  const accepted = P.prepareV2Manifest(fx.manifest, fx.manifestPath);
+  const missing = scaffoldProtocol({ manifestPath: fx.manifestPath });
+  assert.equal(missing.ok, false);
+  assert.match(missing.error, /run|owner|state/i);
+  const preview = scaffoldProtocol({ manifestPath: fx.manifestPath, accepted, runId: 'run-test', dryRun: true });
+  assert.equal(preview.ok, true);
+  assert.match(preview.protoDir, /runs[\\/]run-test$/);
+  assert.equal(fs.existsSync(preview.protoDir), false);
+});
+
+for (const target of ['docs', 'runs', 'phase', 'events']) {
+  test(`U1 V2 scaffold prevalidates every action before writing through redirected ${target}`, async (t) => {
+    const fx = runtimeFixture(t);
+    const W = require('./workspace-owner');
+    const accepted = require('./parse-manifest').prepareV2Manifest(fx.manifest, fx.manifestPath);
+    const owner = await W.acquireWorkspaceOwner(accepted.workspace, { _runtimeRoot: fx.runtimeRoot });
+    t.after(() => owner.release());
+    const state = require('./state-store').createStateStore({ manifestPath: fx.manifestPath, owner }).initialize(accepted);
+    const runs = path.join(fx.workdir, 'docs', 'orchestration', 'runs');
+    const run = path.join(runs, state.run_id);
+    const outside = path.join(fx.root, 'outside');
+    fs.mkdirSync(outside);
+    const sentinel = path.join(outside, 'events.jsonl');
+    fs.writeFileSync(sentinel, 'preserve outside bytes\n');
+    const redirected = {
+      docs: path.join(fx.workdir, 'docs'), runs,
+      phase: path.join(run, 'phases', 'p1'),
+      events: path.join(run, 'logs', 'events.jsonl'),
+    }[target];
+    fs.mkdirSync(path.dirname(redirected), { recursive: true });
+    fs.symlinkSync(target === 'events' ? sentinel : outside, redirected, target === 'events' ? 'file' : 'junction');
+    const options = { manifestPath: fx.manifestPath, accepted: state.accepted, runId: state.run_id, owner };
+    for (let restart = 0; restart < 2; restart++) {
+      const result = scaffoldProtocol(options);
+      assert.equal(result.ok, false, JSON.stringify(result));
+      assert.match(result.error, /redirected link/);
+      assert.deepEqual(fs.readdirSync(outside), ['events.jsonl']);
+      assert.equal(fs.readFileSync(sentinel, 'utf8'), 'preserve outside bytes\n');
+      if (target === 'events') assert.equal(fs.existsSync(path.join(run, 'phases')), false, 'no earlier action may write');
+    }
+  });
+}
+
+test('U1 shared artifact path guard preserves containment, realpath and errno checks', (t) => {
+  const fx = runtimeFixture(t);
+  const { assertArtifactPath } = require('./artifact-path');
+  const root = require('./workspace-owner').canonicalPath(fx.workdir);
+  assert.doesNotThrow(() => assertArtifactPath(root, path.join(root, 'missing', 'artifact.json')));
+  assert.throws(() => assertArtifactPath(root, path.join(root, '..', 'artifact.json')), /escapes/);
+  const alias = path.join(fx.root, 'alias');
+  fs.symlinkSync(root, alias, 'junction');
+  assert.throws(() => assertArtifactPath(alias, path.join(alias, 'artifact.json')), /identity changed/);
+  const lstat = fs.lstatSync;
+  t.mock.method(fs, 'lstatSync', (target, ...args) => {
+    if (target === path.join(root, 'denied')) throw Object.assign(new Error('denied artifact ancestor'), { code: 'EACCES' });
+    if (target === path.join(root, 'not-a-directory')) throw Object.assign(new Error('invalid artifact ancestor'), { code: 'ENOTDIR' });
+    return lstat(target, ...args);
+  });
+  assert.throws(() => assertArtifactPath(root, path.join(root, 'denied', 'artifact.json')), { code: 'EACCES' });
+  assert.throws(() => assertArtifactPath(root, path.join(root, 'not-a-directory', 'artifact.json')), { code: 'ENOTDIR' });
+});
 
 // Fixture builder: writes a manifest + a plugin-dir with template stubs
 // into a fresh temp dir. Returns paths so tests can inspect results.

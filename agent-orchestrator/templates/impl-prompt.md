@@ -1,6 +1,6 @@
 ---
 required: [phase_id, plan_units, output_paths, completion_signal_path]
-optional: [previous_phase_briefing]
+optional: [previous_phase_briefing, attempt_context]
 ---
 
 # Phase {{phase_id}} — implementation assignment
@@ -12,6 +12,8 @@ optional: [previous_phase_briefing]
 > header wins — surface the conflict in **Blockers / open questions**.
 
 ## Role preamble
+
+{{attempt_context}}
 
 You are the implementation agent for phase **{{phase_id}}**. Your job is
 to ship the scope described under **Implementation scope** below, write

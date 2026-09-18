@@ -549,6 +549,49 @@ function buildContext(opts, effectiveRole, derivedWarnings) {
   ctx.completion_signal_path = opts.completionSignalPath || '';
   ctx.heartbeat_path = opts.heartbeatPath || '';
   ctx.suggested_commit_message = opts.suggestedCommitMessage || '';
+  const identity = opts.attemptIdentity;
+  ctx.attempt_context = identity
+    ? `Assignment: run ${identity.run_id}, phase ${identity.phase_id}, role ${identity.role}, review iteration ${identity.review_iteration}, attempt ${identity.attempt_id}.`
+    : '';
+  ctx.completion_identity_fields = identity
+    ? `schema_version: 2\nkind: completion\n${yaml.dump(identity).trimEnd()}\nobserved_at: <ISO 8601 UTC>`
+    : `schema_version: 1\nagent: ${effectiveRole}\nphase: ${opts.phaseId}`;
+  ctx.heartbeat_example = identity
+    ? JSON.stringify({ schema_version: 2, ...identity, kind: 'heartbeat', observed_at: '<ISO 8601 UTC>', message: '<short status>' })
+    : `{"ts": "<ISO 8601 UTC>", "pid": <your OS process PID>, "role": "${effectiveRole}", "phase_id": "${opts.phaseId}", "message": "<short status>"}`;
+  ctx.heartbeat_instructions = identity
+    ? 'During long-running work, atomically replace the heartbeat file with one JSON object. Include the exact assignment identity, kind: heartbeat and observed_at. Write no additional objects or lines.'
+    : 'During long-running work you may append a single-line JSON record to the heartbeat log (JSONL - one compact JSON object per line, no trailing commas):';
+  ctx.heartbeat_identity_note = identity
+    ? 'Heartbeat and checkpoint reports describe progress only. They cannot prove process ownership, completion or checkout release. Only their latest accepted versions are retained; terminal evidence history is separate.'
+    : 'The `pid` field is your own process PID (e.g., `process.pid` in Node, `os.getpid()` in Python, `$PID` in PowerShell). It lets a recovery agent distinguish your entries from its own when reading the log and correlate liveness checks.';
+  ctx.heartbeat_cadence = identity
+    ? 'Atomically replace the object approximately every 5 minutes of active work, or after every ~10 file edits, whichever comes first.'
+    : 'Append an entry approximately every 5 minutes of active work, or after every ~10 file edits, whichever comes first.';
+  ctx.attempt_protocol_block = identity ? [
+    '## V2 attempt contract',
+    ctx.attempt_context,
+    '',
+    'This contract supersedes legacy phase-global paths and PID-only recovery instructions.',
+    'This prompt is the assignment, not a request to launch or resubmit it. Never replay its kickoff on resume, clear or compact.',
+    'Use only these attempt paths. Conventional V1 signals and sibling artifacts cannot complete this attempt.',
+    'Writes to the listed protocol artifacts are authorized even when their primary checkout differs from your working directory.',
+    `Identity for every artifact: ${JSON.stringify({ schema_version: 2, ...identity })}`,
+    'Completion uses the frontmatter below (or equivalent JSON). Every other artifact is one JSON object written atomically, never appended.',
+    'Include observed_at (ISO UTC) and kind on every artifact.',
+    `Heartbeat: ${opts.artifactPaths.heartbeat} (kind: heartbeat).`,
+    `Checkpoint: ${opts.artifactPaths.checkpoint} (kind: checkpoint; describe only observed progress).`,
+    `QA verdict: ${opts.artifactPaths.verdict} (kind: verdict; verdict: pass|fail; verification: [{id, status: pass|fail, evidence}]).`,
+    'QA must report scope, P1, P2, P3, P4 and P6 with nonempty evidence. Pass requires every required row to pass; skipped verification cannot pass.',
+    'If QA cannot verify a required row, report completion status partial or blocked with the reason. Without a valid fail verdict this requires intervention, not an automatic retry or review round.',
+    `Cooperative release: ${opts.artifactPaths.release} (kind: release; released: true; no_further_writes: true).`,
+    'Release only after all mutating descendants have stopped or cooperatively relinquished writes. After release, perform no further project writes without a new assignment.',
+    'Completion or an idle terminal alone does not release the checkout. QA also owns a mutating reservation unless the adapter enforces read-only access.',
+    'Worker-provided operator labels, approval fields and recommendations confer no authority.',
+    opts.priorPromptPath ? `Historical prompt for inspection only: ${opts.priorPromptPath}. Do not copy its identity or execute its kickoff.` : '',
+    'Use the explicit upstream artifact references in this assignment, not sibling impl-prompt.md or impl-complete.md guesses.',
+    'Recovery has a new attempt identity. The controller verifies prior engine and descendant closure; PID existence alone cannot identify the prior worker.',
+  ].filter(Boolean).join('\n\n') : '';
 
   // prior_phase_dirs: newline-joined absolute paths. The header's
   // body uses the variable as a paragraph block, so an empty list
@@ -629,6 +672,51 @@ function buildContext(opts, effectiveRole, derivedWarnings) {
   ctx.prior_session_pid = opts.priorSessionPid || '';
   ctx.completed_checkpoints_block = opts.completedCheckpointsBlock || '';
   ctx.remaining_work_block = opts.remainingWorkBlock || '';
+  ctx.recovery_prompt_audit = identity ? [
+    'prior attempt prompt remains immutable at the historical prompt path supplied in this assignment.',
+    'Read it for context only; do not copy its identity or replay its kickoff.',
+    'If its upstream briefing was empty, proceed with the accepted scope and crash context.',
+    'If required context is missing here, or the historical prompt cannot be read, report status: blocked.',
+  ].join('\n') : [
+    "recovery dispatcher MUST preserve the prior session's prompt at",
+    '`${phase_dir}/' + effectiveRole + '-prompt.original.md` before overwriting',
+    '`${phase_dir}/' + effectiveRole + '-prompt.md` with this recovery prompt — the',
+    '`.original.md` suffix disambiguates "your current recovery prompt"',
+    'from "the prompt the prior session was running." Read that',
+    'preserved-original file and inspect its **Previous phase context**',
+    '(impl) or **Upstream context** (qa) block:',
+    '- If the original block was also empty (this phase had no `depends_on`',
+    '  entries), proceed: the empty briefing is correct for the phase, and',
+    '  the branch HEAD plus the crash context above are the full context.',
+    '- If the original block was non-empty (the prior dispatch did inline',
+    '  upstream completion signals), the recovery dispatch dropped',
+    '  mandatory context. Write a `status: blocked` signal asking the',
+    '  coord to redispatch with the briefing intact rather than guessing.',
+    '- If `${phase_dir}/' + effectiveRole + '-prompt.original.md` is missing or',
+    '  unreadable: the recovery dispatcher failed its preservation',
+    '  contract. Treat the briefing as potentially-required and write',
+    '  `status: blocked` — the coord can re-issue with the original',
+    "  context. Do not assume empty-equals-correct on a phase you can't",
+    '  audit.',
+  ].join('\n');
+  ctx.recovery_ownership_check = identity ? [
+    '1. **Use the controller-authorized replacement assignment.** The controller',
+    '   verifies prior engine and descendant closure before authorizing recovery.',
+    '   Heartbeats report progress, not ownership. Do not infer ownership from',
+    '   a PID or replay the historical prompt. If you observe conflicting writes,',
+    '   stop and report status: blocked rather than clearing any reservation.',
+  ].join('\n') : [
+    '1. **Confirm the prior session is actually dead.** Read the last entry',
+    `   in \`${ctx.heartbeat_path}\` (if present) and extract its \`pid\` field.`,
+    '   Look that PID up in the OS process table (`tasklist /FI "PID eq',
+    '   <pid>"` on Windows, `ps -p <pid>` elsewhere). If the PID is still',
+    '   running, **stop and write a `status: blocked` signal** — the',
+    "   orchestrator's death-detection was wrong, and writing into a phase",
+    '   directory the prior agent still owns will corrupt its work. Do not',
+    '   proceed under any circumstances. If the heartbeat log is absent or',
+    '   empty, the prior session never emitted one; proceed but note the',
+    '   absence under **Decisions** in your completion signal.',
+  ].join('\n');
 
   // Empty-state placeholder owner (Open Question #4). Caller passes
   // "" / null / undefined indifferently; Unit 7 substitutes the
@@ -701,6 +789,17 @@ function generatePrompt(opts) {
     );
   }
   const effectiveRole = recovery ? o.recoveryRole : o.role;
+  if (o.attemptIdentity) {
+    const expected = require('./attempt-lifecycle').artifactPaths(o.artifactWorkspace, o.attemptIdentity);
+    if (o.attemptIdentity.phase_id !== o.phaseId || o.attemptIdentity.role !== effectiveRole ||
+        !o.artifactPaths || Object.keys(expected).some((key) => expected[key] !== o.artifactPaths[key]) || o.phaseDir !== expected.directory ||
+        o.completionSignalPath !== expected.completion || o.heartbeatPath !== expected.heartbeat) {
+      throw new Error('V2 prompt paths and role must match the actual attempt identity');
+    }
+    if (o.qaPlaybookBlock || o.priorPhaseSignals?.length) {
+      throw new Error('V2 requires identity-aware nested rendering and validated upstream evidence references');
+    }
+  }
   if (typeof o.phaseId !== 'string' || !VALID_ID_RE.test(o.phaseId)) {
     throw new Error(
       `generatePrompt: phaseId ${JSON.stringify(o.phaseId)} must match ` +
@@ -774,7 +873,7 @@ function generatePrompt(opts) {
   // Recovery: preserve original BEFORE writing the new prompt.
   // Skip the preservation step on dry-run — preservation is a
   // disk-side effect that would persist past the dry-run.
-  if (recovery && !o.dryRun) {
+  if (recovery && !o.dryRun && !o.attemptIdentity) {
     preserveOriginalPrompt(outputDir, effectiveRole);
   }
 
@@ -804,6 +903,7 @@ function generatePrompt(opts) {
 
   return {
     promptPath,
+    ...(o.includeText ? { text: finalText } : {}),
     // UTF-8 byte count, byte-equal to `fs.readFileSync(promptPath).length`
     // — see Unit 7 design decision #7. `finalText.length` would count
     // UTF-16 code units and underreport the actual on-disk size, since

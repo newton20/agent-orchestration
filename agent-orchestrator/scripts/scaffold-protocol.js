@@ -30,12 +30,14 @@
 
 const fs = require('fs');
 const path = require('path');
+const { assertArtifactPath } = require('./artifact-path');
 
 const {
   loadManifest,
   validate,
   findDanglingDeps,
   normalizePhases,
+  loadStatus,
 } = require('./parse-manifest');
 
 // -------------------- CLI entry --------------------
@@ -96,8 +98,13 @@ function fail(msg, code = 1) {
  * @param {boolean} [opts.dryRun]     If true, do not write anything.
  * @returns {object}
  */
-function scaffoldProtocol({ manifestPath, pluginDir, dryRun = false }) {
-  const loaded = loadManifest(manifestPath);
+function scaffoldProtocol({ manifestPath, pluginDir, dryRun = false, accepted, runId, owner }) {
+  const loaded = accepted ? null : loadManifest(manifestPath);
+  const status = loadStatus(manifestPath);
+  if (!status.ok) return { ok: false, error: status.error };
+  if (accepted || loaded?.manifest?.schema_version === 2 || status.status?.schema_version === 2) {
+    return scaffoldV2({ manifestPath, pluginDir, dryRun, accepted, runId, owner });
+  }
   if (!loaded.ok) return { ok: false, error: loaded.error };
 
   const dangling = findDanglingDeps(
@@ -106,6 +113,42 @@ function scaffoldProtocol({ manifestPath, pluginDir, dryRun = false }) {
   const vresult = validate(loaded.manifest);
   if (dangling.length > 0 || !vresult.valid) {
     return { ok: false, errors: [...dangling, ...vresult.errors] };
+  }
+
+  function scaffoldV2({ manifestPath, pluginDir, dryRun, accepted, runId, owner }) {
+    try {
+      const { validateAccepted, readState, canonicalJson } = require('./state-store');
+      const { assertOwnership } = require('./workspace-owner');
+      if (!accepted || typeof runId !== 'string' || !/^[A-Za-z0-9_-]+$/.test(runId)) {
+        throw new Error('V2 scaffold requires an accepted snapshot and persisted run ID from the owner');
+      }
+      validateAccepted({ ...accepted, revision: accepted.revision || 1 });
+      if (!dryRun) {
+        assertOwnership(owner, accepted.workspace);
+        const state = readState(manifestPath);
+        if (state?.run_id !== runId || canonicalJson(state.accepted) !== canonicalJson(accepted)) {
+          throw new Error('V2 scaffold must match the persisted accepted run state');
+        }
+      }
+      const protoDir = path.join(accepted.workspace.root, 'docs', 'orchestration', 'runs', runId);
+      const actions = [
+        ...accepted.phases.map((phase) => ({ type: 'mkdir', path: path.join(protoDir, 'phases', phase.id) })),
+        { type: 'mkdir', path: path.join(protoDir, 'logs') },
+        { type: 'touch', path: path.join(protoDir, 'logs', 'events.jsonl') },
+      ];
+      for (const action of actions) assertArtifactPath(accepted.workspace.root, action.path);
+      if (dryRun) return { ok: true, dryRun: true, protoDir, actions };
+      for (const action of actions) {
+        assertOwnership(owner, accepted.workspace);
+        if (action.type === 'mkdir') fs.mkdirSync(action.path, { recursive: true });
+        else {
+          try { fs.closeSync(fs.openSync(action.path, 'wx')); } catch (error) {
+            if (error.code !== 'EEXIST') throw error;
+          }
+        }
+      }
+      return { ok: true, protoDir, run_id: runId, actions };
+    } catch (error) { return { ok: false, error: error.message }; }
   }
 
   const phases = normalizePhases(loaded.manifest);

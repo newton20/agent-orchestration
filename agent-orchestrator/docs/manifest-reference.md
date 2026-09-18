@@ -1,11 +1,101 @@
 # Manifest Reference
 
-The manifest is a YAML file that describes a multi-phase build. It is the
-single source of truth the orchestrator reads on every tick. The user owns
+The manifest is a YAML file that describes a multi-phase build. V1 reads it
+on every tick. V2 schedules from a persisted accepted snapshot; later
+authoring edits do not change that snapshot. The user owns
 the structural fields (phases, agents, dependencies, launcher). The
 orchestrator owns runtime state (PIDs, timestamps, completion flags), which
 it writes to a separate `manifest-status.yaml` to avoid concurrent-edit
 conflicts.
+
+## V2 foundation
+
+An omitted `schema_version` or `schema_version: 1` selects V1. Explicit
+`schema_version: 2` selects V2; other versions are rejected. V2 currently
+persists accepted state and exposes owner readiness as
+`live_dispatch_disabled`. It does not launch workers.
+
+```yaml
+schema_version: 2
+name: my-feature
+workdir: .
+defaults:
+  engine: agency-copilot
+  phase_timeout_minutes: 60
+  heartbeat_timeout_minutes: 5
+terminal:
+  shell: powershell
+limits:
+  max_timeout_minutes: 1440
+phases:
+  - id: implement
+    agent:
+      role: impl
+      access: mutating
+    completion_signal: signals/implement.md
+```
+
+`defaults.engine` is required: `claude`, `agency-claude`, or
+`agency-copilot`. Each entry in `agents[]`, or the `agent` shorthand, may
+override `engine`, `access`, and `workdir`. Access defaults to `mutating`;
+the other value is `read-only`. A phase cannot contain both forms or
+duplicate roles. Engine executable resolution, permission/model mappings,
+and enforcement of read-only access require adapter acceptance before
+dispatch can be enabled.
+
+All working directories resolve relative to the manifest directory unless
+absolute. Each must exist inside a Git worktree. Separate existing
+worktrees outside the primary checkout are allowed; subdirectories and
+junction aliases of one worktree share its ownership identity. V2 does not
+provision worktrees. Startup revalidates the accepted declarations and
+rejects paths that now resolve differently.
+
+`terminal.shell` accepts `powershell` (default) or `cmd`. V2 rejects the
+entire legacy `launcher` block, raw flags, and arbitrary binaries with
+migration diagnostics. Remove those fields and select a supported engine,
+or retain V1. Unknown V1 fields still produce compatibility warnings.
+
+Timeouts are positive integers. The defaults are 60 minutes per phase,
+5 minutes for heartbeat staleness, and a 1440-minute
+`limits.max_timeout_minutes` cap. Effective defaults and phase overrides
+must fit the cap, including when a timeout was omitted. A smaller cap may
+therefore require explicitly lowering both defaults. Changing the cap
+requires a new run.
+
+Ordinary V2 restart, with or without `--resume`, retains the run ID,
+accepted revision, pause state, and history, even if the authoring file is
+invalid or drifted. `--rerun` explicitly creates a new run and retains the
+old record. An untouched run can be replaced before dispatch. After any
+dispatch, every started phase must be completed or failed, and every historical
+attempt must have a terminal outcome and concrete release/closure evidence.
+Mutating reservations are reconciled under the old run before replacement;
+live, unknown, or queued attempts prevent rerun. Never-started pending or
+dependency-blocked phases do not hold worker ownership and may be replaced
+by the explicit new run. Completed V1 status
+can be imported as read-only history; active or ambiguous V1 state cannot
+be adopted. Do not edit active status directly or use V1 `--update` against
+V2 state. See [runtime state and ownership](runtime-state-reference.md) for
+the storage and ownership contracts.
+
+Fixture-backed lifecycle execution preserves already-admitted retries
+across restart, including at the retry limit, and rechecks engine/access
+capabilities before dispatch. Partial or blocked QA reports without a
+valid fail verdict require intervention; they neither pass verification
+nor trigger automatic execution recovery.
+Without an enabled `review_loop`, a valid negative QA verdict fails the
+phase without launch or execution retries. Closure reconciliation continues
+after that failure; a failed verdict does not itself release the checkout.
+
+## V1 fields
+
+Updated V1 controllers use the same Windows named-pipe ownership as V2.
+They require Windows PowerShell and Git on PATH, but an existing non-Git
+workdir remains supported after positive non-repository detection. Git
+resolution errors do not authorize a directory fallback. An initially
+invalid manifest fails preflight because the controller cannot safely
+choose an ownership claim; it does not poll without owning the workspace.
+Live or uncertain legacy-owner contention returns exit code 2. Corrupt
+ownership metadata returns exit code 1 and requires investigation.
 
 This reference documents every field. Each is tagged with the unit that
 makes it active:

@@ -26,6 +26,46 @@ const {
   VALID_PERMISSION_MODES,
 } = require('./parse-manifest');
 const { FLAG_NAME_RE } = require('../hooks/session-start');
+const { runtimeFixture } = require('./test-support/runtime-fixture');
+
+test('U1 explicit manifest versions and V2 engine configuration fail closed', () => {
+  const base = { name: 'v2', schema_version: 2, defaults: { engine: 'claude' },
+    phases: [{ id: 'p', completion_signal: 'done.md', agent: { role: 'impl' } }] };
+  assert.equal(validate({ ...base, schema_version: 1 }).valid, true);
+  for (const version of [0, 3, '2', null]) assert.equal(validate({ ...base, schema_version: version }).valid, false);
+  for (const patch of [
+    { defaults: {} }, { defaults: { engine: 'wrapper.exe' } },
+    { launcher: { binary: 'claude' } }, { passthrough_flags: ['--foo'] },
+    { terminal: { shell: 'bash' } }, { terminal: { binary: 'cmd.exe' } },
+    { limits: { max_timeout_minutes: 0 } },
+    { limits: { max_timeout_minutes: 1 } },
+    { limits: { max_timeout_minutes: 10 }, defaults: { engine: 'claude', heartbeat_timeout_minutes: 11 } },
+    { limits: { max_timeout_minutes: 10 }, phases: [{ ...base.phases[0], timeout_minutes: 11 }] },
+    { phases: [{ ...base.phases[0], agents: [{ role: 'qa' }] }] },
+    { phases: [{ ...base.phases[0], agent: { role: 'impl', access: 'write' } }] },
+    { phases: [{ ...base.phases[0], agent: { role: 'impl', engine: 'other' } }] },
+    { phases: [{ ...base.phases[0], agent: { role: 'impl', flags: [] } }] },
+  ]) assert.equal(validate({ ...base, ...patch }).valid, false, JSON.stringify(patch));
+});
+
+test('U1 V2 normalization resolves defaults and separately declared Git worktrees', (t) => {
+  const fx = runtimeFixture(t);
+  const other = runtimeFixture(t);
+  const { prepareV2Manifest } = require('./parse-manifest');
+  fx.manifest.phases.push({ id: 'p2', completion_signal: 'done2.md',
+    agents: [{ role: 'qa', engine: 'agency-claude', access: 'read-only', workdir: other.workdir }] });
+  const accepted = prepareV2Manifest(fx.manifest, fx.manifestPath);
+  assert.equal(accepted.manifest.terminal.shell, 'powershell');
+  assert.equal(accepted.manifest.limits.max_timeout_minutes, 1440);
+  assert.equal(accepted.manifest.defaults.phase_timeout_minutes, 60);
+  assert.equal(accepted.manifest.defaults.heartbeat_timeout_minutes, 5);
+  assert.equal(accepted.phases[0].agents[0].engine, 'agency-copilot');
+  assert.equal(accepted.phases[0].agents[0].access, 'mutating');
+  assert.notEqual(accepted.phases[1].agents[0].workspace.key, accepted.workspace.key);
+  assert.equal(accepted.phases[1].agents[0].engine, 'agency-claude');
+  fx.manifest.phases[0].agent.workdir = 'missing';
+  assert.throws(() => prepareV2Manifest(fx.manifest, fx.manifestPath), /workdir|resolve|exist/i);
+});
 
 function write(manifestObj) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'parse-manifest-'));

@@ -11,6 +11,23 @@
 
 # ---- Project identity ------------------------------------------------
 
+schema_version: 1
+# Omitted or 1 keeps V1 compatibility. Explicit 2 activates the V2
+# foundation, which persists accepted state but does not dispatch workers.
+# For V2, remove launcher entirely and add:
+# defaults:
+#   engine: agency-copilot            # claude | agency-claude | agency-copilot
+#   phase_timeout_minutes: 60
+#   heartbeat_timeout_minutes: 5
+# terminal:
+#   shell: powershell                 # powershell (default) | cmd
+# limits:
+#   max_timeout_minutes: 1440         # positive integer; all timeouts fit this cap
+# Agents in either form may add engine, access (mutating | read-only),
+# and workdir (relative to this manifest or absolute). V2 defaults access
+# to mutating and rejects a phase containing both agent and agents.
+# Every V2 workdir must resolve inside an existing Git worktree.
+
 name: my-phased-build
 # Optional. Cosmetic. Shown in the orchestrator's startup header.
 

@@ -31,6 +31,65 @@ const {
 // drift between the catalog and the renderer surfaces as a CI failure.
 const TEMPLATES_DIR = path.resolve(__dirname, '..', 'templates');
 
+test('U2 nested QA and recovery rendering binds every artifact to the actual attempt without kickoff files', (t) => {
+  const { runtimeFixture } = require('./test-support/runtime-fixture');
+  const fx = runtimeFixture(t);
+  const workspace = require('./workspace-owner').resolveWorkspace(fx.workdir);
+  const { artifactPaths } = require('./attempt-lifecycle');
+  for (const recovery of [false, true]) {
+    const identity = { run_id: 'run-test', phase_id: 'phase-7', role: 'qa', review_iteration: 2, attempt_id: recovery ? 'qa-recovery' : 'qa-first' };
+    const artifacts = artifactPaths(workspace, identity);
+    const opts = makeBaseOpts({
+      role: recovery ? 'recovery' : 'qa', ...(recovery ? { recoveryRole: 'qa' } : {}),
+      workdir: fx.workdir, phaseDir: artifacts.directory, completionSignalPath: artifacts.completion,
+      heartbeatPath: artifacts.heartbeat, attemptIdentity: identity, artifactPaths: artifacts, artifactWorkspace: workspace,
+      dryRun: true, includeText: true, priorPromptPath: 'prior-prompt-for-inspection',
+    });
+    const rendered = generatePrompt(opts);
+    assert.ok(rendered.text.includes(identity.attempt_id));
+    assert.ok(rendered.text.includes(artifacts.release));
+    assert.ok(rendered.text.includes('QA playbook'));
+    assert.ok(rendered.text.includes('schema_version: 2'));
+    const heartbeat = rendered.text.split('## Heartbeat (secondary liveness signal)')[1].split('## Git commit instructions')[0];
+    assert.ok(!/\bappend\b|\bJSONL\b|\bpid\b/i.test(heartbeat), heartbeat);
+    assert.match(heartbeat, /atomic/i);
+    assert.ok(!rendered.text.includes('{{attempt_context}}'));
+    assert.deepStrictEqual(rendered.warnings, []);
+    assert.equal(fs.existsSync(artifacts.directory), false);
+    assert.throws(() => generatePrompt({ ...opts, phaseDir: fx.workdir }), /identity/);
+    assert.throws(() => generatePrompt({ ...opts, qaPlaybookBlock: 'old identity' }), /identity-aware/);
+  }
+});
+
+test('U2 correction: V1 heartbeat keeps JSONL instructions', () => {
+  const rendered = generatePrompt(makeBaseOpts({ dryRun: true, includeText: true }));
+  assert.match(rendered.text, /append a single-line JSON record/);
+  assert.match(rendered.text, /JSONL/);
+});
+
+test('round2 full recovery renders preserve V1 audit instructions without ambiguous V2 kickoff guidance', (t) => {
+  const { runtimeFixture } = require('./test-support/runtime-fixture');
+  const fx = runtimeFixture(t);
+  const workspace = require('./workspace-owner').resolveWorkspace(fx.workdir);
+  for (const role of ['impl', 'qa', 'coord']) {
+    const opts = makeBaseOpts({ role: 'recovery', recoveryRole: role, phaseDir: fx.workdir, dryRun: true, includeText: true });
+    const legacy = generatePrompt(opts).text;
+    assert.match(legacy, /\.original\.md/);
+    assert.match(legacy, /extract its `pid` field/);
+    const identity = { run_id: 'recovery-run', phase_id: 'phase-7', role, review_iteration: 0, attempt_id: `new-${role}` };
+    const artifacts = require('./attempt-lifecycle').artifactPaths(workspace, identity);
+    const text = generatePrompt({ ...opts, attemptIdentity: identity, artifactPaths: artifacts, artifactWorkspace: workspace,
+      phaseDir: artifacts.directory, completionSignalPath: artifacts.completion, heartbeatPath: artifacts.heartbeat,
+      priorPromptPath: 'historical-prompt-for-audit',
+    }).text;
+    assert.ok(text.includes('historical-prompt-for-audit'));
+    assert.match(text, /controller verifies prior engine and descendant closure/);
+    assert.match(text, /Never replay its kickoff/);
+    assert.doesNotMatch(text, /\.original\.md|extract its `pid` field|tasklist \/FI|preserved-original file/);
+    assert.doesNotMatch(text, /\{\{[^}]+\}\}/);
+  }
+});
+
 // -------------------- Helpers --------------------
 
 function mkTmp(prefix) {

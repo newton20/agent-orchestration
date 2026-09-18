@@ -1,6 +1,6 @@
 ---
 required: [phase_id, status_summary_block, decisions_block, open_questions_block, project_context_block, coord_next_actions]
-optional: [plan_reference_block, git_details_block, warnings_block, artifact_pointer]
+optional: [plan_reference_block, git_details_block, warnings_block, artifact_pointer, attempt_context]
 ---
 
 # Coordinator briefing — phase {{phase_id}}
@@ -18,6 +18,8 @@ optional: [plan_reference_block, git_details_block, warnings_block, artifact_poi
 > the session-handoff skill's fragment list to match.
 
 ## Role preamble
+
+{{attempt_context}}
 
 You are the coordination agent. Read this briefing, update your phase
 tracker, decide next actions. Do not dive into implementation details
