@@ -258,6 +258,16 @@ function validateRun(record) {
       typeof event.type === 'string' && event.type.length > 0 && Object.hasOwn(event, 'payload'), 'invalid event identity or ordering');
     previousSequence = event.sequence;
   }
+  if (record.projection !== undefined) {
+    const projection = record.projection;
+    requireShape(isObject(projection) && ['healthy', 'degraded'].includes(projection.status) &&
+      nonnegative(projection.acknowledged_sequence) && projection.acknowledged_sequence < record.next_event_sequence &&
+      nonnegative(projection.retained_through) && projection.retained_through <= projection.acknowledged_sequence &&
+      typeof projection.updated_at === 'string' && Number.isFinite(Date.parse(projection.updated_at)) &&
+      (projection.diagnostic === null || (isObject(projection.diagnostic) &&
+        typeof projection.diagnostic.code === 'string' && typeof projection.diagnostic.message === 'string')),
+    'invalid projection bookkeeping');
+  }
   requireShape(Array.isArray(record.legacy_history), 'legacy_history must be an array');
   record.legacy_history.forEach(validateLegacyCompleted);
 }
@@ -313,14 +323,21 @@ function readState(manifestPath) {
 }
 
 function appendEvents(draft, events) {
+  const { eventLine, MAX_OUTBOX_EVENTS, MAX_OUTBOX_BYTES } = require('./event-log');
   requireShape(Array.isArray(events), 'transaction events must be an array');
   for (const event of events) {
     requireShape(isObject(event) && typeof event.type === 'string' && event.type && Object.hasOwn(event, 'payload'), 'invalid transaction event');
     const sequence = draft.next_event_sequence++;
-    draft.outbox.push({
+    const record = {
       sequence, event_id: `${draft.run_id}:${sequence}`, run_id: draft.run_id,
       revision: draft.revision, type: event.type, payload: clone(event.payload),
-    });
+    };
+    eventLine(record);
+    draft.outbox.push(record);
+  }
+  if (events.length && (draft.outbox.length > MAX_OUTBOX_EVENTS ||
+      Buffer.byteLength(canonicalJson(draft.outbox)) > MAX_OUTBOX_BYTES)) {
+    throw new Error('event outbox backpressure: pending projection exceeds limit');
   }
 }
 
@@ -385,7 +402,7 @@ function assertRerunEligible(state, { allowUnclearedReservations = false } = {})
   }
 }
 
-function createStateStore({ manifestPath, owner, _fs = {} }) {
+function createStateStore({ manifestPath, owner, _fs = {}, _eventFs = {}, _projectionFault }) {
   const statusPath = statusPathFor(path.resolve(manifestPath));
   const io = { ...fs, ..._fs };
   let mutating = false;
@@ -446,9 +463,24 @@ function createStateStore({ manifestPath, owner, _fs = {} }) {
       for (const field of ['schema_version', 'run_id', 'workspace', 'history', 'legacy_history', 'created_at', 'command_results', 'outbox', 'next_event_sequence', 'revision']) {
         if (canonicalJson(draft[field]) !== canonicalJson(current.state[field])) throw new Error(`immutable transaction field: ${field}`);
       }
+      if (canonicalJson(draft.projection ?? null) !== canonicalJson(current.state.projection ?? null)) {
+        throw new Error('immutable transaction field: projection');
+      }
       // Structural acceptance belongs to the later human-command contract.
       if (canonicalJson(draft.accepted) !== canonicalJson(current.state.accepted)) throw new Error('accepted snapshot is immutable in foundation transactions');
       preserveLifecycle(current.state, draft);
+      if (current.state.projection?.status === 'degraded') {
+        for (const [phaseId, phase] of Object.entries(draft.phases)) {
+          for (const [role, entry] of Object.entries(phase.roles)) {
+            const previous = current.state.phases[phaseId].roles[role];
+            if (entry.attempts.some((attempt) => {
+              const prior = previous?.attempts.find((item) => item.attempt_id === attempt.attempt_id);
+              return !prior || (prior.status === 'queued' && attempt.status === 'launching') ||
+                (prior.reservation?.state === 'pending' && attempt.reservation?.state === 'held');
+            })) throw new Error('event projection backpressure: new dispatch is disabled while projection is degraded');
+          }
+        }
+      }
       draft.revision++;
       draft.updated_at = new Date().toISOString();
       const response = { revision: draft.revision, result: clone(outcome.result) };
@@ -470,6 +502,77 @@ function createStateStore({ manifestPath, owner, _fs = {} }) {
     },
     transact: (options) => transact(options),
     transactInternal: (options) => transact(options, true),
+    projectOutbox({ expectedRevision }) {
+      let current = readRecord(manifestPath);
+      requireShape(current.state?.schema_version === 2, 'initialize a V2 run before projecting');
+      owned(current.state.workspace);
+      if (expectedRevision !== current.state.revision) throw new Error('state revision conflict');
+      const { projectEvents, planRetention, compactEvents, EventLogError } = require('./event-log');
+      const eventIo = { ...fs, ..._eventFs };
+      const fault = (point) => { if (_projectionFault) _projectionFault(point); };
+      function persist(projection) {
+        const comparable = (value) => value ? {
+          status: value.status, acknowledged_sequence: value.acknowledged_sequence,
+          retained_through: value.retained_through, error_code: value.diagnostic?.code || null,
+        } : null;
+        const draft = clone(current.state);
+        const pending = draft.outbox.filter((event) => event.sequence > projection.acknowledged_sequence);
+        if (canonicalJson(comparable(draft.projection)) === canonicalJson(comparable(projection)) &&
+            pending.length === draft.outbox.length) return;
+        draft.outbox = pending;
+        draft.revision++;
+        draft.updated_at = new Date().toISOString();
+        draft.projection = { ...projection, updated_at: draft.updated_at };
+        publish(draft, current.bytes);
+        current = readRecord(manifestPath);
+      }
+      function degraded(error) {
+        if (!(error instanceof EventLogError)) throw error;
+        return {
+          acknowledged_sequence: current.state.projection?.acknowledged_sequence || 0,
+          retained_through: current.state.projection?.retained_through || 0,
+          status: 'degraded', diagnostic: { code: error.code, message: error.message.slice(0, 1024) },
+        };
+      }
+      mutating = true;
+      try {
+        let outcome;
+        try {
+          outcome = {
+            ...projectEvents({ state: current.state, owner, io: eventIo, fault }),
+            status: 'healthy', diagnostic: null,
+          };
+        } catch (error) {
+          outcome = degraded(error);
+        }
+        fault('before_acknowledge');
+        const previousProjection = current.state.projection;
+        if (outcome.diagnostic?.code !== 'LOG_LIMIT') {
+          persist(outcome.status === 'healthy' && previousProjection?.status === 'degraded'
+            ? { ...outcome, status: 'degraded', diagnostic: previousProjection.diagnostic }
+            : outcome);
+        }
+        if (outcome.status === 'healthy' || outcome.diagnostic?.code === 'LOG_LIMIT') {
+          let retention;
+          try { retention = planRetention({ state: current.state, io: eventIo }); } catch (error) {
+            persist(degraded(error));
+            return clone(current.state);
+          }
+          if (retention.needed) {
+            // Record the retention boundary before removing acknowledged history.
+            persist({ ...(current.state.projection || outcome), retained_through: retention.retained_through });
+            fault('before_retention');
+            try { compactEvents({ state: current.state, owner, io: eventIo, events: retention.events }); } catch (error) {
+              persist(degraded(error));
+              return clone(current.state);
+            }
+            fault('after_retention');
+          }
+          persist({ ...outcome, retained_through: current.state.projection.retained_through });
+        }
+        return clone(current.state);
+      } finally { mutating = false; }
+    },
     rerun({ expectedRevision, accepted }) {
       const current = readRecord(manifestPath);
       requireShape(current.state?.schema_version === 2, 'explicit rerun requires an existing V2 run');
@@ -478,6 +581,9 @@ function createStateStore({ manifestPath, owner, _fs = {} }) {
       if (accepted.workspace.key !== current.state.workspace.key) throw new Error('rerun cannot change workspace identity');
       assertRerunEligible(current.state);
       if (readCheckoutReservation(owner)) throw new Error('rerun requires private reservation cleanup under the old run owner');
+      if (current.state.outbox.length || current.state.projection?.status === 'degraded') {
+        throw new Error('rerun requires a drained, healthy event projection');
+      }
       const { history, ...prior } = current.state;
       const next = newRun(accepted, current.state.revision + 1, [...history, prior], current.state.legacy_history);
       return publish(next, current.bytes);

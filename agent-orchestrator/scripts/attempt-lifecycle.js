@@ -10,10 +10,12 @@ const { observeProcessIdentity, sameHostname, creationTimeKey } = require('./che
 const { observeProcessTable } = require('./spawn-session');
 const { generatePrompt, atomicWrite } = require('./generate-prompt');
 const { assertArtifactPath } = require('./artifact-path');
+const { MAX_OUTBOX_EVENTS, MAX_OUTBOX_BYTES } = require('./event-log');
 
 const MAX_ARTIFACT_BYTES = 256 * 1024;
 const MAX_ATTEMPTS_PER_ROLE = 64;
 const MAX_OBSERVATIONS = 64;
+const DISPATCH_EVENT_RESERVE = MAX_OBSERVATIONS + 4;
 const RETRY_LIMITS = Object.freeze({ launch: 2, execution: 2 });
 const QA_VERIFICATION = Object.freeze(['scope', 'P1', 'P2', 'P3', 'P4', 'P6']);
 const ID_FIELDS = ['run_id', 'phase_id', 'role', 'review_iteration', 'attempt_id'];
@@ -30,6 +32,12 @@ const isObject = (value) => value !== null && typeof value === 'object' && !Arra
 const isProgress = (kind) => ['heartbeat', 'checkpoint'].includes(kind);
 const sameProcess = (a, b) => a.pid === b.pid && creationTimeKey(a.creation_time) === creationTimeKey(b.creation_time) &&
   a.host_boot_id === b.host_boot_id && sameHostname(a.hostname, b.hostname);
+
+function hasDispatchCapacity(state) {
+  // Leave room for intent, reservation, launch, every allowed observation, and the final outcome.
+  return state.outbox.length <= MAX_OUTBOX_EVENTS - DISPATCH_EVENT_RESERVE &&
+    Buffer.byteLength(canonicalJson(state.outbox)) <= MAX_OUTBOX_BYTES - DISPATCH_EVENT_RESERVE * 1024;
+}
 
 function newerSample(sample, watermark) {
   return !watermark || (sample.sample_id !== watermark.sample_id &&
@@ -485,7 +493,8 @@ async function createAttemptLifecycle({ owner, store, manifestPath, _runtimeRoot
   async function dispatch(attemptId, sample) {
     let a = find(store.read(), attemptId);
     if (!adapter) throw new Error('production V2 dispatch is disabled');
-    if (a.status !== 'queued' || store.read().operator.paused) return;
+    const state = store.read();
+    if (a.status !== 'queued' || state.operator.paused || state.projection?.status === 'degraded' || !hasDispatchCapacity(state)) return;
     assertCapabilities(a);
     if (W.resolveWorkspace(a.workdir).key !== a.workspace.key || W.canonicalPath(a.workdir) !== a.workdir) {
       throw new Error('attempt working directory identity changed');
@@ -660,7 +669,7 @@ async function createAttemptLifecycle({ owner, store, manifestPath, _runtimeRoot
         });
         fault('after_reconcile');
         await syncReservations();
-        if (!adapter || state.operator.paused) return store.read();
+        if (!adapter || state.operator.paused || state.projection?.status === 'degraded') return store.read();
         for (const phaseId of state.accepted.execution_order) {
           const phase = state.accepted.phases.find((p) => p.id === phaseId);
           const latest = store.read();
@@ -668,7 +677,8 @@ async function createAttemptLifecycle({ owner, store, manifestPath, _runtimeRoot
           if (latest.operator.paused || runtime.blocker || ['completed', 'failed'].includes(runtime.status)) continue;
           const roles = phase.review_loop.enabled ? [runtime.review_stage] : Object.keys(runtime.roles);
           for (const role of roles) {
-            if (store.read().operator.paused) break;
+            const admission = store.read();
+            if (admission.operator.paused || !hasDispatchCapacity(admission)) break;
             const entry = store.read().phases[phase.id].roles[role];
             const category = retryCategory(entry, runtime.review_iteration);
             const previous = currentAttempt(entry);

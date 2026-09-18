@@ -3775,26 +3775,36 @@ async function startV2Foundation(opts) {
   });
   let lifecycle;
   try {
-    const store = createStateStore({ manifestPath: opts.manifestPath, owner, _fs: opts._stateFs });
+    const store = createStateStore({
+      manifestPath: opts.manifestPath, owner, _fs: opts._stateFs,
+      _eventFs: opts._eventFs, _projectionFault: opts._projectionFault,
+    });
     const { createAttemptLifecycle } = require('./attempt-lifecycle');
     if (opts.rerun) {
       assertRerunEligible(store.read(), { allowUnclearedReservations: true });
       if (accepted.workspace.key !== persisted.workspace.key) throw new Error('rerun cannot change workspace identity');
+      store.projectOutbox({ expectedRevision: store.read().revision });
       lifecycle = await createAttemptLifecycle({
         owner, store, manifestPath: opts.manifestPath, _runtimeRoot: opts._runtimeRoot,
       });
       await lifecycle.close();
       lifecycle = undefined;
+      const projected = store.projectOutbox({ expectedRevision: store.read().revision });
+      if (projected.projection.status === 'degraded') throw new Error('event projection must recover before rerun');
       store.rerun({ expectedRevision: store.read().revision, accepted });
-    } else store.initialize(accepted);
+    } else {
+      store.initialize(accepted);
+    }
+    store.projectOutbox({ expectedRevision: store.read().revision });
     lifecycle = await createAttemptLifecycle({
       owner, store, manifestPath: opts.manifestPath, _runtimeRoot: opts._runtimeRoot,
       _fixtureAdapter: opts._fixtureAdapter, _lifecycleFault: opts._lifecycleFault,
       _hostEvidence: opts._hostEvidence,
     });
-    const state = store.read();
+    let state = store.read();
     const scaffold = scaffoldProtocol({ manifestPath: opts.manifestPath, accepted: state.accepted, runId: state.run_id, owner, pluginDir: opts.pluginDir });
     if (!scaffold.ok) throw new Error(scaffold.error || 'V2 run scaffold failed');
+    state = store.projectOutbox({ expectedRevision: state.revision });
     owner.setReadiness('live_dispatch_disabled');
     return { owner, store, state, lifecycle, authoring, summary: 'live_dispatch_disabled' };
   } catch (error) {
@@ -3826,13 +3836,26 @@ async function runOrchestrator(opts) {
       owner = runtime.owner;
       lifecycle = runtime.lifecycle;
       logger('warn', 'V2 accepted state is ready; live_dispatch_disabled until engine adapter acceptance.');
+      const reportProjection = () => {
+        if (runtime.state.projection.status === 'degraded') {
+          logger('warn', `event projection degraded: ${runtime.state.projection.diagnostic.message}`);
+        }
+        const history = require('./event-log').readEvents({ state: runtime.state, limit: 1 }).history;
+        if (history.status === 'degraded' || history.gaps.some((gap) => gap.reason === 'missing_history')) {
+          logger('warn', `event history ${history.status}; use the authoritative snapshot`);
+        }
+      };
+      reportProjection();
       if (runtime.authoring.status !== 'unchanged') {
         logger('warn', `authoring manifest is ${runtime.authoring.status}; continuing with the persisted accepted snapshot`);
       }
       const limit = Number.isSafeInteger(opts.maxTicks) ? opts.maxTicks : Infinity;
       for (let tick = 0; tick < limit && !opts.signal?.aborted; tick++) {
         require('./workspace-owner').assertOwnership(owner, runtime.state.workspace);
+        runtime.state = runtime.store.projectOutbox({ expectedRevision: runtime.store.read().revision });
         runtime.state = await lifecycle.tick(opts._healthSample ? { sample: await opts._healthSample() } : {});
+        runtime.state = runtime.store.projectOutbox({ expectedRevision: runtime.state.revision });
+        reportProjection();
         if (runtime.state.process_diagnostic) logger('warn', runtime.state.process_diagnostic.error);
         if (tick + 1 >= limit) break;
         await new Promise((resolve) => {
@@ -3842,7 +3865,9 @@ async function runOrchestrator(opts) {
           if (opts.signal?.aborted) finish();
         });
       }
-      return { ok: true, summary: runtime.state.runtime_status, run_id: runtime.state.run_id, revision: runtime.state.revision, authoring: runtime.authoring, history: [] };
+      return { ok: true, summary: runtime.state.projection.status === 'degraded' ? 'event_projection_degraded' : runtime.state.runtime_status,
+        run_id: runtime.state.run_id, revision: runtime.state.revision, authoring: runtime.authoring,
+        projection: runtime.state.projection, history: [] };
     }
     if (loaded.manifest?.schema_version !== undefined && loaded.manifest.schema_version !== 1) {
       throw new Error('unsupported manifest schema_version; use 1 or 2');

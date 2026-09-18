@@ -14,6 +14,69 @@ const TIME = '2026-09-17T12:00:00.000Z';
 const identity = (a) => Object.fromEntries(['run_id', 'phase_id', 'role', 'review_iteration', 'attempt_id'].map((k) => [k, a[k]]));
 const processIdentity = (pid) => ({ ...HOST, pid, creation_time: TIME });
 
+test('U4 restart drains a full outbox before reservation cleanup can append', async (t) => {
+  let interrupt = false;
+  const fx = await fixture(t, { fault(point) {
+    if (interrupt && point === 'after_reconcile') throw new Error('closure stop');
+  } });
+  await fx.tick();
+  fx.complete(fx.current());
+  interrupt = true;
+  await assert.rejects(fx.tick(), /closure stop/);
+  const state = fx.runtime.store.read();
+  const count = require('./event-log').MAX_OUTBOX_EVENTS - state.outbox.length;
+  fx.runtime.store.transactInternal({ expectedRevision: state.revision,
+    mutate: () => ({ result: {}, events: Array.from({ length: count }, () => ({ type: 'event', payload: {} })) }) });
+  await fx.reopen();
+  assert.equal(fx.current().reservation_cleared, true);
+  assert.equal(fx.runtime.store.read().outbox.length, 0);
+  assert.equal(fx.calls.length, 1);
+});
+
+test('U4 degraded projection observes current work but leaves new and queued dispatch untouched', async (t) => {
+  let failIntent = true;
+  const fx = await fixture(t, { fault(point) {
+    if (failIntent && point === 'after_intent') throw new Error('queued stop');
+  } });
+  await assert.rejects(fx.tick(), /queued stop/);
+  failIntent = false;
+  const queued = fx.current();
+  const E = require('./event-log');
+  fs.appendFileSync(E.eventLogPath(fx.runtime.store.read()), '{bad}\n');
+  fx.runtime.store.projectOutbox({ expectedRevision: fx.runtime.store.read().revision });
+  await fx.tick();
+  assert.equal(fx.calls.length, 0);
+  assert.equal(fx.current().status, 'queued');
+  assert.equal(fx.current().reservation.state, queued.reservation.state);
+  assert.equal(fs.existsSync(queued.artifacts.prompt), false);
+});
+
+test('U4 a real session observation with incomplete process identity keeps liveness unknown', async (t) => {
+  const fx = await fixture(t, { launch: async (a, observe) => {
+    await observe({ ...identity(a), id: 'session', kind: 'session', session_id: 'partial-process',
+      process: { ...processIdentity(8991), creation_time: null, host_boot_id: null } });
+    await observe({ ...identity(a), id: 'submission', kind: 'submission', acknowledged: true });
+  } });
+  await fx.tick();
+  const snapshot = require('./read-model').createSnapshot({ manifestPath: fx.manifestPath });
+  const attempt = snapshot.phases[0].roles[0].current_attempt;
+  assert.equal(attempt.session.status, 'observed');
+  assert.equal(attempt.engine_observation.status, 'unknown');
+  assert.equal(attempt.submission.status, 'acknowledged');
+});
+
+test('U4 dispatch admission reserves outbox capacity before any launch effect', async (t) => {
+  const fx = await fixture(t);
+  fx.runtime.store.transactInternal({ expectedRevision: fx.runtime.store.read().revision,
+    mutate: () => ({ result: {}, events: Array.from({ length: 240 }, () => ({ type: 'event', payload: {} })) }) });
+  await fx.tick();
+  assert.equal(fx.calls.length, 0);
+  assert.equal(fx.runtime.store.read().phases.p1.roles.impl.attempts.length, 0);
+  fx.runtime.store.projectOutbox({ expectedRevision: fx.runtime.store.read().revision });
+  await fx.tick();
+  assert.equal(fx.calls.length, 1);
+});
+
 test('round3 process closure evidence survives report repair and permits rerun', async (t) => {
   const fx = await fixture(t);
   await fx.tick();
@@ -405,7 +468,7 @@ test('round2 safely closed completed and failed runs rerun with immutable histor
       fx.complete(fx.current());
       await fx.tick();
     }
-    const prior = fx.runtime.store.read();
+    const prior = fx.runtime.store.projectOutbox({ expectedRevision: fx.runtime.store.read().revision });
     assert.equal(prior.phases.p1.status, failed ? 'failed' : 'completed');
     await fx.close();
     await fx.open({ rerun: true });
@@ -452,10 +515,9 @@ test('round2 rerun publication failure preserves the old run after cleanup and r
   await assert.rejects(fx.tick(), /closure stop/);
   const prior = fx.runtime.store.read();
   await fx.close();
-  let publications = 0;
   await assert.rejects(fx.open({ rerun: true, _stateFs: {
     renameSync(from, to) {
-      if (++publications === 2) throw new Error('rerun publication EIO');
+      if (JSON.parse(fs.readFileSync(from, 'utf8')).run_id !== prior.run_id) throw new Error('rerun publication EIO');
       fs.renameSync(from, to);
     },
   } }), /rerun publication EIO/);
@@ -597,7 +659,9 @@ test('round2 zero-tick runner returns the revision committed by startup reservat
   const result = await O.runOrchestrator({ ...fx.options(), maxTicks: 0 });
   const saved = require('./state-store').readState(fx.manifestPath);
   assert.equal(result.ok, true, JSON.stringify(result));
-  assert.equal(saved.revision, prior.revision + 1);
+  assert.equal(saved.revision, prior.revision + 3, 'drain, reservation cleanup and cleanup-event acknowledgement each commit');
+  assert.equal(saved.outbox.length, 0);
+  assert.equal(saved.projection.acknowledged_sequence, saved.next_event_sequence - 1);
   assert.equal(result.revision, saved.revision);
 });
 
@@ -953,7 +1017,7 @@ test('superseded read-only attempts reconcile only closure across restart withou
       }
       await fx.reopen();
       await fx.tick(sample);
-      const after = fx.runtime.store.read();
+      const after = fx.runtime.store.projectOutbox({ expectedRevision: fx.runtime.store.read().revision });
       const { roles: afterRoles, ...afterProgress } = after.phases.p1;
       const released = afterRoles.impl.attempts[0];
       assert.equal(released.reservation.state, 'released');
@@ -1239,7 +1303,7 @@ test('U2 correction: progress churn reserves terminal history and bounds health-
   assert.ok(fx.current().evidence.heartbeat);
   assert.ok(fx.current().evidence.checkpoint);
   assert.deepEqual(progress.command_results, initial.command_results);
-  assert.equal(progress.outbox.length, initial.outbox.length);
+  assert.equal(progress.next_event_sequence, initial.next_event_sequence);
   const legacy = Array.from({ length: 64 }, (_, index) => ({
     ...fx.current().evidence.heartbeat,
     sha256: require('node:crypto').createHash('sha256').update(`legacy-progress-${index}`).digest('hex'),
@@ -1262,7 +1326,8 @@ test('U2 correction: progress churn reserves terminal history and bounds health-
   await fx.reopen();
   await fx.tick();
   assert.deepEqual(fx.current(), terminal);
-  assert.ok(fx.runtime.store.read().outbox.length > progress.outbox.length);
+  assert.ok(fx.runtime.store.read().next_event_sequence > progress.next_event_sequence);
+  assert.equal(fx.runtime.store.read().outbox.length, 0);
 });
 
 test('U2 correction: incomplete QA and invalid verification rows never trigger automatic recovery', async (t) => {

@@ -43,6 +43,103 @@ const O = {
 };
 const { runtimeFixture } = require('./test-support/runtime-fixture');
 
+test('U4 public V2 startup and ticks project committed lifecycle events without enabling live dispatch', async (t) => {
+  const fx = runtimeFixture(t);
+  let samples = 0;
+  const opts = { manifestPath: fx.manifestPath, maxTicks: 2, activeIntervalMs: 1, _runtimeRoot: fx.runtimeRoot, logger: () => {},
+    _healthSample: async () => ({ sample_id: `events-sample-${++samples}`, observed_at: new Date().toISOString(), processes: [], complete: true }),
+    _fixtureAdapter: {
+      kind: 'fixture', capabilities: { engines: ['agency-copilot'], read_only_enforced: false, tracks_descendants: true },
+      async launch(attempt) {
+        const identity = require('./attempt-lifecycle').identityOf(attempt);
+        for (const [kind, data] of [['completion', { status: 'complete' }], ['release', { released: true, no_further_writes: true }]]) {
+          fs.writeFileSync(attempt.artifacts[kind], JSON.stringify({ schema_version: 2, ...identity, kind,
+            observed_at: new Date().toISOString(), ...data }));
+        }
+      },
+    },
+  };
+  const result = await ActualOrchestrator.runOrchestrator(opts);
+  assert.equal(result.ok, true, JSON.stringify(result));
+  const state = require('./state-store').readState(fx.manifestPath);
+  assert.equal(state.live_dispatch_enabled, false);
+  assert.equal(state.outbox.length, 0);
+  const page = require('./event-log').readEvents({ state });
+  assert.equal(page.history.status, 'complete');
+  assert.ok(page.events.some((event) => event.type === 'attempt_lifecycle'));
+  assert.equal(page.latest_cursor, `${state.run_id}:${state.next_event_sequence - 1}`);
+  const snapshot = require('./read-model').createSnapshot({ manifestPath: fx.manifestPath });
+  const attempt = snapshot.phases[0].roles[0].current_attempt;
+  assert.equal(attempt.completion.status, 'reported_complete');
+  assert.equal(attempt.independent_verification.status, 'unknown');
+  assert.equal(snapshot.revision, state.revision);
+  assert.equal(snapshot.event_cursor, page.latest_cursor);
+});
+
+test('U4 degraded projection is visible and prevents a new fixture launch', async (t) => {
+  const fx = runtimeFixture(t);
+  const warnings = [];
+  const result = await ActualOrchestrator.runOrchestrator({
+    manifestPath: fx.manifestPath, maxTicks: 1, _runtimeRoot: fx.runtimeRoot,
+    logger: (level, message) => warnings.push(message),
+    _eventFs: { openSync(file, flags, ...args) {
+      if (flags === 'a') throw Object.assign(new Error('projection denied'), { code: 'EACCES' });
+      return fs.openSync(file, flags, ...args);
+    } },
+    _healthSample: async () => ({ sample_id: 'events-blocked', observed_at: new Date().toISOString(), processes: [], complete: true }),
+    _fixtureAdapter: {
+      kind: 'fixture', capabilities: { engines: ['agency-copilot'], read_only_enforced: false, tracks_descendants: true },
+      async launch() { assert.fail('degraded projection dispatched'); },
+    },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.summary, 'event_projection_degraded');
+  const state = require('./state-store').readState(fx.manifestPath);
+  assert.equal(state.projection.status, 'degraded');
+  assert.ok(warnings.some((message) => /projection.*degraded/i.test(message)));
+  assert.equal(state.phases.p1.roles.impl.attempts.length, 0);
+  const snapshot = require('./read-model').createSnapshot({ manifestPath: fx.manifestPath });
+  assert.equal(snapshot.projection.status, 'degraded');
+  assert.equal(snapshot.projection.diagnostic.code, 'EACCES');
+});
+
+test('U4 missing acknowledged event log remains a history gap on public restart', async (t) => {
+  const fx = runtimeFixture(t);
+  const opts = { manifestPath: fx.manifestPath, maxTicks: 0, _runtimeRoot: fx.runtimeRoot, logger: () => {} };
+  assert.equal((await ActualOrchestrator.runOrchestrator(opts)).ok, true);
+  const E = require('./event-log');
+  const state = require('./state-store').readState(fx.manifestPath);
+  fs.unlinkSync(E.eventLogPath(state));
+  assert.equal((await ActualOrchestrator.runOrchestrator(opts)).ok, true);
+  const restarted = require('./state-store').readState(fx.manifestPath);
+  assert.equal(restarted.run_id, state.run_id);
+  assert.equal(restarted.outbox.length, 0);
+  assert.equal(E.readEvents({ state: restarted }).history.status, 'gap');
+});
+
+test('U4 routine retention does not repeatedly warn about missing history', async (t) => {
+  const fx = runtimeFixture(t);
+  const warnings = [];
+  const opts = { manifestPath: fx.manifestPath, maxTicks: 0, _runtimeRoot: fx.runtimeRoot,
+    logger: (level, message) => warnings.push(message) };
+  const runtime = await ActualOrchestrator.startV2Foundation(opts);
+  try {
+    for (let i = 0; i < 3; i++) {
+      runtime.store.transactInternal({ expectedRevision: runtime.store.read().revision,
+        mutate: () => ({ result: {}, events: Array.from({ length: 200 }, () => ({ type: 'event', payload: {} })) }) });
+      runtime.store.projectOutbox({ expectedRevision: runtime.store.read().revision });
+    }
+  } finally {
+    await runtime.lifecycle.close();
+    await runtime.owner.release();
+  }
+  assert.equal((await ActualOrchestrator.runOrchestrator(opts)).ok, true);
+  assert.equal(warnings.some((message) => message.includes('event history gap')), false);
+  fs.unlinkSync(require('./event-log').eventLogPath(require('./state-store').readState(fx.manifestPath)));
+  assert.equal((await ActualOrchestrator.runOrchestrator(opts)).ok, true);
+  assert.equal(warnings.some((message) => message.includes('event history gap')), true);
+});
+
 test('U1 V2 startup persists accepted state without reaching legacy dispatch, and restart ignores invalid authoring', async (t) => {
   const fx = runtimeFixture(t);
   const opts = { manifestPath: fx.manifestPath, maxTicks: 1, _runtimeRoot: fx.runtimeRoot, logger: () => {},
