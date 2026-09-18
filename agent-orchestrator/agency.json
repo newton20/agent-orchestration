@@ -1,0 +1,5 @@
+{
+  "engines": ["claude", "copilot"],
+  "platforms": ["windows"],
+  "category": "developer-tools"
+}

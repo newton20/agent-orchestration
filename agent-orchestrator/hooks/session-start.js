@@ -57,12 +57,7 @@ const FLAG_NAME_RE = /^\.pending-[A-Za-z0-9._-]+$/;
 // AGENT_FLAG_TOKEN was bound to the OLD spawn's UUID at tab-launch
 // time; the new flag carries a NEW UUID; mismatch → skip → safe.
 //
-// Compat: when AGENT_FLAG_TOKEN is unset (legacy spawn paths, or
-// spawn-session env propagation not yet wired), the hook falls back
-// to the pre-fix oldest-flag-wins behavior. This is INTENTIONAL —
-// hook tests run without AGENT_FLAG_TOKEN, and the orchestrator's
-// env-propagation path through spawn-session.js is wired separately
-// (out-of-scope for the hook itself).
+// Tokenless legacy sessions may consume only tokenless legacy flags.
 const SPAWN_TOKEN_HEADER_RE = /^[ \t]*#[ \t]*spawn_token[ \t]*:[ \t]*([A-Za-z0-9._-]+)[ \t]*$/;
 const SPAWN_TOKEN_PEEK_BYTES = 256;
 
@@ -86,18 +81,38 @@ function tryUnlink(fsLib, p) {
   catch (err) { if (err && err.code !== 'ENOENT') logErr(`unlink ${p}: ${err.message}`); }
 }
 
+function peekSpawnToken(fsLib, file) {
+  const fd = fsLib.openSync(file, 'r');
+  try {
+    const buf = Buffer.alloc(SPAWN_TOKEN_PEEK_BYTES);
+    const count = fsLib.readSync(fd, buf, 0, buf.length, 0);
+    return extractSpawnToken(buf.toString('utf8', 0, count));
+  } finally { fsLib.closeSync(fd); }
+}
+
+function restoreClaim(fsLib, claimed, pending) {
+  try {
+    fsLib.linkSync(claimed, pending);
+  } catch (err) {
+    logErr(`post-rename token mismatch; restore ${pending}: ${err.message}`);
+    return;
+  }
+  tryUnlink(fsLib, claimed);
+}
+
 function runHook(opts) {
   const o = opts || {};
   const projectDir = o.projectDir;
   const now = typeof o.now === 'number' ? o.now : Date.now();
   const fsLib = o.fsLib || fs;
   const pid = typeof o.pid === 'number' ? o.pid : process.pid;
+  if ((o.source ?? 'startup') !== 'startup') return '{}';
   // Todo 099: tab-bound token from out-of-band channel. Production
   // path reads from process.env. Tests pass `tabToken` directly to
   // exercise the matching/skipping logic without env-var setup.
   const tabToken =
     typeof o.tabToken === 'string'
-      ? o.tabToken
+      ? o.tabToken || null
       : typeof process.env.AGENT_FLAG_TOKEN === 'string' && process.env.AGENT_FLAG_TOKEN !== ''
         ? process.env.AGENT_FLAG_TOKEN
         : null;
@@ -127,15 +142,8 @@ function runHook(opts) {
     try { st = fsLib.statSync(full); }
     catch (err) { logErr(`stat ${full}: ${err.message}`); continue; }
     const age = now - st.mtimeMs;
-    if (age > FLAG_TTL_MS) {
-      // Stale: skip either way. Beyond the hard TTL, GC the file so the
-      // per-tick statSync count stays bounded by recent activity rather
-      // than every flag ever written. Files in [soft, hard) stay on disk
-      // as the debug window for a failed spawn.
-      if (age >= STALE_HARD_TTL_MS) tryUnlink(fsLib, full);
-      continue;
-    }
-    candidates.push({ path: full, mtimeMs: st.mtimeMs, name: ent.name });
+    if (age > FLAG_TTL_MS && age < STALE_HARD_TTL_MS) continue;
+    candidates.push({ path: full, mtimeMs: st.mtimeMs, name: ent.name, expired: age > FLAG_TTL_MS });
   }
 
   if (candidates.length === 0) return '{}';
@@ -156,28 +164,20 @@ function runHook(opts) {
     // otherwise the orphan tab would remove the fresh flag and
     // then refuse to deliver it, leaving the intended new tab
     // with no prompt to consume (codex round 7 of PR #22).
-    if (tabToken) {
-      let peekContent;
+    {
+      let fileToken;
       try {
-        const fd = fsLib.openSync(cand.path, 'r');
-        try {
-          const buf = Buffer.alloc(SPAWN_TOKEN_PEEK_BYTES);
-          const bytesRead = fsLib.readSync(fd, buf, 0, SPAWN_TOKEN_PEEK_BYTES, 0);
-          peekContent = buf.toString('utf8', 0, bytesRead);
-        } finally {
-          fsLib.closeSync(fd);
-        }
+        fileToken = peekSpawnToken(fsLib, cand.path);
       } catch (err) {
         if (err && err.code === 'ENOENT') continue; // race: vanished
         logErr(`peek ${cand.path}: ${err.message}`);
         continue;
       }
-      const fileToken = extractSpawnToken(peekContent);
       // Mismatch behavior: skip without rename. A null fileToken
       // (header missing — legacy flag) is also a mismatch when the
       // tab itself was launched with a token; better to fail closed
       // than to consume an unauthenticated prompt.
-      if (fileToken !== tabToken) {
+      if (fileToken !== tabToken || (cand.expired && fileToken)) {
         continue;
       }
     }
@@ -196,6 +196,18 @@ function runHook(opts) {
     } catch (err) {
       if (err && err.code === 'ENOENT') continue;  // race: another hook consumed it
       logErr(`rename ${cand.path}: ${err.message}`);
+      continue;
+    }
+
+    // Recheck a bounded header before size-based cleanup can delete a swapped file.
+    try {
+      if (peekSpawnToken(fsLib, consumingPath) !== tabToken) {
+        restoreClaim(fsLib, consumingPath, cand.path);
+        continue;
+      }
+    } catch (err) {
+      logErr(`revalidate header ${consumingPath}: ${err.message}`);
+      restoreClaim(fsLib, consumingPath, cand.path);
       continue;
     }
 
@@ -219,6 +231,7 @@ function runHook(opts) {
     if (sizeBytes > MAX_FLAG_BYTES) {
       logErr(`flag ${cand.name} exceeds ${MAX_FLAG_BYTES} bytes (got ${sizeBytes})`);
       tryUnlink(fsLib, consumingPath);
+      if (cand.expired) continue;
       return '{}';
     }
 
@@ -232,44 +245,28 @@ function runHook(opts) {
     //
     // Restore the claimed prompt without replacing a newer pending
     // flag, so the intended tab can still find it. If restoration
-    // fails, log and clean up the consuming file without delivering
-    // another spawn's prompt.
-    if (tabToken) {
-      let postContent;
+    // fails, retain the claimed file for diagnosis without delivering
+    // or deleting another spawn's prompt.
+    let content;
+    {
       try {
-        postContent = fsLib.readFileSync(consumingPath, 'utf8');
+        content = fsLib.readFileSync(consumingPath, 'utf8');
       } catch (err) {
         logErr(`revalidate ${consumingPath}: ${err.message}`);
         tryUnlink(fsLib, consumingPath);
         continue;
       }
-      const postToken = extractSpawnToken(postContent);
+      const postToken = extractSpawnToken(content);
       if (postToken !== tabToken) {
         // A hard link publishes atomically and fails if the destination
         // exists; checking before rename cannot prevent an overwrite.
-        try {
-          fsLib.linkSync(consumingPath, cand.path);
-        } catch (err) {
-          if (err && err.code === 'EEXIST') {
-            logErr(`post-rename token mismatch on ${cand.name}: a newer flag is already on disk; cannot restore stale .consuming-*`);
-          } else {
-            logErr(`post-rename token mismatch + restore failed for ${cand.name}: ${err.message}`);
-          }
-        }
-        tryUnlink(fsLib, consumingPath);
+        restoreClaim(fsLib, consumingPath, cand.path);
         continue;
       }
     }
 
-    let content;
-    try { content = fsLib.readFileSync(consumingPath, 'utf8'); }
-    catch (err) {
-      logErr(`read ${consumingPath}: ${err.message}`);
-      tryUnlink(fsLib, consumingPath);
-      continue;
-    }
-
     tryUnlink(fsLib, consumingPath);  // best-effort; warn-only on failure
+    if (cand.expired) continue;
 
     // Todo 099 + codex round 9 P2: strip the spawn-token header
     // before delivery. The orchestrator embeds `# spawn_token: <uuid>`
@@ -293,7 +290,9 @@ function runHook(opts) {
 
 if (require.main === module) {
   try {
-    process.stdout.write(runHook({ projectDir: process.env.CLAUDE_PROJECT_DIR }));
+    const input = fs.readFileSync(0, 'utf8');
+    const payload = input.trim() ? JSON.parse(input) : {};
+    process.stdout.write(runHook({ projectDir: process.env.CLAUDE_PROJECT_DIR, source: payload.source || '' }));
   } catch (err) {
     // Defense in depth — runHook itself already swallows errors.
     logErr(`unexpected: ${err && err.message}`);
