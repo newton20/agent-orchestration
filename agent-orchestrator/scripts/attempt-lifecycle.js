@@ -147,8 +147,8 @@ function processRecord(value) {
   return { pid: value.pid, creation_time: value.creation_time, hostname: value.hostname, host_boot_id: value.host_boot_id };
 }
 
-function acceptArtifacts(state, attempt) {
-  for (const kind of ARTIFACT_KINDS) {
+function acceptArtifacts(state, attempt, kinds) {
+  for (const kind of kinds) {
     if (attempt.evidence[kind] && !isProgress(kind)) continue;
     const artifact = readAttemptArtifact(state, attempt, kind);
     if (!artifact) continue;
@@ -220,9 +220,9 @@ function addDescendants(attempt, sample, host) {
   return true;
 }
 
-function reconcileAttempt(state, attempt, sample) {
+function reconcileAttempt(state, attempt, sample, closureOnly = false) {
   if (attempt.status === 'queued' || (attempt.outcome && attempt.reservation.state === 'released')) return;
-  acceptArtifacts(state, attempt);
+  acceptArtifacts(state, attempt, closureOnly ? ['release'] : ARTIFACT_KINDS);
   const fresh = newerSample(sample, attempt.health.observed_at ? attempt.health : null);
   const negativeEligible = afterProcessWatermark(attempt, sample);
   let engine = attempt.health.engine || { state: 'unknown', reason: 'no process observation yet' };
@@ -245,7 +245,7 @@ function reconcileAttempt(state, attempt, sample) {
       unknown_samples: engine.state === 'unknown' ? attempt.health.unknown_samples + 1 : 0,
     };
   }
-  if (!attempt.outcome) {
+  if (!closureOnly && !attempt.outcome) {
     if (Object.keys(attempt.diagnostics).length) {
       attempt.status = 'needs_operator';
       attempt.reason = 'worker artifact rejected; correct the reported diagnostics';
@@ -648,8 +648,12 @@ async function createAttemptLifecycle({ owner, store, manifestPath, _runtimeRoot
           }
           for (const phase of Object.values(draft.phases)) {
             for (const entry of Object.values(phase.roles)) {
-              const attempt = currentAttempt(entry);
-              if (attempt) reconcileAttempt(draft, attempt, sample);
+              for (const attempt of entry.attempts) {
+                const isCurrent = attempt.attempt_id === entry.current_attempt_id;
+                if (isCurrent || (attempt.outcome && attempt.reservation.state !== 'released')) {
+                  reconcileAttempt(draft, attempt, sample, !isCurrent);
+                }
+              }
             }
           }
           aggregate(draft);

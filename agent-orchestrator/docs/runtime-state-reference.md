@@ -337,7 +337,11 @@ returned are rejected. `reconcile` may supply late acknowledgements for
 the same attempt, or supported closure evidence for an unidentified
 launch, without resubmitting work. It must not perform launch effects.
 Dispatched attempts remain eligible for closure reconciliation after an
-outcome until their reservation is released. Additive descendant/closure
+outcome until their reservation is released, including attempts superseded
+by later review iterations. Historical terminal attempts accept only
+release artifacts and process/adapter closure evidence; their other worker
+reports cannot change phase progression. Current attempts alone determine
+review progression, outcomes, and retry eligibility. Additive descendant/closure
 observations cannot rewrite that outcome or its process/submission identity.
 No observation or artifact-provided role label grants operator authority.
 

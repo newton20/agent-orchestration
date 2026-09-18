@@ -889,6 +889,105 @@ test('U2 correction: valid QA failure followed by pass preserves review history 
   assert.deepEqual(phase.roles.impl.budgets, { launch: 0, execution: 0 });
 });
 
+test('superseded read-only attempts reconcile only closure across restart without changing review progress', async (t) => {
+  for (const evidence of ['late-release', 'process-death', 'adapter-closure', 'early-release']) {
+    await t.test(evidence, async (t) => {
+      const fx = await fixture(t, { readOnly: true, phases: [{
+        id: 'p1', agents: [{ role: 'impl', access: 'read-only' }, { role: 'qa' }],
+        completion_signal: 'done.md', review_loop: { enabled: true, max_iterations: 2 },
+      }] });
+      await fx.tick();
+      const original = fx.current();
+      fx.complete(original, evidence === 'early-release');
+      await fx.tick();
+      const firstQa = fx.current('p1', 'qa');
+      fx.artifact(firstQa, 'completion', { status: 'blocked' });
+      fx.artifact(firstQa, 'verdict', { verdict: 'fail',
+        verification: firstQa.intent.required_verification.map((id) =>
+          ({ id, status: 'fail', evidence: 'requires implementation changes' })) });
+      fx.artifact(firstQa, 'release', { released: true, no_further_writes: true });
+      await fx.tick();
+      assert.notEqual(fx.current().attempt_id, original.attempt_id);
+      assert.equal(fx.current().retry_category, 'review');
+      await fx.reopen();
+      fx.complete(fx.current());
+      await fx.tick();
+      fx.complete(fx.current('p1', 'qa'));
+      await fx.tick();
+
+      if (evidence !== 'early-release') {
+        await fx.tick(fx.sample([], { complete: false, error: 'historical process probe failed' }));
+        const unresolved = fx.runtime.store.read().phases.p1.roles.impl.attempts[0];
+        assert.equal(unresolved.reservation.state, 'held', 'unknown evidence cannot close a historical attempt');
+        assert.equal(unresolved.health.engine.state, 'unknown');
+      }
+      const before = fx.runtime.store.read();
+      const { roles: beforeRoles, ...beforeProgress } = before.phases.p1;
+      assert.equal(beforeProgress.status, 'completed');
+      assert.deepEqual(beforeProgress.review_history.map((row) => row.verdict), ['fail', 'pass']);
+      assert.equal(fx.calls.length, 4);
+      const historical = beforeRoles.impl.attempts[0];
+      assert.equal(historical.reservation.state, evidence === 'early-release' ? 'released' : 'held');
+      if (evidence !== 'early-release') {
+        assert.throws(() => fx.runtime.store.rerun({
+          expectedRevision: before.revision, accepted: before.accepted,
+        }), /closure/);
+      }
+
+      fs.writeFileSync(original.artifacts.heartbeat, '{');
+      fs.writeFileSync(original.artifacts.checkpoint, '{');
+      let sample = fx.sample();
+      let adapterClosures = 0;
+      if (evidence === 'late-release') {
+        fx.artifact(original, 'release', { released: true, no_further_writes: true });
+      } else if (evidence === 'process-death') {
+        sample = fx.sample(sample.processes.filter((process) => process.pid !== historical.engine_process.pid));
+      } else if (evidence === 'adapter-closure') {
+        sample = fx.sample([], { complete: false, error: 'fixture process table unavailable' });
+        fx.adapter.reconcile = async (attempt, { observe }) => {
+          assert.equal(attempt.attempt_id, original.attempt_id);
+          adapterClosures++;
+          await observe({ ...identity(attempt), id: 'historical-closure', kind: 'closure',
+            launch_settled: true, engine_closed: true, descendants_closed: true });
+        };
+      }
+      await fx.reopen();
+      await fx.tick(sample);
+      const after = fx.runtime.store.read();
+      const { roles: afterRoles, ...afterProgress } = after.phases.p1;
+      const released = afterRoles.impl.attempts[0];
+      assert.equal(released.reservation.state, 'released');
+      assert.equal(released.reservation.closure.type, evidence === 'process-death' ? 'process_closure'
+        : evidence === 'adapter-closure' ? 'adapter_closure' : 'cooperative_release');
+      assert.deepEqual(afterProgress, beforeProgress);
+      for (const [role, previous] of Object.entries(beforeRoles)) {
+        const current = afterRoles[role];
+        assert.equal(current.current_attempt_id, previous.current_attempt_id);
+        assert.deepEqual(current.budgets, previous.budgets);
+        assert.deepEqual(current.attempts.map((attempt) => [attempt.attempt_id, attempt.status, attempt.outcome]),
+          previous.attempts.map((attempt) => [attempt.attempt_id, attempt.status, attempt.outcome]));
+        assert.deepEqual(current.attempts.at(-1), previous.attempts.at(-1));
+      }
+      for (const kind of ['completion', 'verdict', 'heartbeat', 'checkpoint']) {
+        assert.deepEqual(released.evidence[kind], historical.evidence[kind]);
+      }
+      assert.deepEqual(released.diagnostics, historical.diagnostics);
+      assert.equal(released.reported_status, historical.reported_status);
+      assert.equal(adapterClosures, evidence === 'adapter-closure' ? 1 : 0);
+      assert.equal(fx.calls.length, 4);
+      await fx.reopen();
+      await fx.tick(sample);
+      assert.deepEqual(fx.runtime.store.read(), after, 'replayed closure remains idempotent after restart');
+      assert.equal(adapterClosures, evidence === 'adapter-closure' ? 1 : 0);
+      await fx.close();
+      await fx.open({ rerun: true });
+      assert.notEqual(fx.runtime.state.run_id, before.run_id);
+      assert.deepEqual(fx.runtime.state.history.at(-1).phases, after.phases);
+      assert.equal(fx.calls.length, 4);
+    });
+  }
+});
+
 test('U2 bounded artifacts reject oversized data and path redirection without dispatch or authority escalation', async (t) => {
   const fx = await fixture(t, { review: true });
   await fx.tick();
