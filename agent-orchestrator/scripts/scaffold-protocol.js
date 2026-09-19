@@ -131,13 +131,14 @@ function scaffoldProtocol({ manifestPath, pluginDir, dryRun = false, accepted, r
         }
       }
       const protoDir = path.join(accepted.workspace.root, 'docs', 'orchestration', 'runs', runId);
+      const eventsLog = require('./event-log').eventLogPath({ workspace: accepted.workspace, run_id: runId });
       const actions = [
         ...accepted.phases.map((phase) => ({ type: 'mkdir', path: path.join(protoDir, 'phases', phase.id) })),
         { type: 'mkdir', path: path.join(protoDir, 'logs') },
-        { type: 'touch', path: path.join(protoDir, 'logs', 'events.jsonl') },
+        { type: 'touch', path: eventsLog },
       ];
       for (const action of actions) assertArtifactPath(accepted.workspace.root, action.path);
-      if (dryRun) return { ok: true, dryRun: true, protoDir, actions };
+      if (dryRun) return { ok: true, dryRun: true, protoDir, eventsLog, actions };
       for (const action of actions) {
         assertOwnership(owner, accepted.workspace);
         if (action.type === 'mkdir') fs.mkdirSync(action.path, { recursive: true });
@@ -147,7 +148,7 @@ function scaffoldProtocol({ manifestPath, pluginDir, dryRun = false, accepted, r
           }
         }
       }
-      return { ok: true, protoDir, run_id: runId, actions };
+      return { ok: true, protoDir, eventsLog, run_id: runId, actions };
     } catch (error) { return { ok: false, error: error.message }; }
   }
 

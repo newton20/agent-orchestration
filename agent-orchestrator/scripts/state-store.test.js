@@ -18,6 +18,191 @@ async function setup(t) {
   return { ...fx, accepted, owner, store };
 }
 
+test('U4 only the dedicated live-owned projection can acknowledge pending events', async (t) => {
+  const fx = await setup(t);
+  const first = fx.store.initialize(fx.accepted);
+  for (const field of ['outbox', 'next_event_sequence', 'projection']) {
+    assert.throws(() => fx.store.transactInternal({
+      expectedRevision: first.revision,
+      mutate(draft) {
+        draft[field] = field === 'outbox' ? [] : field === 'projection' ? { status: 'healthy' } : 100;
+        return { result: {}, events: [] };
+      },
+    }), /immutable/);
+  }
+  assert.throws(() => fx.store.projectOutbox({ expectedRevision: 0 }), /revision/);
+  await fx.owner.release();
+  assert.throws(() => fx.store.projectOutbox({ expectedRevision: first.revision }), /owner|ownership/);
+  assert.deepEqual(fx.store.read(), first);
+});
+
+test('U4 projection acknowledgement preserves canonical identities and rerun revision continuity', async (t) => {
+  const fx = await setup(t);
+  const first = fx.store.initialize(fx.accepted);
+  const projected = fx.store.projectOutbox({ expectedRevision: first.revision });
+  assert.deepEqual(projected.accepted, first.accepted);
+  assert.deepEqual(projected.phases, first.phases);
+  assert.deepEqual(projected.command_results, first.command_results);
+  const next = fx.store.rerun({ expectedRevision: projected.revision, accepted: fx.accepted });
+  assert.equal(next.revision, projected.revision + 1);
+  assert.equal(next.outbox[0].sequence, 1);
+  assert.notEqual(next.run_id, projected.run_id);
+  const beforeHistory = next.history;
+  const after = fx.store.projectOutbox({ expectedRevision: next.revision });
+  assert.deepEqual(after.history, beforeHistory);
+});
+
+test('U4 rerun refuses undrained projection without archiving pending events', async (t) => {
+  const fx = await setup(t);
+  const state = fx.store.initialize(fx.accepted);
+  assert.throws(() => fx.store.rerun({ expectedRevision: state.revision, accepted: fx.accepted }), /projection/);
+  assert.deepEqual(fx.store.read(), state);
+});
+
+test('U4 retention intent survives a crash after trimming and append acknowledgements survive trim failures', async (t) => {
+  const E = require('./event-log');
+  for (const fault of ['after_retention', 'rename']) {
+    const fx = await setup(t);
+    fx.store.initialize(fx.accepted);
+    const faulty = S.createStateStore({ manifestPath: fx.manifestPath, owner: fx.owner,
+      _projectionFault: (point) => { if (fault === point) throw new Error('retention crash'); },
+      _eventFs: fault === 'rename' ? {
+        renameSync() { throw Object.assign(new Error('retention file busy'), { code: 'EBUSY' }); },
+      } : {},
+    });
+    for (let i = 0; i < 2; i++) {
+      fx.store.transactInternal({ expectedRevision: fx.store.read().revision,
+        mutate: () => ({ result: {}, events: Array.from({ length: 255 }, () => ({ type: 'event', payload: {} })) }) });
+      fx.store.projectOutbox({ expectedRevision: fx.store.read().revision });
+    }
+    fx.store.transactInternal({ expectedRevision: fx.store.read().revision,
+      mutate: () => ({ result: {}, events: Array.from({ length: 3 }, () => ({ type: 'event', payload: {} })) }) });
+    if (fault === 'after_retention') assert.throws(() => faulty.projectOutbox({ expectedRevision: fx.store.read().revision }), /retention crash/);
+    else {
+      const degraded = faulty.projectOutbox({ expectedRevision: fx.store.read().revision });
+      assert.equal(degraded.projection.status, 'degraded');
+      assert.equal(degraded.projection.diagnostic.code, 'EBUSY');
+      assert.deepEqual(faulty.projectOutbox({ expectedRevision: degraded.revision }), degraded);
+    }
+    const persisted = fx.store.read();
+    assert.equal(persisted.outbox.length, 0, 'flushed append remains acknowledged even if retention fails');
+    assert.equal(persisted.projection.retained_through, 2);
+    const recovered = fx.store.projectOutbox({ expectedRevision: persisted.revision });
+    assert.equal(E.readEvents({ state: recovered }).history.gaps[0].reason, 'retention');
+    assert.equal(recovered.projection.status, 'healthy');
+  }
+});
+
+test('U4 stable projection errors do not churn revisions because temporary paths change', async (t) => {
+  const fx = await setup(t);
+  const first = fx.store.initialize(fx.accepted);
+  const faulty = S.createStateStore({ manifestPath: fx.manifestPath, owner: fx.owner,
+    _eventFs: { openSync() { throw Object.assign(new Error(`failure tmp-${Math.random()}`), { code: 'EACCES' }); } } });
+  const degraded = faulty.projectOutbox({ expectedRevision: first.revision });
+  assert.deepEqual(faulty.projectOutbox({ expectedRevision: degraded.revision }), degraded);
+});
+
+test('U4 physical retention recovery can succeed without a canonical revision change', async (t) => {
+  const E = require('./event-log');
+  const fx = await setup(t);
+  fx.store.initialize(fx.accepted);
+  for (let i = 0; i < 2; i++) {
+    fx.store.transactInternal({ expectedRevision: fx.store.read().revision,
+      mutate: () => ({ result: {}, events: Array.from({ length: 255 }, () => ({ type: 'event', payload: {} })) }) });
+    fx.store.projectOutbox({ expectedRevision: fx.store.read().revision });
+  }
+  fx.store.transactInternal({ expectedRevision: fx.store.read().revision,
+    mutate: () => ({ result: {}, events: Array.from({ length: 3 }, () => ({ type: 'event', payload: {} })) }) });
+  const interrupted = S.createStateStore({ manifestPath: fx.manifestPath, owner: fx.owner,
+    _projectionFault(point) { if (point === 'before_retention') throw new Error('retention interrupted'); } });
+  assert.throws(() => interrupted.projectOutbox({ expectedRevision: fx.store.read().revision }), /retention interrupted/);
+  const before = fx.store.read();
+  const file = E.eventLogPath(before);
+  const bytes = fs.statSync(file).size;
+  assert.equal(before.outbox.length, 0);
+  assert.ok(before.projection.retained_through > 0);
+  const after = fx.store.projectOutbox({ expectedRevision: before.revision });
+  assert.ok(fs.statSync(file).size < bytes);
+  assert.deepEqual(after, before, 'physical compaction is not guaranteed to publish a new state revision');
+});
+
+test('U4 recovered retention can drain pending events after the hard log cap is reached', async (t) => {
+  const E = require('./event-log');
+  const fx = await setup(t);
+  fx.store.initialize(fx.accepted);
+  const blocked = S.createStateStore({ manifestPath: fx.manifestPath, owner: fx.owner,
+    _eventFs: { renameSync() { throw Object.assign(new Error('retention busy'), { code: 'EBUSY' }); } } });
+  for (let i = 0; i < 5; i++) {
+    fx.store.transactInternal({ expectedRevision: fx.store.read().revision, mutate: () => ({
+      result: {}, events: Array.from({ length: 60 }, () => ({ type: 'event', payload: { text: 'x'.repeat(E.MAX_EVENT_BYTES - 1024) } })),
+    }) });
+    blocked.projectOutbox({ expectedRevision: fx.store.read().revision });
+  }
+  assert.ok(fx.store.read().outbox.length > 0);
+  const stalled = blocked.projectOutbox({ expectedRevision: fx.store.read().revision });
+  assert.deepEqual(blocked.projectOutbox({ expectedRevision: stalled.revision }), stalled);
+  for (let i = 0; i < 2; i++) fx.store.projectOutbox({ expectedRevision: fx.store.read().revision });
+  const recovered = fx.store.read();
+  assert.equal(recovered.outbox.length, 0);
+  assert.equal(recovered.projection.status, 'healthy');
+  assert.ok(fs.statSync(E.eventLogPath(recovered)).size <= E.RETAIN_LOG_BYTES);
+});
+
+test('U4 a failed flush near the cap acknowledges its on-disk prefix before draining the rest', async (t) => {
+  const E = require('./event-log');
+  const fx = await setup(t);
+  fx.store.initialize(fx.accepted);
+  const append = (count) => fx.store.transactInternal({ expectedRevision: fx.store.read().revision,
+    mutate: () => ({ result: {}, events: Array.from({ length: count }, () => ({
+      type: 'event', payload: { text: 'x'.repeat(E.MAX_EVENT_BYTES - 1024) },
+    })) }) });
+  const busy = S.createStateStore({ manifestPath: fx.manifestPath, owner: fx.owner,
+    _eventFs: { renameSync() { throw Object.assign(new Error('retention busy'), { code: 'EBUSY' }); } } });
+  for (let i = 0; i < 4; i++) {
+    append(60);
+    busy.projectOutbox({ expectedRevision: fx.store.read().revision });
+  }
+  append(20);
+  const unflushed = S.createStateStore({ manifestPath: fx.manifestPath, owner: fx.owner,
+    _eventFs: { fsyncSync() { throw Object.assign(new Error('flush failed'), { code: 'EIO' }); } } });
+  unflushed.projectOutbox({ expectedRevision: fx.store.read().revision });
+  append(20);
+  const before = fx.store.read();
+  assert.equal(before.outbox.length, 40);
+  const prefix = fx.store.projectOutbox({ expectedRevision: before.revision });
+  assert.equal(prefix.outbox.length, 20);
+  assert.equal(prefix.projection.acknowledged_sequence, before.outbox[19].sequence);
+  const recovered = fx.store.projectOutbox({ expectedRevision: prefix.revision });
+  assert.equal(recovered.projection.status, 'healthy');
+  assert.equal(recovered.outbox.length, 0);
+  const events = [];
+  let after = `${recovered.run_id}:${before.outbox[0].sequence - 1}`;
+  for (;;) {
+    const page = E.readEvents({ state: recovered, after, limit: E.MAX_READ_EVENTS });
+    assert.equal(page.reset_required, false);
+    events.push(...page.events);
+    if (!page.has_more) break;
+    after = page.cursor;
+  }
+  assert.deepEqual(events.map(S.fingerprint), before.outbox.map(S.fingerprint));
+});
+
+for (const code of ['EACCES', 'EIO', 'ENOTDIR']) {
+  test(`U4 owner projection preserves artifact-boundary ${code} as a fatal error`, async (t) => {
+    const fx = await setup(t);
+    const state = fx.store.initialize(fx.accepted);
+    const inspect = fs.lstatSync;
+    t.mock.method(fs, 'lstatSync', (file, ...args) => {
+      if (file === require('node:path').join(state.workspace.root, 'docs')) {
+        throw Object.assign(new Error('artifact boundary unavailable'), { code });
+      }
+      return inspect(file, ...args);
+    });
+    assert.throws(() => fx.store.projectOutbox({ expectedRevision: state.revision }), { code });
+    assert.deepEqual(fx.store.read(), state);
+  });
+}
+
 test('U1 state initializes, resumes without replacing accepted state, and reruns with immutable history', async (t) => {
   const fx = await setup(t);
   const first = fx.store.initialize(fx.accepted);
@@ -30,10 +215,11 @@ test('U1 state initializes, resumes without replacing accepted state, and reruns
   assert.equal(first.outbox[0].sequence, 1);
   assert.equal(first.outbox[0].event_id, `${first.run_id}:1`);
   assert.deepEqual(fx.store.initialize({ ...fx.accepted, manifest: { invalid: true } }), first);
-  const next = fx.store.rerun({ expectedRevision: first.revision, accepted: fx.accepted });
+  const projected = fx.store.projectOutbox({ expectedRevision: first.revision });
+  const next = fx.store.rerun({ expectedRevision: projected.revision, accepted: fx.accepted });
   assert.notEqual(next.run_id, first.run_id);
-  assert.equal(next.revision, 2);
-  const { history, ...historical } = first;
+  assert.equal(next.revision, projected.revision + 1);
+  const { history, ...historical } = projected;
   assert.deepEqual(next.history[0], historical);
 });
 
@@ -63,7 +249,8 @@ test('round4 rerun keeps imported V1 history in the current read contract', asyn
   const legacy = { phases: { p1: { status: 'completed' } } };
   fs.writeFileSync(P.statusPathFor(fx.manifestPath), JSON.stringify(legacy));
   const first = fx.store.initialize(fx.accepted);
-  const next = fx.store.rerun({ expectedRevision: first.revision, accepted: first.accepted });
+  const projected = fx.store.projectOutbox({ expectedRevision: first.revision });
+  const next = fx.store.rerun({ expectedRevision: projected.revision, accepted: first.accepted });
   assert.deepEqual(next.legacy_history, [legacy]);
   assert.deepEqual(next.history[0].legacy_history, [legacy]);
 });
