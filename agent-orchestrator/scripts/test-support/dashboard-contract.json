@@ -15,6 +15,7 @@
     "start": "Start a separate process and wait for readiness. Repeated starts discover the live dashboard namespace owner. A different manifest in the same workspace is a conflict.",
     "status": "Query the live namespace owner, then verify the service-specific control endpoint and private discovery identity; never trust a stored port or PID alone.",
     "stop": "Target the exact service_id using a separate private service capability; browser cookies cannot stop the service or mutate a workflow.",
+    "recovery": "status/stop/access accept --workspace <original Git workspace directory> if the manifest or canonical state is unavailable. Discovery must still match the manifest path, workspace key and live service identity. stop also accepts an optional service_id after the manifest.",
     "access": "Only an explicit interactive terminal displays a one-use code. Machine output contains the URL and instructions, never a code.",
     "ownership": "Use the dashboard namespace only. Never project outbox, write canonical state, start a controller, or launch workers."
   },
