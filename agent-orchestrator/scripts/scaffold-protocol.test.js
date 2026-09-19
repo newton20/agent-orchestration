@@ -14,6 +14,28 @@ const yaml = require('js-yaml');
 const { scaffoldProtocol } = require('./scaffold-protocol');
 const { runtimeFixture } = require('./test-support/runtime-fixture');
 
+test('U4 scaffold preserves the bounded projection and does not acknowledge or rebuild history', async (t) => {
+  const fx = runtimeFixture(t);
+  const accepted = require('./parse-manifest').prepareV2Manifest(fx.manifest, fx.manifestPath);
+  const owner = await require('./workspace-owner').acquireWorkspaceOwner(accepted.workspace, { _runtimeRoot: fx.runtimeRoot });
+  t.after(() => owner.release());
+  const store = require('./state-store').createStateStore({ manifestPath: fx.manifestPath, owner });
+  const first = store.initialize(accepted);
+  const options = { manifestPath: fx.manifestPath, accepted: first.accepted, runId: first.run_id, owner };
+  const result = scaffoldProtocol(options);
+  const file = require('./event-log').eventLogPath(first);
+  assert.equal(result.eventsLog, file);
+  assert.deepEqual(store.read(), first);
+  const projected = store.projectOutbox({ expectedRevision: first.revision });
+  const bytes = fs.readFileSync(file, 'utf8');
+  assert.equal(scaffoldProtocol(options).ok, true);
+  assert.equal(fs.readFileSync(file, 'utf8'), bytes);
+  fs.unlinkSync(file);
+  assert.equal(scaffoldProtocol(options).ok, true);
+  assert.equal(fs.readFileSync(file, 'utf8'), '');
+  assert.deepEqual(store.read(), projected);
+});
+
 test('U1 V2 scaffold requires persisted run identity and preserves run-scoped artifacts', (t) => {
   const fx = runtimeFixture(t);
   const P = require('./parse-manifest');
