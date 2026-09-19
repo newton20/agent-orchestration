@@ -12,7 +12,8 @@
     "orchestrate": "./orchestrate.js"
   },
   "scripts": {
-    "test": "node --test parse-manifest.test.js scaffold-protocol.test.js spawn-session.test.js generate-prompt.test.js check-health.test.js orchestrate.test.js state-store.test.js workspace-owner.test.js attempt-lifecycle.test.js event-log.test.js read-model.test.js"
+    "test": "node --test parse-manifest.test.js scaffold-protocol.test.js spawn-session.test.js generate-prompt.test.js check-health.test.js orchestrate.test.js state-store.test.js workspace-owner.test.js attempt-lifecycle.test.js event-log.test.js read-model.test.js engine-adapters.test.js attempt-channel.test.js engine-acceptance.test.js package-plugin.test.js",
+    "package:plugin": "node package-plugin.js"
   },
   "dependencies": {
     "js-yaml": "^4.1.0"

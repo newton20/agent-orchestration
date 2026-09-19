@@ -2,9 +2,9 @@
   "name": "agent-orchestrator-hooks",
   "version": "0.1.0",
   "private": true,
-  "description": "Unit 5 — SessionStart hook for the agent-orchestrator plugin. Reads the oldest-fresh `.pending-<id>` flag file under docs/orchestration/ and injects its contents as the initial session context. No-op when no flag file is present.",
+  "description": "Attempt-bound startup and lifecycle hooks for the agent-orchestrator plugin. Unrelated sessions do not consume another launch's kickoff.",
   "scripts": {
-    "test": "node --test session-start.test.js"
+    "test": "node --test session-start.test.js copilot-session.test.js"
   },
   "engines": {
     "node": ">=20"
