@@ -63,9 +63,10 @@ function listConsumingFiles(orchDir) {
   return fs.readdirSync(orchDir).filter((n) => /\.consuming-/.test(n)).sort();
 }
 
-function runCli(env) {
+function runCli(env, payload = { source: 'startup' }) {
   return spawnSync(process.execPath, [HOOK_PATH], {
     env,
+    input: JSON.stringify(payload),
     encoding: 'utf8',
   });
 }
@@ -73,8 +74,72 @@ function runCli(env) {
 function cliEnv(overrides) {
   const env = Object.assign({}, process.env);
   delete env.CLAUDE_PROJECT_DIR;  // start from a clean slate
+  delete env.AGENT_FLAG_TOKEN;
   return Object.assign(env, overrides || {});
 }
+
+test('an unrelated tokenless session cannot consume or garbage-collect a bound kickoff', (t) => {
+  const root = mkProjectDir();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const orch = mkOrchDir(root);
+  const now = Date.now();
+  for (const age of [0, STALE_HARD_TTL_MS + 1000]) {
+    const flag = writeFlag(orch, `bound-${age}`, '# spawn_token: other-attempt\nAssignment', { mtimeMs: now - age });
+    assert.equal(runHook({ projectDir: root, tabToken: '', now }), '{}');
+    assert.equal(fs.existsSync(flag), true);
+  }
+});
+
+test('only startup may consume a bound kickoff, even when the inherited token matches', (t) => {
+  const root = mkProjectDir();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const orch = mkOrchDir(root);
+  const flag = writeFlag(orch, 'bound', '# spawn_token: intended\nAssignment');
+  for (const source of ['clear', 'compact', 'resume', '', 'other']) {
+    assert.equal(runHook({ projectDir: root, tabToken: 'intended', source }), '{}');
+    assert.equal(fs.existsSync(flag), true);
+  }
+  assert.deepEqual(JSON.parse(runHook({ projectDir: root, tabToken: 'intended', source: 'startup' })),
+    { additionalContext: 'Assignment' });
+});
+
+test('CLI reads the actual hook source and leaves another lifecycle event untouched', (t) => {
+  const root = mkProjectDir();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const orch = mkOrchDir(root);
+  const flag = writeFlag(orch, 'bound', '# spawn_token: intended\nAssignment');
+  for (const payload of [{ source: 'resume' }, { source: 'clear' }, {}]) {
+    const result = runCli(cliEnv({ CLAUDE_PROJECT_DIR: root, AGENT_FLAG_TOKEN: 'intended' }), payload);
+    assert.equal(result.status, 0);
+    assert.equal(result.stdout, '{}');
+    assert.equal(fs.existsSync(flag), true);
+  }
+});
+
+test('a swapped oversized kickoff for another token is restored before any deletion', (t) => {
+  const root = mkProjectDir();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const orch = mkOrchDir(root);
+  const flag = writeFlag(orch, 'swapped', '# spawn_token: intended\nAssignment');
+  const replacement = '# spawn_token: replacement\n' + 'x'.repeat(MAX_FLAG_BYTES);
+  const fsLib = Object.create(fs);
+  fsLib.renameSync = (from, to) => {
+    fs.writeFileSync(from, replacement);
+    fs.renameSync(from, to);
+  };
+  assert.equal(runHook({ projectDir: root, tabToken: 'intended', fsLib }), '{}');
+  assert.equal(fs.readFileSync(flag, 'utf8'), replacement);
+});
+
+test('expired oversized legacy cleanup does not suppress a fresh kickoff', (t) => {
+  const root = mkProjectDir();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const orch = mkOrchDir(root);
+  const now = Date.now();
+  writeFlag(orch, 'old', 'x'.repeat(MAX_FLAG_BYTES + 1), { mtimeMs: now - STALE_HARD_TTL_MS - 1000 });
+  writeFlag(orch, 'fresh', 'Current assignment', { mtimeMs: now });
+  assert.deepEqual(JSON.parse(runHook({ projectDir: root, now, tabToken: '' })), { additionalContext: 'Current assignment' });
+});
 
 // -------------------- 1. env unset → {} via CLI --------------------
 
@@ -506,15 +571,16 @@ test('[todo 099] extractSpawnToken returns null for missing/malformed headers', 
   assert.strictEqual(extractSpawnToken('# spawn_token: bad whitespace token\nrest'), null);
 });
 
-test('[todo 099] runHook with no tabToken falls through to oldest-flag-wins (compat)', () => {
+test('tokenless compatibility remains available only for unbound legacy flags', () => {
   const projectDir = mkProjectDir();
   const orchDir = mkOrchDir(projectDir);
   try {
-    writeFlag(orchDir, 'compat', '# spawn_token: any-token\nlegacy-style prompt');
-    // No tabToken passed → existing oldest-fresh wins.
-    const out = runHook({ projectDir });
+    const bound = writeFlag(orchDir, 'bound', '# spawn_token: any-token\nanother assignment');
+    writeFlag(orchDir, 'compat', 'legacy-style prompt');
+    const out = runHook({ projectDir, tabToken: '' });
     const parsed = JSON.parse(out);
     assert.ok(parsed.additionalContext.includes('legacy-style prompt'));
+    assert.ok(fs.existsSync(bound));
   } finally {
     fs.rmSync(projectDir, { recursive: true, force: true });
   }
@@ -632,7 +698,13 @@ for (const scenario of ['absent', 'already published', 'published during restore
     };
     try {
       assert.strictEqual(runHook({ projectDir, tabToken: 'T1', fsLib }), '{}');
-      assert.deepStrictEqual(listConsumingFiles(orchDir), []);
+      const retained = listConsumingFiles(orchDir);
+      if (scenario === 'absent') {
+        assert.deepStrictEqual(retained, []);
+      } else {
+        assert.equal(retained.length, 1);
+        assert.equal(fs.readFileSync(path.join(orchDir, retained[0]), 'utf8'), replacement);
+      }
       if (scenario === 'unsupported links') {
         assert.strictEqual(fs.existsSync(flagPath), false);
       } else {

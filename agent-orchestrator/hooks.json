@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "type": "command",
+        "powershell": "if ($env:AGENT_ORCHESTRATOR_PLUGIN_ROOT) { & $env:AGENT_ORCHESTRATOR_NODE (Join-Path $env:AGENT_ORCHESTRATOR_PLUGIN_ROOT 'hooks\\copilot-session.js') sessionStart }"
+      }
+    ],
+    "userPromptSubmitted": [
+      {
+        "type": "command",
+        "powershell": "if ($env:AGENT_ORCHESTRATOR_PLUGIN_ROOT) { & $env:AGENT_ORCHESTRATOR_NODE (Join-Path $env:AGENT_ORCHESTRATOR_PLUGIN_ROOT 'hooks\\copilot-session.js') userPromptSubmitted }"
+      }
+    ]
+  }
+}

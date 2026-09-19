@@ -311,6 +311,60 @@ function loadLauncherFromManifest(manifestPath) {
 
 // -------------------- Command construction --------------------
 
+function windowsArgument(value) {
+  return `"${value.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/g, '$1$1')}"`;
+}
+
+function powershellData(value) {
+  if (/^[\x20-\x7e]*$/.test(value)) return quotePsAlways(value);
+  // PowerShell recognizes smart quotes as delimiters, even inside ASCII quotes.
+  return `[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${Buffer.from(value).toString('base64')}'))`;
+}
+
+function buildEngineSpawnCommand({ workdir, title, invocation, environment = {}, shell = 'powershell' }) {
+  if (!['powershell', 'cmd'].includes(shell)) throw new Error('unsupported V2 terminal shell');
+  if (typeof workdir !== 'string' || !path.isAbsolute(workdir)) throw new Error('absolute working directory required');
+  if (typeof title !== 'string' || !title) throw new Error('terminal title required');
+  if ([workdir, title].some((value) => /[;\0\r\n]/.test(value))) throw new Error('terminal separator in title or working directory');
+  if (!invocation || typeof invocation.file !== 'string' || !path.isAbsolute(invocation.file) ||
+      !/\.exe$/i.test(invocation.file) || /[\0\r\n]/.test(invocation.file)) {
+    throw new Error('V2 terminal requires a resolved absolute .exe; shell shims are not supported');
+  }
+  if (!Array.isArray(invocation.args) || !invocation.args.every((arg) => typeof arg === 'string' && !arg.includes('\0'))) {
+    throw new Error('V2 invocation args must be NUL-free strings');
+  }
+  const script = [
+    "$ErrorActionPreference='Stop'",
+    '$p=New-Object System.Diagnostics.ProcessStartInfo',
+    `$p.FileName=${powershellData(invocation.file)}`,
+    `$p.Arguments=${powershellData(invocation.args.map(windowsArgument).join(' '))}`,
+    `$p.WorkingDirectory=${powershellData(workdir)}`,
+    '$p.UseShellExecute=$false',
+  ];
+  for (const [key, value] of Object.entries(environment)) {
+    if (!/^[A-Z][A-Z0-9_]*$/.test(key) || typeof value !== 'string' || value.includes('\0')) {
+      throw new Error('invalid V2 worker environment');
+    }
+    script.push(`$p.EnvironmentVariables[${quotePsAlways(key)}]=${powershellData(value)}`);
+  }
+  // Encode the shell program, then use native Windows argv quoting inside it.
+  // WT never sees separators and PowerShell 5.1 never re-quotes native arguments.
+  script.push('$child=[System.Diagnostics.Process]::Start($p)', '$child.WaitForExit()',
+    'if ($child.ExitCode -ne 0) { throw ("Worker exited with code " + $child.ExitCode) }');
+  const encoded = Buffer.from(script.join('; '), 'utf16le').toString('base64');
+  const powershell = ['powershell.exe', '-NoProfile', '-NoExit', '-EncodedCommand', encoded];
+  const shellArgs = shell === 'cmd'
+    ? ['cmd.exe', '/d', '/v:off', '/k', ...powershell.filter((arg) => arg !== '-NoExit')]
+    : powershell;
+  if (shell === 'cmd' && shellArgs.map(windowsArgument).join(' ').length > 8191) {
+    throw new Error('V2 CMD payload exceeds the 8191-character limit; select powershell or shorten inputs');
+  }
+  const argv = ['-w', '0', 'new-tab', '--title', title, '--suppressApplicationTitle',
+    '--startingDirectory', workdir, ...shellArgs];
+  if (argv.join(' ').length > 30000) throw new Error('V2 terminal command exceeds Windows command-line limit');
+  return { program: 'wt.exe', argv, command: `wt.exe ${argv.map(windowsArgument).join(' ')}` };
+}
+
 /**
  * Pure builder — returns the exact wt command string that would be
  * passed to execSync, plus the computed sessionName and title. Callers
@@ -955,6 +1009,7 @@ module.exports = {
   spawnSession,
   getSessionPid,
   buildSpawnCommand,
+  buildEngineSpawnCommand,
   resolveLauncher,
   loadLauncherFromManifest,
   buildPidLookupArgs,

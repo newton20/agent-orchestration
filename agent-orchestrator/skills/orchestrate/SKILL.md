@@ -1,6 +1,6 @@
 ---
 name: orchestrate
-description: Run a multi-phase, multi-session build from a YAML manifest. Validates the manifest, scaffolds the file-drop protocol, and starts the Node.js orchestrator process that spawns visible Claude Code sessions per phase, polls for completion signals, runs review loops, and recovers from crashes — all without consuming this Claude session's context window.
+description: Run V1 multi-session phased builds from a YAML manifest, or inspect V2 state without production worker dispatch. V1 spawns visible Claude Code sessions, monitors file signals, runs review loops, and recovers from crashes in an external Node.js process.
 argument-hint: "[manifest.yaml path | --resume]"
 ---
 
@@ -22,6 +22,28 @@ exhaust the context after ~90 polling ticks; the external process has
 no such limit.
 
 ## Steps
+
+First identify the manifest schema and any existing canonical state.
+The launch instructions below describe V1. V2 manifests or persisted V2
+state use the separate foundation path and report `live_dispatch_disabled`;
+they do not launch production Claude or Copilot workers.
+
+For V2, distinguish accepted state, projection diagnostics, and worker
+reports from live engine acceptance. Do not report a successful live build
+from an exit code or readiness response alone. Do not inject an engine
+through `_fixtureAdapter`, remove the live-test skips, or broaden
+permissions to make a run start. Native correlation, immutable executable
+binding, runtime adapter integration, and authorized live acceptance are
+still outstanding.
+
+The offline package is built with `npm run package:plugin -- --output`
+and a new absolute directory outside the source checkout. It includes
+locked runtime dependencies but not Node. Package loading does not perform
+an npm install. A packaged installation with missing dependencies is an
+invalid artifact to rebuild, not a reason to silently alter installed files.
+The developer dependency-install step below applies to a source checkout.
+See `agent-orchestrator\README.md` in the source repository for the complete
+packaging invocation.
 
 When the user invokes this skill with a manifest path:
 
@@ -92,7 +114,7 @@ When the user invokes this skill with a manifest path:
    every phase reaches a terminal status (`completed` / `failed` /
    `blocked`).
 
-## CLI flags
+## V1 CLI flags
 
 The orchestrator accepts:
 
@@ -117,7 +139,7 @@ Exit codes: `0` (every phase completed), `1` (one or more phases
 failed, or fatal error), `2` (lockfile contention — another
 orchestrator is already running against this manifest).
 
-## What the orchestrator does
+## What the V1 orchestrator does
 
 Per tick (every 30 seconds when active, 2 minutes when idle):
 
@@ -139,7 +161,7 @@ Per tick (every 30 seconds when active, 2 minutes when idle):
 The orchestrator never calls `claude -p`. V1 is template-only; V1.5's
 recovery-analyst LLM step is deferred (see plan §V1.5 Deferred Units).
 
-## File locations under `<manifestDir>/docs/orchestration/`
+## V1 file locations under `<manifestDir>/docs/orchestration/`
 
 | Path | Purpose |
 |---|---|

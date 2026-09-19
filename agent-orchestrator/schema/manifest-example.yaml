@@ -17,6 +17,7 @@ schema_version: 1
 # For V2, remove launcher entirely and add:
 # defaults:
 #   engine: agency-copilot            # claude | agency-claude | agency-copilot
+#   permission_mode: default          # do not carry V1 bypassPermissions into V2
 #   phase_timeout_minutes: 60
 #   heartbeat_timeout_minutes: 5
 # terminal:
@@ -27,6 +28,11 @@ schema_version: 1
 # and workdir (relative to this manifest or absolute). V2 defaults access
 # to mutating and rejects a phase containing both agent and agents.
 # Every V2 workdir must resolve inside an existing Git worktree.
+# Offline candidate adapters currently reject read-only access and bypass modes.
+# Omit inherited Claude model aliases for Copilot unless selected-engine help
+# proves the requested model. Remove the V1 launcher block and raw flags.
+# Packaging and candidate preparation do not enable production dispatch;
+# independent process/session correlation and authorized live acceptance remain.
 
 name: my-phased-build
 # Optional. Cosmetic. Shown in the orchestrator's startup header.
