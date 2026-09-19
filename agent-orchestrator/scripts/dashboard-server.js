@@ -141,6 +141,10 @@ async function discover(context) {
   let owner;
   try { owner = await W.queryOwner(context.workspace, { namespace: 'dashboard' }); } catch (error) {
     if (absentOwner(error)) return null;
+    if (error.code === undefined && error.message === 'owner readiness query timed out') {
+      throw Object.assign(new Error('dashboard owner readiness is still pending; retry discovery', { cause: error }),
+        { code: 'DASHBOARD_STARTING' });
+    }
     throw error;
   }
   if (owner.status !== 'ready') throw Object.assign(new Error('dashboard is starting or unavailable; retry discovery'),
@@ -361,12 +365,14 @@ async function serveDashboard(options) {
       client.response.once('drain', () => {
         clearTimeout(client.drainTimer);
         client.waitingDrain = false;
+        if (client.pendingEvents) observeStream(client);
       });
     }
     return true;
   }
 
   function observeStream(client) {
+    if (!streams.has(client)) return;
     if (!sessions.has(client.session) || sessions.get(client.session) <= now()) {
       frame(client, 'error', errorBody(new DashboardError(401, 'AUTH_EXPIRED', 'Dashboard access expired.'), owner.serviceId));
       client.response.end();
@@ -375,27 +381,35 @@ async function serveDashboard(options) {
     }
     if (client.waitingDrain) return;
     try {
-      const selected = view(client.runId);
-      const s = selected.snapshot;
-      if (!frame(client, 'observation', {
-        schema_version: 1, service_id: owner.serviceId, run_id: s.run_id, current_run_id: s.current_run_id,
-        revision: s.revision, event_cursor: s.event_cursor, updated_at: s.updated_at, reader_observed_at: s.reader_observed_at,
-        controller: s.controller, controller_service: selected.controller_service, projection: s.projection, history: s.history,
-      })) return;
+      if (!client.pendingEvents) {
+        const selected = view(client.runId);
+        const s = selected.snapshot;
+        if (!frame(client, 'observation', {
+          schema_version: 1, service_id: owner.serviceId, run_id: s.run_id, current_run_id: s.current_run_id,
+          revision: s.revision, event_cursor: s.event_cursor, updated_at: s.updated_at, reader_observed_at: s.reader_observed_at,
+          controller: s.controller, controller_service: selected.controller_service, projection: s.projection, history: s.history,
+        })) return;
+        // Resume the page before another observation, without retaining a queue of frames.
+        client.pendingEvents = true;
+      }
+      if (client.waitingDrain) return;
       const page = eventPage(client.runId, client.after);
       if (page.reset_required) {
-        frame(client, 'reset', { schema_version: 1, service_id: owner.serviceId, run_id: client.runId,
-          reset_required: true, resume_after: null, latest_cursor: page.latest_cursor, history: page.history }, '');
+        if (!frame(client, 'reset', { schema_version: 1, service_id: owner.serviceId, run_id: client.runId,
+          reset_required: true, resume_after: null, latest_cursor: page.latest_cursor, history: page.history }, '')) return;
         client.after = null;
       } else {
         // A reset may revisit retained history. It must not replay already delivered timeline IDs.
         const events = page.events.filter((event) => event.sequence > client.deliveredSequence);
-        if (events.length && frame(client, 'events', { ...page, events }, events.at(-1).event_id)) {
+        if (events.length) {
+          if (!frame(client, 'events', { ...page, events }, events.at(-1).event_id)) return;
           client.deliveredSequence = events.at(-1).sequence;
         }
         client.after = page.cursor;
       }
+      client.pendingEvents = false;
     } catch (error) {
+      client.pendingEvents = false;
       frame(client, 'error', errorBody(error, owner.serviceId));
       if (error instanceof DashboardError && error.status === 404) {
         client.response.end();
@@ -542,7 +556,7 @@ async function serveDashboard(options) {
         headers(response);
         response.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', Connection: 'keep-alive' });
         response.flushHeaders();
-        const client = { response, session, runId, after, deliveredSequence: 0 };
+        const client = { response, session, runId, after, deliveredSequence: 0, pendingEvents: false };
         streams.add(client);
         response.on('close', () => { clearTimeout(client.drainTimer); streams.delete(client); });
         observeStream(client);
