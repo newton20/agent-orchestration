@@ -1,0 +1,135 @@
+{
+  "contract": "dashboard-http/v1",
+  "scope": "U5 read-only backend; not a finished UI or live-engine acceptance",
+  "transport": {
+    "bind": "127.0.0.1",
+    "port": "OS-selected",
+    "host": "Exact 127.0.0.1:<port>",
+    "origin": "If supplied, must equal http://127.0.0.1:<port>; bootstrap requires it.",
+    "service_header": "X-Dashboard-Service",
+    "cache_control": "no-store",
+    "cors": "No CORS access is granted."
+  },
+  "lifecycle": {
+    "commands": "node dashboard-server.js <start|serve|status|stop|access> <manifest-path>",
+    "start": "Start a separate process and wait for readiness. Repeated starts discover the live dashboard namespace owner. A different manifest in the same workspace is a conflict.",
+    "status": "Query the live namespace owner, then verify the service-specific control endpoint and private discovery identity; never trust a stored port or PID alone.",
+    "stop": "Target the exact service_id using a separate private service capability; browser cookies cannot stop the service or mutate a workflow.",
+    "access": "Only an explicit interactive terminal displays a one-use code. Machine output contains the URL and instructions, never a code.",
+    "ownership": "Use the dashboard namespace only. Never project outbox, write canonical state, start a controller, or launch workers."
+  },
+  "authentication": {
+    "bootstrap": "POST /api/bootstrap with application/json {\"code\":\"<locally entered one-use code>\"}; success 204 with HttpOnly; SameSite=Strict; Path=/ cookie.",
+    "code_lifetime_seconds": 60,
+    "session_lifetime_seconds": 900,
+    "cookie_name": "dashboard_<service UUID with hyphens removed>",
+    "rotation": "Codes and sessions are memory-only and invalidated on restart. Codes are single-use. No credential belongs in a URL.",
+    "session": "GET /api/session returns {schema_version:1,service_id,expires_at,read_only:true}; unauthenticated or expired sessions return 401.",
+    "browser_flow": "Serve the static login UI without a cookie. Submit the entered code with a same-origin POST, then fetch snapshot and open one EventSource per page. On 401/auth_expired, close EventSource and show the access flow."
+  },
+  "routes": {
+    "GET /": "Allowlisted dashboard/index.html only; 503 UI_UNAVAILABLE until frontend integration.",
+    "GET /app.js": "Allowlisted dashboard/app.js only.",
+    "GET /styles.css": "Allowlisted dashboard/styles.css only.",
+    "GET /api/snapshot?run_id=<optional>": "Authenticated. {schema_version:1,service_id,snapshot:<unchanged U4 snapshot>,stream:{run_id,after:null},controller_service:{status,observed_at,service_id}}. Omitted run_id follows the current run.",
+    "GET /api/events?run_id=<required>&after=<optional>&limit=<optional>": "Authenticated bounded U4 readEvents page, plus schema_version and service_id. Resume from cursor, not latest_cursor. Malformed cursor strings still use U4 reset_required semantics.",
+    "GET /api/stream?run_id=<required>&after=<optional>": "Authenticated SSE. Last-Event-ID overrides after on reconnect. Fixed selected run; observation.current_run_id lets a current-run view detect rerun and switch intentionally.",
+    "GET /api/artifact?run_id=<required>&phase_id=<required>&role=<required>&review_iteration=<required>&attempt_id=<required>&kind=<required>": "Authenticated JSON containing identity, kind, content (untrusted UTF-8 text), sha256, accepted_sha256, matches_accepted. Kinds: completion, heartbeat, verdict, checkpoint, release. Resolve from the selected snapshot's allowlisted attempt paths; no arbitrary file/path parameter or prompt access."
+  },
+  "sse": {
+    "observation": "No id field. data: {schema_version:1,service_id,run_id,current_run_id,revision,event_cursor,updated_at,reader_observed_at,controller,controller_service,projection,history}. Sent once per second even without state changes. Refresh canonical snapshot on revision/current-run changes; use observation timestamps for freshness.",
+    "events": "id is the last actually delivered event_id. data is the bounded events-page envelope. Events are timeline/refresh notifications, never instructions or progress reducers. Deduplicate timeline items by run_id + event_id, including across reconnect/reset.",
+    "reset": "Empty id field clears EventSource Last-Event-ID. data: {schema_version:1,service_id,run_id,reset_required:true,resume_after:null,latest_cursor,history}. Fetch a fresh snapshot, keep its canonical progress, and resume projected history from null. Server retries bounded history reads; gaps remain visible.",
+    "error": "No id field. Same error envelope as HTTP. STATE_UNAVAILABLE is recoverable on the next observation. AUTH_EXPIRED closes the stream and requires a new access flow.",
+    "cursor_rule": "snapshot.event_cursor and events.latest_cursor mean latest committed, possibly still pending projection. Neither is a delivered log cursor. snapshot.stream.after is intentionally null. If a client passes a snapshot cursor ahead of projection, reset + replay of available timeline IDs must not roll back or double-apply canonical progress.",
+    "backpressure": "Slow clients are disconnected rather than queued without bounds. Reconnect uses only the last received event_id."
+  },
+  "bounds": {
+    "poll_ms": 1000,
+    "snapshot_bytes": 2097152,
+    "artifact_bytes": 65536,
+    "static_bytes": 262144,
+    "request_bytes": 1024,
+    "event_limit": 256,
+    "event_page_bytes": 262144,
+    "streams": 8,
+    "sessions": 64,
+    "bootstrap_codes": 8
+  },
+  "errors": {
+    "shape": {
+      "schema_version": 1,
+      "service_id": "11111111-1111-4111-8111-111111111111",
+      "error": { "code": "AUTH_REQUIRED", "message": "Dashboard access is required." }
+    },
+    "statuses": {
+      "400": ["INVALID_REQUEST"],
+      "401": ["AUTH_REQUIRED", "AUTH_EXPIRED", "INVALID_CODE"],
+      "403": ["FORBIDDEN_HOST", "FORBIDDEN_ORIGIN", "UNSAFE_PATH"],
+      "404": ["NOT_FOUND", "RUN_NOT_FOUND", "ARTIFACT_NOT_FOUND"],
+      "405": ["METHOD_NOT_ALLOWED"],
+      "413": ["REQUEST_TOO_LARGE", "ARTIFACT_TOO_LARGE", "SNAPSHOT_TOO_LARGE"],
+      "429": ["SESSION_LIMIT", "STREAM_LIMIT", "CODE_LIMIT"],
+      "503": ["STATE_UNAVAILABLE", "UI_UNAVAILABLE"]
+    },
+    "redaction": "Fixed diagnostic messages only. Do not return raw canonical state, prompts, capabilities, stack traces, or filesystem exceptions."
+  },
+  "freshness": {
+    "updated_at": "Canonical state timestamp.",
+    "reader_observed_at": "Last successful companion snapshot read; never advances on read failure.",
+    "controller": "The U4 run-bound observation. Workspace readiness alone cannot prove that a controller is monitoring this run, so it never fabricates running status. Confirmed absence can mark the current run stopped; historical run status remains unknown.",
+    "controller_service": "Separate async workspace owner readiness observation: running, stopped, or unavailable. Includes observed_at and service_id; this is not worker liveness or run-correlated controller health.",
+    "polling": "Permanent one-second read-only observation independent of controller progress and U6."
+  },
+  "fixtures": {
+    "pending_snapshot_fields": {
+      "run_id": "fixture-run",
+      "current_run_id": "fixture-run",
+      "is_current_run": true,
+      "revision": 3,
+      "event_cursor": "fixture-run:2",
+      "updated_at": "2026-09-17T12:00:01.000Z",
+      "reader_observed_at": "2026-09-17T12:00:02.000Z",
+      "controller": { "status": "unknown", "observed_at": null, "run_id": "fixture-run" },
+      "projection": { "status": "healthy", "acknowledged_sequence": 1, "retained_through": 0, "updated_at": "2026-09-17T12:00:00.000Z", "diagnostic": null },
+      "history": { "status": "gap", "gaps": [{ "from": 2, "to": 2, "reason": "pending_projection" }], "diagnostic": null, "limits": { "total": 1, "shown": 1, "truncated": false } }
+    },
+    "projected_page": {
+      "schema_version": 1,
+      "service_id": "11111111-1111-4111-8111-111111111111",
+      "run_id": "fixture-run",
+      "revision": 3,
+      "events": [{ "sequence": 1, "event_id": "fixture-run:1", "run_id": "fixture-run", "revision": 1, "type": "run_created", "payload": { "accepted_revision": 1 } }],
+      "cursor": "fixture-run:1",
+      "latest_cursor": "fixture-run:2",
+      "has_more": false,
+      "reset_required": false,
+      "history": { "status": "gap", "gaps": [{ "from": 2, "to": 2, "reason": "pending_projection" }], "diagnostic": null }
+    },
+    "ahead_cursor_reset": {
+      "schema_version": 1,
+      "service_id": "11111111-1111-4111-8111-111111111111",
+      "run_id": "fixture-run",
+      "reset_required": true,
+      "resume_after": null,
+      "latest_cursor": "fixture-run:2",
+      "history": { "status": "gap", "gaps": [{ "from": 2, "to": 2, "reason": "pending_projection" }], "diagnostic": null }
+    },
+    "reported_completion": {
+      "completion": { "status": "reported_complete", "provenance": { "source": "worker_report" } },
+      "independent_verification": { "status": "unknown", "evidence": [] }
+    },
+    "inert_artifact_content": "<script>alert('fixture')</script><img src=x onerror=alert(1)>"
+  },
+  "frontend_integration": {
+    "files_owned_by_frontend": ["agent-orchestrator/dashboard/index.html", "agent-orchestrator/dashboard/app.js", "agent-orchestrator/dashboard/app.test.js", "agent-orchestrator/dashboard/styles.css"],
+    "rendering": "Use textContent for all worker content. Do not use innerHTML for artifact content or events. CSP forbids inline script, eval, framing, and external connections.",
+    "release": "Coordinator must explicitly agree to this contract and release frontend work. Contract publication alone is not release.",
+    "coordinator_requests": [
+      "Add dashboard-server.test.js to the maintained scripts npm test list, preserving event-log.test.js/read-model.test.js and adapter additions.",
+      "Add dashboard/app.test.js after frontend integration.",
+      "Wire dashboard lifecycle/access usage into coordinator-owned README and skill prose.",
+      "Run combined browser acceptance, including authentication, reconnect, truthful completion labels, accessibility, and safe artifact display."
+    ]
+  }
+}
