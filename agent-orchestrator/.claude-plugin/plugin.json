@@ -1,7 +1,7 @@
 {
   "name": "agent-orchestrator",
   "version": "0.1.0",
-  "description": "Multi-session phased-build orchestration for Claude Code. Spawns visible Claude Code sessions per phase, coordinates via a file-drop protocol, and handles review loops and crash recovery.",
+  "description": "Visible phased-build orchestration with attempt-bound worker artifacts. Retains Claude launch support; V2 Agency/Copilot dispatch requires separate live acceptance.",
   "author": {
     "name": "dunliu",
     "url": "https://github.com/newton20"

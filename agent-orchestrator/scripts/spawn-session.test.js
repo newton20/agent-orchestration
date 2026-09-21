@@ -16,6 +16,58 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
+test('V2 terminal launch carries literal argv and environment without WT separators', () => {
+  const { buildEngineSpawnCommand } = require('./spawn-session');
+  const result = buildEngineSpawnCommand({
+    workdir: 'C:\\work space', title: 'orch-test',
+    invocation: { file: 'C:\\Program Files\\engine.exe', args: ['a; b', "'quoted'", '$env:PATH', '%PATH%', 'x"y'] },
+    environment: { AGENT_FLAG_TOKEN: 'test-token' },
+  });
+  assert.ok(result.argv.includes('--suppressApplicationTitle'));
+  const encoded = result.argv[result.argv.indexOf('-EncodedCommand') + 1];
+  const script = Buffer.from(encoded, 'base64').toString('utf16le');
+  assert.ok(script.includes('"a; b"'));
+  assert.ok(script.includes('"\'\'quoted\'\'"'));
+  assert.ok(script.includes('"$env:PATH"'));
+  assert.ok(script.includes('"%PATH%"'));
+  assert.ok(script.includes('"x\\"y"'));
+  assert.ok(result.argv.every((arg) => !arg.includes(';')));
+  assert.throws(() => buildEngineSpawnCommand({
+    workdir: 'C:\\work;other', title: 'orch-test', invocation: { file: 'C:\\engine.exe', args: [] },
+  }), /terminal separator/);
+});
+
+for (const shell of ['powershell', 'cmd']) {
+  test(`V2 ${shell} round-trips real argv and per-worker environment without launching an engine`, {
+    skip: process.platform !== 'win32',
+  }, () => {
+    const { execFileSync } = require('node:child_process');
+    const { buildEngineSpawnCommand } = require('./spawn-session');
+    const values = ['space value', 'semi;colon', "a'b", 'a"b', '$env:PATH', '%PATH%', 'C:\\end\\', '', 'back\\"quote',
+      'O\u2019Brien', '\u2018quoted\u2019', '\u201a\u201b\u201c\u201d'];
+    const result = buildEngineSpawnCommand({
+      workdir: process.cwd(), title: 'safe-test', shell,
+      environment: { AGENT_V2_TEST_TOKEN: 'independent;$PATH%PATH%"value' },
+      invocation: { file: process.execPath, args: ['-e',
+        'console.log(JSON.stringify({args:process.argv.slice(1),token:process.env.AGENT_V2_TEST_TOKEN}))', '--', ...values] },
+    });
+    const args = result.argv.slice(result.argv.indexOf(shell === 'cmd' ? 'cmd.exe' : 'powershell.exe') + 1)
+      .filter((arg) => arg !== '-NoExit').map((arg) => arg === '/k' ? '/c' : arg);
+    const output = execFileSync(`${shell}.exe`, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    assert.deepEqual(JSON.parse(output.trim()), { args: values, token: 'independent;$PATH%PATH%"value' });
+    assert.equal(process.env.AGENT_V2_TEST_TOKEN, undefined);
+  });
+}
+
+test('V2 rejects oversized CMD candidates before launch while preserving the larger PowerShell limit', () => {
+  const options = {
+    workdir: process.cwd(), title: 'safe-long-test',
+    invocation: { file: process.execPath, args: ['-e', 'console.log(process.argv[1].length)', 'x'.repeat(3400)] },
+  };
+  assert.throws(() => require('./spawn-session').buildEngineSpawnCommand({ ...options, shell: 'cmd' }), /CMD.*8191/);
+  assert.ok(require('./spawn-session').buildEngineSpawnCommand(options).argv.includes('-EncodedCommand'));
+});
+
 test('U2 full OS table probe preserves identity evidence and surfaces failures without changing V1 PID output', () => {
   const { observeProcessTable, buildProcessTableArgs } = require('./spawn-session');
   const value = { complete: true, hostname: 'host', host_boot_id: '2026-09-17T00:00:00Z',

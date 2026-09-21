@@ -2,10 +2,10 @@
 
 A Claude Code plugin (in active development) for multi-phase, multi-session
 builds. You write a YAML manifest describing phases and agent roles, and
-the orchestrator spawns visible Claude Code sessions in Windows Terminal
+the V1 orchestrator spawns visible Claude Code sessions in Windows Terminal
 tabs, polls a file-drop protocol for completion signals, and advances
-phases. Review loops, crash recovery, prompt injection, and email
-notifications are planned for later units.
+phases. V1 includes review loops, crash recovery, and prompt injection;
+email notifications remain deferred.
 
 **Current shipped scope:** V1 feature-complete (Units 0-8 + Unit 11). The
 `/orchestrate` skill validates a manifest, scaffolds the protocol, and
@@ -14,7 +14,54 @@ injects prompts via the SessionStart hook, runs review loops, and
 recovers from crashes. The orchestrator runs zero Claude context. See
 the status table below for unit-by-unit detail.
 
-## Current status
+## V2 offline delivery
+
+V2 has durable state/ownership, fixture-backed attempt lifecycles, event
+projection, and read-only progress snapshots. Offline helpers prepare
+attempt-bound engine candidates and a relocatable plugin package.
+**Production V2 dispatch remains disabled.** Packaging, capability probes,
+and hook receipts do not establish live engine support.
+
+The candidate adapters distinguish direct Claude, Agency/Claude, and
+Agency/Copilot. They require native Windows `.exe` installations on PATH,
+Node.js >=20, and explicit supported engine/model/permission mappings.
+An earlier shell shim on PATH is rejected rather than silently skipped.
+Read-only enforcement and descendant tracking are not proven by these
+offline adapters. Native process/session correlation, immutable per-run
+executable/preflight binding, runtime integration, and separately authorized
+live acceptance remain required before U3 is complete.
+
+### Build the offline package
+
+Run from `agent-orchestrator\scripts`, using a new absolute output directory
+outside the checkout whose parent already exists:
+
+```powershell
+npm run package:plugin -- --output C:\artifacts\agent-orchestrator
+```
+
+The command builds a directory containing the plugin components and locked
+runtime dependencies, then writes `package-inventory.json` with sorted
+SHA-256 file hashes. It runs `npm ci --omit=dev --ignore-scripts --no-audit
+--no-fund` inside the staging directory and refuses to replace an existing
+output. Node itself is not bundled. The packager excludes test/fixture
+paths, hidden entries, and named secret/credential paths; never place
+secrets inside runtime source files.
+
+Agency loading does not run this build or install npm dependencies on the
+package's behalf. A successful build establishes filesystem/runtime
+packaging only, not installed-engine plugin discovery.
+The source-checkout test entrypoints include offline adapter/channel/package
+and Copilot-hook tests. The twelve live-acceptance cases remain explicit
+skips with unimplemented procedures; removing a skip cannot turn them into
+a passing acceptance result.
+
+See `docs\manifest-reference.md` for V1/V2 configuration boundaries and
+`docs\runtime-state-reference.md` for canonical state and observation
+contracts. A live run requires a dedicated disposable checkout and separate
+authorization; do not enable production through the fixture adapter.
+
+## V1 status
 
 | Unit | What | Status |
 |---|---|---|
@@ -49,7 +96,7 @@ node orchestrate-prototype.js manifest-example.yaml
 
 Details, CLI flags, and a no-Claude smoke test: [`prototype/README.md`](./prototype/README.md).
 
-## Architecture (once V1 ships)
+## V1 architecture
 
 ```
 User ── /orchestrate ──► Claude Code session (thin skill entry point)
@@ -73,9 +120,11 @@ LLM in the main loop).
 ## Prerequisites
 
 - Windows 11 with Windows Terminal on `PATH` (`where.exe wt`)
-- Node.js ≥ 18 (tested on v22.22.2)
-- Claude Code CLI, invoked directly or via a wrapper (this project supports
-  Microsoft's `agency claude --enable-auto-mode` out of the box)
+- Node.js >=20; Windows PowerShell and Git on PATH for workspace ownership
+- For V1, Claude Code CLI invoked directly or through its configured wrapper
+- For offline V2 candidates, native `claude.exe` or `agency.exe` on PATH;
+  installed versions, capabilities, and actual live behavior still require
+  the separate acceptance gate
 
 ## Docs
 

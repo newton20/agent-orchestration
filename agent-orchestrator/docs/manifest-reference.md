@@ -21,6 +21,7 @@ name: my-feature
 workdir: .
 defaults:
   engine: agency-copilot
+  permission_mode: default
   phase_timeout_minutes: 60
   heartbeat_timeout_minutes: 5
 terminal:
@@ -41,7 +42,37 @@ override `engine`, `access`, and `workdir`. Access defaults to `mutating`;
 the other value is `read-only`. A phase cannot contain both forms or
 duplicate roles. Engine executable resolution, permission/model mappings,
 and enforcement of read-only access require adapter acceptance before
-dispatch can be enabled.
+dispatch can be enabled. Schema validation is not proof that an adapter can
+enforce a requested mode.
+
+### Offline adapter boundaries
+
+The offline candidate API recognizes `claude`, `agency-claude`, and
+`agency-copilot` separately. It resolves a native `.exe` from PATH and rejects
+shell shims; a follow-up must persist the resolved path and preflight hash
+as an immutable per-run binding before external launch effects.
+The controller does not yet select or launch these adapters in production.
+
+| Setting | Offline candidate behavior |
+|---|---|
+| `engine` | Direct Claude uses `claude.exe`; the two Agency adapters use `agency.exe` with their selected engine. |
+| `model` | An explicit model requires evidence in the selected engine's installed help; no alias is substituted. Omit it to leave selection to the engine. |
+| `permission_mode` | Missing/default candidate policy is `default`. Agency/Copilot accepts only that policy. Claude maps it to the installed CLI's `manual` spelling; other non-bypass modes also require installed-help evidence. |
+| `access` | `mutating` is supported for candidate preparation. `read-only` is rejected because enforcement is unproven. |
+| `terminal.shell` | `powershell` or `cmd` hosts literal argument construction; it does not authorize engine launch. |
+
+Do not carry V1's `bypassPermissions`, raw flags, or Claude model aliases
+into a V2 Copilot example. A policy accepted by the manifest schema may
+still be rejected by an engine candidate. Candidate preflight can invoke
+the installed selected engine's version/help; an Agency probe may require
+provisioning, so preparation is not a substitute for authorized acceptance.
+
+`prepareCandidate` returns `live_verified: false`, and `launch()` remains
+disabled. Startup/submitted-task receipts preserve attempt identity, but
+context injection, a hook-provided PID, a wrapper PID, or a session-name
+match cannot prove the native engine process or task execution. Production
+integration must supply independent session/process correlation and retain
+conservative closure handling.
 
 All working directories resolve relative to the manifest directory unless
 absolute. Each must exist inside a Git worktree. Separate existing
