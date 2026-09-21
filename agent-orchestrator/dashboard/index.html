@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Orchestration / Run observer</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to run status</a>
+  <header class="masthead">
+    <div><p class="eyebrow">LOCAL ORCHESTRATION</p><h1>Run observer</h1></div>
+    <span class="read-only">Read-only</span>
+  </header>
+  <main id="main">
+    <div class="toolbar"><p>Committed progress and the evidence behind it.</p><button id="refresh" type="button">Refresh observation</button></div>
+    <div id="notice" role="status" aria-live="polite"><p class="notice">Loading dashboard snapshot...</p></div>
+    <section id="access" class="panel access" aria-labelledby="access-title" hidden>
+      <p class="eyebrow">LOCAL ACCESS</p>
+      <h2 id="access-title">Enter your one-use code</h2>
+      <p>In your local terminal, run <code>node dashboard-server.js access &lt;manifest-path&gt;</code> from the installed scripts directory. Enter the code here within 60 seconds. Access lasts 15 minutes.</p>
+      <p>Codes belong only in this form, never in a URL or shared log.</p>
+      <form id="access-form">
+        <label for="access-code">One-use access code</label>
+        <input id="access-code" type="password" required maxlength="128" autocomplete="off" spellcheck="false" aria-describedby="access-error">
+        <button id="access-submit" type="submit">Open read-only dashboard</button>
+        <p id="access-error" role="alert"></p>
+      </form>
+    </section>
+    <div id="dashboard" hidden>
+      <section class="panel" aria-labelledby="run-title">
+        <h2 id="run-title">Run identity</h2><div id="identity"></div>
+      </section>
+      <section class="panel" aria-labelledby="freshness-title">
+        <h2 id="freshness-title">Observation and freshness</h2><div id="freshness"></div>
+      </section>
+      <section class="panel" aria-labelledby="phases-title">
+        <h2 id="phases-title">Phases and roles</h2><div id="phases"></div>
+      </section>
+      <div class="detail-grid">
+        <section class="panel" aria-labelledby="attempt-title">
+          <h2 id="attempt-title">Selected attempt / evidence</h2><div id="attempt"></div>
+        </section>
+        <section class="panel" aria-labelledby="timeline-title">
+          <h2 id="timeline-title">Transition timeline</h2><div id="timeline"></div>
+        </section>
+      </div>
+    </div>
+    <noscript><p class="notice warning">JavaScript is required for local authentication and read-only observations.</p></noscript>
+  </main>
+  <footer>Local companion / No scheduling controls / Worker reports are untrusted evidence</footer>
+</body>
+</html>
