@@ -347,9 +347,81 @@ Ordinary restarts preserve artifacts, events, paused state, and the
 accepted snapshot. Authoring validation errors/drift are reported
 separately, without replacing the run.
 
-Live engine acceptance, authenticated operator mutations, and dashboard
-services remain separate integrations. Event projection and read-only
-snapshots do not satisfy those gates.
+Live engine acceptance and authenticated workflow mutations remain separate
+integrations. The read-only dashboard backend below adds neither capability;
+frontend integration and combined browser acceptance remain separate gates.
+
+## Read-only dashboard companion
+
+`dashboard-server.js` provides
+`<start|serve|status|stop|access> <manifest-path>`. The companion holds only
+the `dashboard` namespace claim and its private service-control capability.
+It cannot acquire scheduler mutation authority, project outbox records,
+rewrite canonical state, or launch workers.
+
+`start` runs a detached process and waits for readiness; `serve` remains in
+the foreground. Discovery binds a canonical workspace, manifest path, and
+live service ID to an OS-selected `127.0.0.1` port. A stored port or PID
+alone cannot authorize status or stop. Repeated starts for the same manifest
+reuse the live service; another manifest in that workspace conflicts.
+`status`, `stop`, and `access` support `--workspace <original-directory>`
+when authoring/state reads are unavailable. An optional exact service ID
+after the manifest further scopes `stop`.
+
+`access` displays a one-use bootstrap code only to a human interactive
+terminal. Codes expire after 60 seconds; at most eight unexpired codes may
+exist. The private `CODE_LIMIT` diagnostic is not a browser HTTP response.
+The browser submits the code to `POST /api/bootstrap` with same-origin
+JSON. Success returns 204 and a service-specific `HttpOnly`,
+`SameSite=Strict`, `Path=/` cookie. Sessions expire after 900 seconds; codes
+and sessions are memory-only and invalidated at service restart. No
+credential belongs in a URL.
+
+The server validates its exact Host and any supplied Origin, requires Origin
+for bootstrap, grants no CORS access, and marks responses `no-store`.
+Browser cookies grant read-only inspection, not service stop or workflow
+commands. This is not a hostile-local-process sandbox: cookies are
+host-scoped, not isolated by loopback port.
+
+The versioned contract and sanitized fixtures are
+`scripts\test-support\dashboard-contract.json`. The HTTP wrappers add
+`schema_version` and `service_id`; U4 snapshots remain unchanged.
+
+| Route | Contract |
+|---|---|
+| `GET /api/session` | Authenticated session expiry and read-only identity; expired/absent sessions require access again. |
+| `GET /api/snapshot` | Optional `run_id`; returns snapshot, separate controller-service observation, and `stream.after: null`. |
+| `GET /api/events` | Required `run_id`, optional delivered `after` cursor and bounded `limit`; preserve `reset_required` and history diagnostics. |
+| `GET /api/stream` | SSE for one selected run; `Last-Event-ID` takes precedence over `after` on reconnect. |
+| `GET /api/artifact` | Exact run/phase/role/iteration/attempt identity and allowlisted kind; returns untrusted text and current/accepted hashes, never an arbitrary path or prompt. |
+
+An SSE `observation` has no event ID and is emitted once per second even
+without canonical changes. Its `current_run_id` lets a current-run view
+notice rerun. Refresh the snapshot when revision/current-run changes.
+An `events` frame uses the last actually delivered event ID; deduplicate
+timeline records by run and event ID without using events as progress
+reducers. A `reset` clears EventSource's last ID and requests a fresh
+snapshot plus replay from null. Snapshot/latest cursors may lead projection
+and must not replace the delivered cursor.
+
+SSE `error` frames have no event ID. `STATE_UNAVAILABLE` is recoverable on
+later observation; `AUTH_EXPIRED` closes the stream and requires a new access
+flow. Slow clients are disconnected rather than queued without bounds.
+Reader observation time advances only after a successful read. Workspace
+service readiness remains separate from run-correlated controller health.
+
+Limits include 2 MiB snapshots, 64 KiB artifacts, 256 KiB static files,
+1 KiB request bodies, eight streams, and 64 browser sessions. Event pages
+retain U4's 256-event/256-KiB bounds. Errors use fixed redacted messages,
+not raw filesystem exceptions, state, prompts, or credentials.
+
+Only `dashboard\index.html`, `dashboard\app.js`, and `dashboard\styles.css`
+are served as static assets. They are separately owned frontend files;
+their absence returns `UI_UNAVAILABLE`, not a successful placeholder.
+Initial redirected/aliased static roots are rejected. Real-browser
+authentication/reconnect and actual TCP backpressure/stop-flush acceptance
+remain unproven until separately exercised; known transient stop/discovery
+failures require retry rather than guessing ownership.
 
 ## Attempt lifecycle
 

@@ -61,6 +61,54 @@ See `docs\manifest-reference.md` for V1/V2 configuration boundaries and
 contracts. A live run requires a dedicated disposable checkout and separate
 authorization; do not enable production through the fixture adapter.
 
+### Read-only dashboard backend
+
+The loopback companion exposes authenticated snapshots, events, and bounded
+artifact reads independently of the controller. It never schedules workers,
+projects the outbox, or changes canonical state. Frontend assets and combined
+browser acceptance are not included yet; opening `/` returns
+`503 UI_UNAVAILABLE` until the UI is integrated.
+
+From `agent-orchestrator\scripts`, replace the example manifest path with
+the run you want to inspect:
+
+```powershell
+node .\dashboard-server.js start C:\projects\example\manifest.yaml
+node .\dashboard-server.js status C:\projects\example\manifest.yaml
+node .\dashboard-server.js access C:\projects\example\manifest.yaml
+node .\dashboard-server.js stop C:\projects\example\manifest.yaml
+```
+
+`start` detaches the companion and waits for readiness. `serve` runs it in
+the foreground. Repeated starts discover the same service for that manifest;
+another manifest in the same workspace is a conflict. The package's
+`dashboard-server` bin points to the same entrypoint.
+
+Only run `access` in your own interactive terminal. It displays a one-use
+code valid for 60 seconds; machine output provides instructions, not a code.
+Browser sessions last 15 minutes and expire on service restart. Codes and
+cookies belong in neither URLs nor logs. The installed UI will collect the
+code locally; backend delivery alone is not a finished browser workflow.
+
+For recovery when the manifest or status is unavailable, `status`, `stop`,
+and `access` accept `--workspace` with the original Git workspace directory.
+`stop` may also take an exact service ID after the manifest path. It stops
+only that companion, not the controller or its workers. Status comes from
+live service identity rather than trusting a stored port or PID.
+
+The snapshot/SSE/auth/error contract and sanitized examples are in
+`scripts\test-support\dashboard-contract.json` in the source checkout.
+Keep snapshot progress authoritative, use delivered event IDs for reconnect,
+and display projection/history gaps. One-second companion observation is
+not evidence that a controller or worker is alive.
+
+This service is for a trusted local operator, not isolation from hostile
+same-user processes. Loopback cookies are host-scoped rather than
+port-isolated. Rejected aliased static roots, transient concurrent
+stop/discovery failures, real-socket backpressure/stop flush behavior, and
+near-limit polling cost remain documented platform acceptance concerns.
+Never resolve a diagnostic by deleting scheduler ownership records.
+
 ## V1 status
 
 | Unit | What | Status |

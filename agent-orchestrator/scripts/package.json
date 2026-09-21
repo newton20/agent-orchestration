@@ -9,10 +9,11 @@
     "spawn-session": "./spawn-session.js",
     "generate-prompt": "./generate-prompt.js",
     "check-health": "./check-health.js",
-    "orchestrate": "./orchestrate.js"
+    "orchestrate": "./orchestrate.js",
+    "dashboard-server": "./dashboard-server.js"
   },
   "scripts": {
-    "test": "node --test parse-manifest.test.js scaffold-protocol.test.js spawn-session.test.js generate-prompt.test.js check-health.test.js orchestrate.test.js state-store.test.js workspace-owner.test.js attempt-lifecycle.test.js event-log.test.js read-model.test.js engine-adapters.test.js attempt-channel.test.js engine-acceptance.test.js package-plugin.test.js",
+    "test": "node --test parse-manifest.test.js scaffold-protocol.test.js spawn-session.test.js generate-prompt.test.js check-health.test.js orchestrate.test.js state-store.test.js workspace-owner.test.js attempt-lifecycle.test.js event-log.test.js read-model.test.js engine-adapters.test.js attempt-channel.test.js engine-acceptance.test.js package-plugin.test.js dashboard-server.test.js",
     "package:plugin": "node package-plugin.js"
   },
   "dependencies": {

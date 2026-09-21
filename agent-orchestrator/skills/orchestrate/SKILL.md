@@ -45,6 +45,33 @@ The developer dependency-install step below applies to a source checkout.
 See `agent-orchestrator\README.md` in the source repository for the complete
 packaging invocation.
 
+### Inspecting through the read-only companion
+
+Use the installed plugin's `scripts\dashboard-server.js` entrypoint with
+`start`, `serve`, `status`, `stop`, or `access` and the target manifest path.
+Resolve the actual installed plugin root; do not start a second scheduler
+or grant the companion its mutation capability. `start` reports ready only
+after a separate companion process responds; `serve` remains in foreground.
+The companion may inspect historical state while the controller is stopped.
+
+For `access`, direct the operator to their own interactive terminal.
+Do not capture, relay, log, or paste the one-use code through an agent
+session. Noninteractive output gives the service URL and instructions, not
+the credential. `status`, `stop`, and `access` may use `--workspace` with the
+original Git workspace when the manifest or status is unavailable.
+Use an exact service ID for a targeted stop when supplied.
+
+The frontend is a separate delivery. Until its assets are integrated, the
+root page returns `UI_UNAVAILABLE`; do not describe that as a working web UI
+or create a success-shaped placeholder. Treat the contract at
+`scripts\test-support\dashboard-contract.json` in the source checkout as the
+frontend handoff, not evidence of actual browser acceptance.
+Keep reported completion, independent verification, reader freshness, and
+controller/worker liveness distinct. Backend availability never enables
+production engine dispatch.
+
+### Starting the V1 controller
+
 When the user invokes this skill with a manifest path:
 
 1. **Ensure dependencies are installed.** This MUST run before any
