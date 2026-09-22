@@ -8,12 +8,16 @@ const { createHash } = require('node:crypto');
 
 const INVENTORY_FILENAME = 'package-inventory.json';
 const NPM_CI_ARGS = Object.freeze(['ci', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund']);
-const COMPONENTS = ['.claude-plugin', 'agency.json', 'hooks', 'scripts', 'templates', 'skills'];
+const COMPONENTS = ['.claude-plugin', 'agency.json', 'hooks', 'scripts', 'templates', 'skills', 'dashboard'];
 const OPTIONAL_FILES = ['hooks.json'];
-const REQUIRED_FILES = ['.claude-plugin/plugin.json', 'agency.json', 'scripts/package.json', 'scripts/package-lock.json'];
+const REQUIRED_FILES = [
+  '.claude-plugin/plugin.json', 'agency.json', 'scripts/package.json', 'scripts/package-lock.json',
+  'dashboard/index.html', 'dashboard/app.js', 'dashboard/styles.css',
+];
 const EXCLUDED_NAMES = /^(?:node_modules|tests?|__tests__|test-support|fixtures?|__fixtures__|coverage|secrets?|credentials?)(?:[._-]|$)/i;
 const TEST_NAME = /(?:^|[._-])(?:test|spec)(?:[._-]|$)/i;
 const EXTENSIONS = {
+  dashboard: new Set(['.html', '.js', '.css']),
   scripts: new Set(['.js', '.cjs', '.mjs', '.json']),
   hooks: new Set(['.js', '.cjs', '.mjs', '.json', '.cmd', '.bat', '.ps1', '.sh']),
   templates: new Set(['.md', '.txt', '.json', '.yaml', '.yml']),

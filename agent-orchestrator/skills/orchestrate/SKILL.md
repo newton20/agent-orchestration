@@ -61,11 +61,13 @@ the credential. `status`, `stop`, and `access` may use `--workspace` with the
 original Git workspace when the manifest or status is unavailable.
 Use an exact service ID for a targeted stop when supplied.
 
-The frontend is a separate delivery. Until its assets are integrated, the
-root page returns `UI_UNAVAILABLE`; do not describe that as a working web UI
-or create a success-shaped placeholder. Treat the contract at
-`scripts\test-support\dashboard-contract.json` in the source checkout as the
-frontend handoff, not evidence of actual browser acceptance.
+The package includes the read-only frontend. Direct the operator to the
+reported loopback URL to enter their code locally, inspect the current run,
+or select historical evidence. If the root page returns `UI_UNAVAILABLE`,
+report an incomplete artifact and rebuild the package; do not create a
+success-shaped placeholder. The contract at
+`scripts\test-support\dashboard-contract.json` in the source checkout
+documents the API, not live engine acceptance.
 Keep reported completion, independent verification, reader freshness, and
 controller/worker liveness distinct. Backend availability never enables
 production engine dispatch.

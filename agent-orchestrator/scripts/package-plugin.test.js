@@ -51,6 +51,9 @@ function fixture(t) {
     'templates/prompt.md': 'A runtime prompt.\n',
     'skills/run/SKILL.md': 'A runtime skill.\n',
     'skills/run/references/detail.md': 'Runtime reference.\n',
+    'dashboard/index.html': '<!doctype html><script src="/app.js" defer></script><link rel="stylesheet" href="/styles.css">\n',
+    'dashboard/app.js': '"use strict";\n',
+    'dashboard/styles.css': 'body { color: black; }\n',
   };
   for (const [relative, content] of Object.entries(files)) write(sourceRoot, relative, content);
   const installer = async ({ cwd, args, env }) => {
@@ -90,6 +93,8 @@ test('packages only runtime components and installs dependencies in the staged a
     'hooks/session-start.test.js', 'hooks/tests/helper.js', 'hooks/secret.json',
     'templates/.env', 'templates/secrets.md', 'skills/run/.git/config',
     'skills/run/test-support/sample.md',
+    'dashboard/app.test.js', 'dashboard/app.spec.js', 'dashboard/test-support/input.js',
+    'dashboard/.env', 'dashboard/credentials.json', 'dashboard/app.js.map',
   ];
   for (const relative of excluded) write(fx.sourceRoot, relative, 'DO NOT SHIP\n');
   const originalFiles = filesBelow(fx.sourceRoot);
@@ -120,6 +125,9 @@ test('a moved package resolves its own dependencies without the source checkout'
   });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout, 'installed-from-lock');
+  for (const filename of ['index.html', 'app.js', 'styles.css']) {
+    assert.equal(fs.readFileSync(path.join(moved, 'dashboard', filename), 'utf8'), fx.files[`dashboard/${filename}`]);
+  }
 });
 
 test('inventory is sorted, hashes every delivered file, and is stable across output names and mtimes', async (t) => {
@@ -134,6 +142,8 @@ test('inventory is sorted, hashes every delivered file, and is stable across out
   assert.equal(inventory.algorithm, 'sha256');
   assert.deepEqual(inventory, first.inventory);
   assert.deepEqual(inventory.files.map(file => file.path), filesBelow(fx.output).filter(file => file !== INVENTORY_FILENAME));
+  assert.deepEqual(inventory.files.filter(file => file.path.startsWith('dashboard/')).map(file => file.path),
+    ['dashboard/app.js', 'dashboard/index.html', 'dashboard/styles.css']);
   for (const file of inventory.files) {
     const bytes = fs.readFileSync(path.join(fx.output, file.path));
     assert.deepEqual(file, { path: file.path, size: bytes.length, sha256: hash(bytes) });
@@ -240,6 +250,20 @@ test('rejects missing metadata, missing lockfiles and local linked dependencies 
   fs.writeFileSync(lockPath, JSON.stringify(lock));
   await assert.rejects(packagePlugin(fx), /lock|link|local|integrity/i);
   assert.deepEqual(fs.readdirSync(fx.root), ['checkout']);
+});
+
+test('requires every dashboard asset before installation or publication', async (t) => {
+  for (const filename of ['index.html', 'app.js', 'styles.css']) {
+    const fx = fixture(t);
+    fs.unlinkSync(path.join(fx.sourceRoot, 'dashboard', filename));
+    let installs = 0;
+    await assert.rejects(packagePlugin({ ...fx, installer: async request => {
+      installs++;
+      await fx.installer(request);
+    } }), /required|missing|ENOENT/i);
+    assert.equal(installs, 0);
+    assert.deepEqual(fs.readdirSync(fx.root), ['checkout']);
+  }
 });
 
 test('rejects installer mutation of pinned inputs and missing installed runtime dependencies', async (t) => {
