@@ -101,14 +101,15 @@ function page(runId, events, extra = {}) {
     reset_required: false, history: { status: 'complete', gaps: [], diagnostic: null }, ...extra };
 }
 
-function clientFixture(envelopes) {
+function clientFixture(envelopes, sessions = []) {
   const requests = [];
   const streams = [];
   const queue = [...envelopes];
+  const sessionQueue = [...sessions];
   class Source {
-    constructor(url) { this.url = url; this.listeners = {}; this.closed = false; streams.push(this); }
+    constructor(url) { this.url = url; this.listeners = {}; this.closed = false; this.readyState = 0; streams.push(this); }
     addEventListener(name, fn) { this.listeners[name] = fn; }
-    close() { this.closed = true; }
+    close() { this.closed = true; this.readyState = 2; }
     emit(name, data) { this.listeners[name]?.({ data: data === undefined ? undefined : JSON.stringify(data) }); }
   }
   const model = UI.createModel();
@@ -116,14 +117,20 @@ function clientFixture(envelopes) {
     model, EventSource: Source,
     fetch: async (url, options) => {
       requests.push({ url, options });
-      if (url === '/api/session') return { ok: true, status: 200, json: async () => ({ service_id: 'fixture-service' }) };
-      const value = queue.shift();
+      const value = url === '/api/session' ? sessionQueue.shift() ?? { service_id: 'fixture-service' } : queue.shift();
       if (value instanceof Error) throw value;
+      if (typeof value === 'function') return value();
       return { ok: !value?.error, status: value?.error ? 401 : 200, json: async () => value };
     },
     onChange() {},
   });
   return { model, client, requests, streams, queue };
+}
+
+function clockFixture(t) {
+  let now = NOW;
+  t.mock.method(Date, 'now', () => now);
+  return { advance(ms) { now += ms; } };
 }
 
 test('U5 complete U4 snapshots drive progress; pending projection never becomes a delivered cursor', (t) => {
@@ -174,16 +181,219 @@ test('U5 reset replay cursor follows newly delivered history even when retained 
   assert.equal(model.timeline.length, 2);
 });
 
-test('U5 permanently closed EventSource is replaced after a successful session snapshot', async (t) => {
+test('U5 retry: repeated CLOSED errors use bounded backoff without a snapshot or stream storm', async (t) => {
   const fx = fixture(t);
-  const ctx = clientFixture([fx.envelope(), fx.envelope()]);
+  const delivered = fx.event();
+  fx.event(false);
+  const clock = clockFixture(t);
+  const ctx = clientFixture(Array.from({ length: 30 }, () => fx.envelope()));
+  t.after(() => ctx.client.stop());
+  await ctx.client.start();
+  ctx.streams[0].emit('events', page(fx.state.run_id, [delivered]));
+  for (const delay of [5000, 10000, 20000, 30000, 30000]) {
+    const count = ctx.streams.length;
+    const requests = ctx.requests.length;
+    for (let i = 0; i < 25; i++) {
+      ctx.streams.at(-1).readyState = 2;
+      ctx.streams.at(-1).emit('error');
+      await ctx.client.idle();
+    }
+    assert.equal(ctx.streams.length, count, 'rejected streams must wait before replacement');
+    assert.equal(ctx.requests.length, requests + 1, 'only one immediate authentication check per closed stream');
+    assert.equal(ctx.streams.at(-1).closed, true);
+    assert.equal(ctx.model.connection, 'disconnected');
+    clock.advance(delay - 1);
+    ctx.client.tick();
+    await ctx.client.idle();
+    assert.equal(ctx.streams.length, count);
+    clock.advance(1);
+    ctx.client.tick();
+    await ctx.client.idle();
+    assert.equal(ctx.streams.length, count + 1);
+    assert.equal(new URL(ctx.streams.at(-1).url, 'http://localhost').searchParams.get('after'), delivered.event_id);
+    assert.equal(ctx.model.timeline.length, 1);
+    assert.equal(ctx.model.snapshot.history.status, 'gap');
+  }
+});
+
+test('U5 retry: transient initial session failures recover automatically with capped backoff', async (t) => {
+  const fx = fixture(t);
+  const clock = clockFixture(t);
+  const ctx = clientFixture([fx.envelope()], Array.from({ length: 5 }, () => new TypeError('fetch failed')));
+  t.after(() => ctx.client.stop());
+  await ctx.client.start();
+  assert.equal(ctx.model.connection, 'disconnected');
+  assert.equal(ctx.model.authenticated, false);
+  let sessionRequests = 1;
+  for (const delay of [5000, 10000, 20000, 30000, 30000]) {
+    clock.advance(delay - 1);
+    for (let i = 0; i < 12; i++) ctx.client.tick();
+    await ctx.client.idle();
+    assert.equal(ctx.requests.filter(({ url }) => url === '/api/session').length, sessionRequests);
+    clock.advance(1);
+    ctx.client.tick();
+    await ctx.client.idle();
+    assert.equal(ctx.requests.filter(({ url }) => url === '/api/session').length, ++sessionRequests);
+  }
+  assert.equal(ctx.model.authenticated, true);
+  assert.equal(ctx.model.connection, 'connected');
+  assert.equal(ctx.model.snapshot.run_id, fx.state.run_id);
+  assert.equal(ctx.streams.length, 1);
+});
+
+test('U5 retry: ticks coalesce a slow session retry and stop fences its late response', async (t) => {
+  const clock = clockFixture(t);
+  let resolveSession;
+  const ctx = clientFixture([], [new TypeError('fetch failed'),
+    () => new Promise((resolve) => { resolveSession = resolve; })]);
+  t.after(() => ctx.client.stop());
+  await ctx.client.start();
+  clock.advance(5000);
+  ctx.client.tick();
+  assert.equal(ctx.requests.length, 2);
+  clock.advance(60000);
+  for (let i = 0; i < 12; i++) ctx.client.tick();
+  assert.equal(ctx.requests.length, 2);
+  ctx.client.stop();
+  resolveSession({ ok: true, status: 200, json: async () => ({ service_id: 'fixture-service' }) });
+  await new Promise((resolve) => setImmediate(resolve));
+  ctx.client.tick();
+  await ctx.client.idle();
+  assert.equal(ctx.model.authenticated, false);
+  assert.equal(ctx.requests.length, 2);
+  assert.equal(ctx.streams.length, 0);
+});
+
+test('U5 retry: explicit session access errors never retry', async (t) => {
+  const clock = clockFixture(t);
+  for (const code of ['AUTH_REQUIRED', 'AUTH_EXPIRED']) {
+    const ctx = clientFixture([], [new TypeError('fetch failed'), { error: { code } }]);
+    t.after(() => ctx.client.stop());
+    await ctx.client.start();
+    clock.advance(5000);
+    ctx.client.tick();
+    await ctx.client.idle();
+    assert.equal(ctx.model.connection, 'access');
+    const requests = ctx.requests.length;
+    for (let i = 0; i < 12; i++) {
+      clock.advance(60000);
+      ctx.client.tick();
+      await ctx.client.idle();
+    }
+    assert.equal(ctx.requests.length, requests);
+    assert.equal(ctx.model.authenticated, false);
+  }
+});
+
+test('U5 retry: HTTP 401 remains terminal even when the response body is not JSON', async (t) => {
+  const clock = clockFixture(t);
+  const ctx = clientFixture([], [() => ({
+    ok: false, status: 401, json: async () => { throw new SyntaxError('Unexpected token'); },
+  })]);
+  t.after(() => ctx.client.stop());
+  await ctx.client.start();
+  assert.equal(ctx.model.connection, 'access');
+  clock.advance(60000);
+  ctx.client.tick();
+  await ctx.client.idle();
+  assert.equal(ctx.requests.length, 1);
+});
+
+test('U5 retry: CLOSED errors check authentication immediately and expiry cancels replacement', async (t) => {
+  const fx = fixture(t);
+  const clock = clockFixture(t);
+  const ctx = clientFixture([fx.envelope(), { error: { code: 'AUTH_EXPIRED' } }]);
+  t.after(() => ctx.client.stop());
   await ctx.client.start();
   ctx.streams[0].readyState = 2;
   ctx.streams[0].emit('error');
   await ctx.client.idle();
+  assert.equal(ctx.model.connection, 'access');
+  assert.equal(ctx.model.snapshot, null);
+  const requests = ctx.requests.length;
+  clock.advance(60000);
+  ctx.client.tick();
+  await ctx.client.idle();
+  assert.equal(ctx.requests.length, requests);
+  assert.equal(ctx.streams.length, 1);
+});
+
+test('U5 retry: stop and run selection cancel obsolete session retries', async (t) => {
+  const clock = clockFixture(t);
+  for (const cancel of [(client) => client.stop(), (client) => client.selectRun('selected-run')]) {
+    const ctx = clientFixture([], [new TypeError('fetch failed')]);
+    t.after(() => ctx.client.stop());
+    await ctx.client.start();
+    await cancel(ctx.client);
+    clock.advance(60000);
+    for (let i = 0; i < 12; i++) ctx.client.tick();
+    await ctx.client.idle();
+    assert.equal(ctx.requests.length, 1);
+    assert.equal(ctx.streams.length, 0);
+  }
+});
+
+test('U5 retry: run selection cancels old stream backoff and stop prevents replacement', async (t) => {
+  const fx = fixture(t);
+  const clock = clockFixture(t);
+  const original = fx.envelope();
+  const other = structuredClone(original);
+  other.snapshot.run_id = other.snapshot.current_run_id = randomUUID();
+  const ctx = clientFixture([original, original, other, other, other]);
+  t.after(() => ctx.client.stop());
+  await ctx.client.start();
+  ctx.streams[0].readyState = 2;
+  ctx.streams[0].emit('error');
+  await ctx.client.idle();
+  await ctx.client.selectRun(other.snapshot.run_id);
   assert.equal(ctx.streams.length, 2);
-  assert.equal(ctx.streams[0].closed, true);
+  assert.equal(new URL(ctx.streams[1].url, 'http://localhost').searchParams.get('run_id'), other.snapshot.run_id);
+  const requests = ctx.requests.length;
+  ctx.streams[0].emit('error', { error: { code: 'AUTH_EXPIRED' } });
+  clock.advance(5000);
+  ctx.client.tick();
+  await ctx.client.idle();
+  assert.equal(ctx.streams.length, 2);
+  assert.equal(ctx.requests.length, requests + 1);
+  assert.equal(ctx.model.authenticated, true);
+  ctx.streams[1].readyState = 2;
+  ctx.streams[1].emit('error');
+  await ctx.client.idle();
+  const stoppedRequests = ctx.requests.length;
   ctx.client.stop();
+  clock.advance(60000);
+  ctx.client.tick();
+  await ctx.client.idle();
+  assert.equal(ctx.requests.length, stoppedRequests);
+  assert.equal(ctx.streams.length, 2);
+});
+
+test('U5 retry: CONNECTING keeps native reconnection and a healthy observation resets backoff', async (t) => {
+  const fx = fixture(t);
+  const clock = clockFixture(t);
+  const ctx = clientFixture(Array.from({ length: 8 }, () => fx.envelope()));
+  t.after(() => ctx.client.stop());
+  await ctx.client.start();
+  ctx.streams[0].emit('error');
+  await ctx.client.idle();
+  assert.equal(ctx.streams.length, 1);
+  assert.equal(ctx.streams[0].closed, false);
+  ctx.streams[0].readyState = 2;
+  ctx.streams[0].emit('error');
+  await ctx.client.idle();
+  clock.advance(5000);
+  ctx.client.tick();
+  await ctx.client.idle();
+  assert.equal(ctx.streams.length, 2);
+  ctx.streams[1].emit('observation', { ...fx.envelope().snapshot, service_id: 'fixture-service' });
+  assert.equal(ctx.model.connection, 'connected');
+  ctx.streams[1].readyState = 2;
+  ctx.streams[1].emit('error');
+  await ctx.client.idle();
+  clock.advance(5000);
+  ctx.client.tick();
+  await ctx.client.idle();
+  assert.equal(ctx.streams.length, 3);
 });
 
 test('U5 timeline is bounded, ordered and deduplicated by run plus event identity', (t) => {

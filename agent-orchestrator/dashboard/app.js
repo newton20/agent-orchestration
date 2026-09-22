@@ -3,6 +3,7 @@
 (function () {
   const TIMELINE_LIMIT = 512;
   const STALE_MS = 5000;
+  const RETRY_MAX_MS = 30000;
   const renderSignatures = new WeakMap();
   const ID_FIELDS = ['run_id', 'phase_id', 'role', 'review_iteration', 'attempt_id'];
   const list = (value) => Array.isArray(value) ? value : [];
@@ -120,10 +121,29 @@
     let sourceRun = null;
     let generation = 0;
     let pending = null;
+    let sessionPending = null;
     let refreshAgain = false;
     let lastRefresh = 0;
     let artifactRequest = 0;
     let stopped = false;
+    const streamRetry = { at: 0, delay: STALE_MS };
+    const sessionRetry = { at: 0, delay: STALE_MS };
+
+    function deferRetry(retry) {
+      retry.at = Date.now() + retry.delay;
+      retry.delay = Math.min(retry.delay * 2, RETRY_MAX_MS);
+    }
+
+    function resetRetry(retry) {
+      retry.at = 0;
+      retry.delay = STALE_MS;
+    }
+
+    function cancelRetries() {
+      resetRetry(streamRetry);
+      resetRetry(sessionRetry);
+      sessionPending = null;
+    }
 
     function closeStream() {
       source?.close();
@@ -135,6 +155,7 @@
       generation++;
       artifactRequest++;
       closeStream();
+      cancelRetries();
       pending = null;
       Object.assign(model, createModel(), { connection: 'access', error: message });
       onChange();
@@ -145,7 +166,11 @@
         credentials: 'same-origin', cache: 'no-store', signal: AbortSignal.timeout(10000), ...options,
       });
       if (response.status === 204) return null;
-      const data = await response.json();
+      let data;
+      try { data = await response.json(); } catch (error) {
+        if (!response.ok) error.status = response.status;
+        throw error;
+      }
       if (!response.ok) {
         const error = new Error(data?.error?.message || 'Dashboard request failed.');
         error.status = response.status;
@@ -156,7 +181,7 @@
     }
 
     function failed(error) {
-      if (error.status === 401) expire();
+      if (error.status === 401 || ['AUTH_EXPIRED', 'AUTH_REQUIRED'].includes(error.code)) expire();
       else {
         model.error = error.status ? error.message : 'Dashboard is unavailable. Retrying without changing run state.';
         model.connection = 'disconnected';
@@ -166,8 +191,9 @@
 
     function openStream() {
       const runId = model.snapshot?.run_id;
-      if (!runId || (source && sourceRun === runId)) return;
+      if (!runId || (source && sourceRun === runId) || Date.now() < streamRetry.at) return;
       closeStream();
+      streamRetry.at = 0;
       const query = new URLSearchParams({ run_id: runId });
       if (model.deliveredCursor) query.set('after', model.deliveredCursor);
       const stream = new EventSource(`/api/stream?${query}`);
@@ -176,7 +202,11 @@
       const listen = (name, handler) => stream.addEventListener(name, (event) => {
         if (source !== stream) return;
         if (name === 'error' && !event.data) {
-          if (stream.readyState === 2) closeStream();
+          if (stream.readyState === 2) {
+            closeStream();
+            // A successful HTTP auth check must not bypass a rejected stream's retry delay.
+            deferRetry(streamRetry);
+          }
           model.connection = 'disconnected';
           onChange();
           void refresh();
@@ -197,6 +227,7 @@
         handler(data);
       });
       listen('observation', (data) => {
+        resetRetry(streamRetry);
         model.connection = 'connected';
         model.error = null;
         const changed = applyObservation(model, data);
@@ -243,9 +274,11 @@
               expire('Dashboard service changed. Request a new local access code.');
               return;
             }
+            const previousRun = model.snapshot?.run_id;
             applySnapshot(model, envelope);
+            if (previousRun !== model.snapshot.run_id) resetRetry(streamRetry);
             model.error = null;
-            if (!source || !model.snapshot.run_id) model.connection = 'connected';
+            if ((!source && !streamRetry.at) || !model.snapshot.run_id) model.connection = 'connected';
             openStream();
             lastRefresh = Date.now();
             onChange();
@@ -260,18 +293,30 @@
       return operation;
     }
 
-    async function start() {
+    function start() {
+      if (sessionPending) return sessionPending;
       stopped = false;
+      sessionRetry.at = 0;
       model.connection = 'loading';
       onChange();
       const epoch = generation;
-      try {
-        const session = await request('/api/session');
-        if (epoch !== generation || stopped) return;
-        model.authenticated = true;
-        model.serviceId = session.service_id;
-        await refresh();
-      } catch (error) { if (epoch === generation && !stopped) failed(error); }
+      const operation = (async () => {
+        try {
+          const session = await request('/api/session');
+          if (epoch !== generation || stopped) return;
+          model.authenticated = true;
+          model.serviceId = session.service_id;
+          resetRetry(sessionRetry);
+          await refresh();
+        } catch (error) {
+          if (epoch !== generation || stopped) return;
+          failed(error);
+          if (model.connection !== 'access') deferRetry(sessionRetry);
+        }
+      })();
+      sessionPending = operation;
+      void operation.finally(() => { if (sessionPending === operation) sessionPending = null; });
+      return operation;
     }
 
     async function login(code) {
@@ -295,6 +340,7 @@
       generation++;
       artifactRequest++;
       closeStream();
+      cancelRetries();
       pending = null;
       model.selectedRun = runId || null;
       model.snapshot = null;
@@ -342,12 +388,22 @@
 
     return {
       start, login, refresh, selectRun, selectAttempt, loadArtifact,
-      idle: async () => { while (pending) await pending; },
+      idle: async () => { while (sessionPending || pending) await (sessionPending || pending); },
       tick() {
         onChange();
-        if (model.authenticated && Date.now() - lastRefresh >= STALE_MS) void refresh();
+        if (stopped || model.connection === 'access') return;
+        const now = Date.now();
+        if (!model.authenticated) {
+          if (sessionRetry.at && now >= sessionRetry.at) void start();
+        } else if ((streamRetry.at && now >= streamRetry.at) || now - lastRefresh >= STALE_MS) void refresh();
       },
-      stop() { stopped = true; generation++; artifactRequest++; closeStream(); },
+      stop() {
+        stopped = true;
+        generation++;
+        artifactRequest++;
+        closeStream();
+        cancelRetries();
+      },
     };
   }
 
