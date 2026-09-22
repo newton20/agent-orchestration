@@ -348,8 +348,7 @@ accepted snapshot. Authoring validation errors/drift are reported
 separately, without replacing the run.
 
 Live engine acceptance and authenticated workflow mutations remain separate
-integrations. The read-only dashboard backend below adds neither capability;
-frontend integration and combined browser acceptance remain separate gates.
+integrations. The read-only dashboard below adds neither capability.
 
 ## Read-only dashboard companion
 
@@ -416,12 +415,19 @@ retain U4's 256-event/256-KiB bounds. Errors use fixed redacted messages,
 not raw filesystem exceptions, state, prompts, or credentials.
 
 Only `dashboard\index.html`, `dashboard\app.js`, and `dashboard\styles.css`
-are served as static assets. They are separately owned frontend files;
-their absence returns `UI_UNAVAILABLE`, not a successful placeholder.
-Initial redirected/aliased static roots are rejected. Real-browser
-authentication/reconnect and actual TCP backpressure/stop-flush acceptance
-remain unproven until separately exercised; known transient stop/discovery
-failures require retry rather than guessing ownership.
+are served as static assets. Packaging requires all three and includes them
+in the SHA-256 inventory; it excludes frontend tests and fixtures.
+Their absence returns `UI_UNAVAILABLE`, not a successful placeholder.
+The UI follows the current run unless the operator pins historical state.
+Canonical snapshots determine progress; the bounded timeline and inert
+artifact text supply context without upgrading worker reports to independent
+verification. Reader freshness, run-correlated controller evidence, and
+workspace service observations remain separate.
+
+Initial redirected/aliased static roots are rejected. Actual TCP
+backpressure/stop-flush behavior and near-limit polling cost remain platform
+acceptance concerns; known transient stop/discovery failures require retry
+rather than guessing ownership.
 
 ## Attempt lifecycle
 
