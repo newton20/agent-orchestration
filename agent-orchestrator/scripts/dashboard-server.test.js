@@ -676,37 +676,45 @@ const closedPipe = () => Object.assign(new Error('write EPIPE'), { code: 'EPIPE'
 
 test('U5 discovery re-observes an instance that stops between readiness, private records and its control reply', { timeout: 60000 }, async (t) => {
   const queryOwner = W.queryOwner;
-  for (const stage of ['owner reply', 'private records', 'control reply', 'empty control reply', 'replacement owner']) await t.test(stage, async (t) => {
+  const stages = ['owner reply', 'private records', 'control reply', 'empty control reply', 'truncated control reply', 'replacement owner'];
+  for (const stage of stages) await t.test(stage, async (t) => {
     const fx = fixture(t);
     const service = await start(t, fx);
     const ready = await queryOwner(fx.state.workspace, { namespace: 'dashboard' });
     const directory = path.dirname(service.discoveryPath);
     const records = ['dashboard.json', 'dashboard-capability.json']
       .map((name) => [path.join(directory, name), fs.readFileSync(path.join(directory, name))]);
+    const reply = { 'empty control reply': '', 'truncated control reply': '{"ok":' }[stage];
     let replacement = null;
-    let silentReplies = 0;
+    let controlReplies = 0;
     let queries = 0;
     t.mock.method(W, 'queryOwner', async (workspace, options) => {
       if (options?.namespace !== 'dashboard' || ++queries > 1) return queryOwner(workspace, options);
       await service.stop();
       if (stage === 'owner reply') throw closedPipe();
-      if (stage === 'control reply' || stage === 'empty control reply') {
+      if (stage.includes('control reply')) {
         fs.mkdirSync(directory, { recursive: true });
         for (const [file, bytes] of records) fs.writeFileSync(file, bytes);
       }
-      if (stage === 'empty control reply') {
-        const silent = net.createServer((socket) => socket.once('data', () => { silentReplies++; socket.end(); }));
-        await new Promise((resolve) => silent.listen(`${W.pipeNameFor(fx.state.workspace, 'dashboard')}-${service.serviceId}`, resolve));
-        t.after(() => new Promise((resolve) => silent.close(resolve)));
+      if (reply !== undefined) {
+        const impostor = net.createServer((socket) => socket.once('data', () => { controlReplies++; socket.end(reply); }));
+        await new Promise((resolve) => impostor.listen(`${W.pipeNameFor(fx.state.workspace, 'dashboard')}-${service.serviceId}`, resolve));
+        t.after(() => new Promise((resolve) => impostor.close(resolve)));
       }
       if (stage === 'replacement owner') replacement = await start(t, fx);
       return ready;
     });
+    if (stage === 'truncated control reply') {
+      await assert.rejects(D.statusDashboard(fx.options), /invalid dashboard control response/);
+      assert.equal(queries, 1, 'a reply with content is a protocol failure, not a closed pipe');
+      assert.equal(controlReplies, 1);
+      return;
+    }
     const status = await D.statusDashboard(fx.options);
     if (stage === 'replacement owner') assert.equal(status.service_id, replacement.serviceId);
     else assert.deepEqual(status, { status: 'stopped', service_id: null, url: null });
     assert.equal(queries, 2, 'absence or replacement must come from a fresh owner query');
-    if (stage === 'empty control reply') assert.equal(silentReplies, 1);
+    if (reply !== undefined) assert.equal(controlReplies, 1);
   });
 });
 

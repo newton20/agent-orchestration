@@ -30,9 +30,9 @@ const digest = (value) => createHash('sha256').update(value).digest('hex');
 const fileKey = (file) => process.platform === 'win32' ? path.resolve(file).toLowerCase() : path.resolve(file);
 const absentOwner = (error) => ['ENOENT', 'ECONNREFUSED'].includes(error.code);
 const readinessTimeout = (error) => error.code === undefined && error.message === 'owner readiness query timed out';
-// A pipe closed around or during our request surfaces as EPIPE/ECONNRESET or a reply that ends early;
-// replies with invalid content stay fatal.
-const peerClosed = (error) => ['EPIPE', 'ECONNRESET'].includes(error.code) ||
+// A pipe closed around our request surfaces as EPIPE/ECONNRESET or an empty reply; replies with content that
+// does not parse stay fatal. queryOwner does not yet tag empty replies, so its end-of-input parse error stands in.
+const peerClosed = (error) => ['EPIPE', 'ECONNRESET', 'EMPTY_REPLY'].includes(error.code) ||
   (error instanceof SyntaxError && error.message === 'Unexpected end of JSON input');
 const DISCOVERY_SETTLE_MS = 2000;
 const DISCOVERY_RETRY_MS = 50;
@@ -134,8 +134,13 @@ function controlRequest(pipe, request) {
       if (Buffer.byteLength(input) > 64 * 1024) socket.destroy(new Error('oversized dashboard control response'));
     });
     socket.on('end', () => {
+      let response;
+      try { response = JSON.parse(input); } catch (_) {
+        reject(input ? new Error('invalid dashboard control response')
+          : Object.assign(new Error('dashboard control closed without a reply'), { code: 'EMPTY_REPLY' }));
+        return;
+      }
       try {
-        const response = JSON.parse(input);
         if (!response.ok) throw new Error(response.error || 'dashboard control rejected');
         if (response.service_id !== request.service_id || response.workspace_key !== request.workspace_key) {
           throw new Error('dashboard control instance mismatch');
@@ -155,8 +160,9 @@ async function discover(context) {
       if (!(absentOwner(error) || peerClosed(error))) throw error;
       deadline ??= Date.now() + DISCOVERY_SETTLE_MS;
       if (Date.now() + DISCOVERY_RETRY_MS >= deadline) throw error;
+      await delay(DISCOVERY_RETRY_MS);
+      if (Date.now() >= deadline) throw error;
     }
-    await delay(DISCOVERY_RETRY_MS);
   }
 }
 
