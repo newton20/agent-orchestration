@@ -464,9 +464,11 @@ function assertRerunEligible(state, { allowUnclearedReservations = false } = {})
   const attempts = phases.flatMap((phase) => Object.values(phase.roles).flatMap((role) => role.attempts));
   if (!attempts.length && phases.every((phase) => phase.status === 'pending')) return;
   if (phases.some((phase) => {
+    // Execution-blocked phases may hold only terminal attempts; the per-attempt closure checks below still apply.
+    if (phase.status === 'blocked' && phase.blocker?.category === 'execution') return false;
     const unstarted = Object.values(phase.roles).every((role) => role.attempts.length === 0);
     if (unstarted && (phase.status === 'pending' ||
-        (phase.status === 'blocked' && ['dependency', 'execution'].includes(phase.blocker?.category)))) return false;
+        (phase.status === 'blocked' && phase.blocker?.category === 'dependency'))) return false;
     return !['completed', 'failed'].includes(phase.status);
   })) {
     throw new Error('rerun requires terminal started phases without active work');

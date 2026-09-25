@@ -1839,6 +1839,12 @@ test('U3 restart drift fails closed without re-resolving, and restoring the pinn
       fs.mkdirSync(path.join(top, ...Array.from({ length: 40 }, () => 'd')), { recursive: true });
       return () => fs.rmSync(top, { recursive: true, force: true });
     },
+    'unbounded package directory breadth': (fx) => {
+      const top = path.join(fx.pkg.plugin, 'wide');
+      fs.mkdirSync(top);
+      for (let i = 0; i <= 8192; i++) fs.mkdirSync(path.join(top, String(i)));
+      return () => fs.rmSync(top, { recursive: true, force: true });
+    },
   };
   for (const [label, drift] of Object.entries(drifts)) {
     await t.test(label, async (t) => {
@@ -1854,6 +1860,7 @@ test('U3 restart drift fails closed without re-resolving, and restoring the pinn
       assert.equal(state.phases.p1.status, 'completed');
       assert.equal(state.phases.p2.status, 'blocked');
       assert.equal(state.phases.p2.blocker.code, 'binding_drift');
+      assert.doesNotMatch(state.phases.p2.blocker.detail, /hook|extra|deep|wide|\.js/, 'package file names stay out of diagnostics');
       assert.equal(state.phases.p2.roles.impl.attempts.length, 0);
       assert.equal(fx.calls.length, 1);
       assert.deepEqual(state.execution_bindings, { 'agency-copilot': binding }, 'drift never rebinds');
@@ -2144,9 +2151,59 @@ test('U3 execution failures are rechecked on a bounded interval, and a restart r
   fx.engineAdapters[0].preflightError = null;
   await fx.tick();
   assert.equal(fx.calls.length, 0, 'recovery waits for the recheck interval');
+  await fx.tick(fx.sample(undefined, { observed_at: '2030-01-01T00:00:00.000Z' }));
+  assert.equal(fx.preflights.length, 1, 'the interval is monotonic, not derived from process-sample time');
   await fx.reopen();
   await fx.tick();
   assert.equal(fx.preflights.length, 2);
   assert.equal(fx.calls.length, 1);
   assert.equal(fx.runtime.store.read().phases.p1.blocker, undefined);
+});
+test('U3 a terminal sibling failure wins over an execution blocker and is never redispatched', async (t) => {
+  const phases = [{ id: 'p1', agents: [{ role: 'impl' }, { role: 'qa', engine: 'agency-claude', access: 'read-only' }],
+    completion_signal: 'x.md' }];
+  const fx = await fixture(t, { phases, engines: withEngines((fx) => [engineAdapter(fx, { launch: async (attempt, observe) => {
+    await observe({ ...identity(attempt), id: 'refused', kind: 'launch_failed', no_external_effect: true, reason: 'fixture refusal' });
+  } })]) });
+  for (let i = 0; i < 6 && fx.runtime.store.read().phases.p1.status !== 'failed'; i++) await fx.tick();
+  const state = fx.runtime.store.read();
+  assert.equal(state.phases.p1.status, 'failed');
+  assert.equal(state.phases.p1.failure, 'attempt retry budget exhausted');
+  assert.equal(state.phases.p1.blocker, undefined);
+  assert.equal(fx.calls.length, 3);
+  await fx.tick();
+  assert.equal(fx.calls.length, 3);
+  assert.equal(fx.runtime.store.read().phases.p1.roles.qa.attempts.length, 0);
+});
+
+test('U3 a queued bound intent whose adapter is missing after restart blocks durably instead of halting', async (t) => {
+  let interrupted = false;
+  const fx = await fixture(t, { phases: [{ id: 'p1', agent: { role: 'impl', engine: 'agency-claude' }, completion_signal: 'x.md' }],
+    engines: withEngines((fx) => [engineAdapter(fx, { engine: 'agency-claude' })]), fault(point) {
+      if (point === 'after_intent' && !interrupted) { interrupted = true; throw new Error('queued'); }
+    } });
+  await assert.rejects(fx.tick(), /queued/);
+  await fx.close();
+  await fx.open({ _engineAdapters: [engineAdapter(fx)] });
+  await fx.tick();
+  const state = fx.runtime.store.read();
+  assert.equal(state.phases.p1.blocker.code, 'adapter_unavailable');
+  assert.equal(fx.current().status, 'queued');
+  assert.equal(fx.calls.length, 0);
+});
+
+test('U3 an execution-blocked phase with only terminal closed attempts permits the advertised explicit rerun', async (t) => {
+  const fx = await fixture(t, { review: true, engines: withEngines() });
+  await fx.tick();
+  fx.complete(fx.current('p1', 'impl'));
+  fs.writeFileSync(fx.pkg.exe, 'upgraded native agency');
+  await fx.tick();
+  const blocked = fx.runtime.store.read();
+  assert.equal(blocked.phases.p1.review_stage, 'qa');
+  assert.equal(blocked.phases.p1.blocker.code, 'binding_drift');
+  await fx.close();
+  await fx.open({ rerun: true });
+  const next = fx.runtime.store.read();
+  assert.notEqual(next.run_id, blocked.run_id);
+  assert.equal(next.history.at(-1).phases.p1.blocker.code, 'binding_drift');
 });

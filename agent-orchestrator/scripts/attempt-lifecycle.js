@@ -159,22 +159,26 @@ function verifyPinnedFiles({ executable, package: pkg }) {
   let entries = 0;
   (function visit(directory, prefix, depth) {
     if (depth > MAX_PACKAGE_DEPTH) throw check('package directory tree exceeds the supported depth');
-    for (const name of fs.readdirSync(directory)) {
-      if (++entries > MAX_PACKAGE_ENTRIES) throw check('package contains too many entries');
-      const file = path.join(directory, name);
-      const relative = prefix ? `${prefix}/${name}` : name;
-      const entry = fs.lstatSync(file);
-      if (entry.isSymbolicLink()) throw check(`package contains a redirected entry: ${relative}`);
-      if (entry.isDirectory()) visit(file, relative, depth + 1);
-      else if (!entry.isFile()) throw check(`package contains an unsupported entry: ${relative}`);
-      else if (relative !== INVENTORY_FILENAME) found.add(relative);
-    }
+    const handle = fs.opendirSync(directory);
+    try {
+      for (let dirent = handle.readSync(); dirent; dirent = handle.readSync()) {
+        if (++entries > MAX_PACKAGE_ENTRIES) throw check('package contains too many entries');
+        const file = path.join(directory, dirent.name);
+        const relative = prefix ? `${prefix}/${dirent.name}` : dirent.name;
+        const entry = fs.lstatSync(file);
+        if (entry.isSymbolicLink()) throw check('package contains a redirected entry');
+        if (entry.isDirectory()) visit(file, relative, depth + 1);
+        else if (!entry.isFile()) throw check('package contains an unsupported entry');
+        else if (relative !== INVENTORY_FILENAME) found.add(relative);
+      }
+    } finally { handle.closeSync(); }
   })(pkg.root, '', 0);
-  for (const relative of found) if (!listed.has(relative)) throw check(`package contains an unlisted file: ${relative}`);
+  // Package-relative names are filesystem data, so they stay out of persisted diagnostics.
+  for (const relative of found) if (!listed.has(relative)) throw check('package contains an unlisted file');
   for (const [relative, entry] of listed) {
     const file = path.join(pkg.root, ...relative.split('/'));
     if (!found.has(relative) || fs.statSync(file).size !== entry.size || sha256File(file) !== entry.sha256) {
-      throw check(`package file changed: ${relative}`);
+      throw check('package file changed');
     }
   }
 }
@@ -458,55 +462,66 @@ function retryCategory(entry, iteration) {
   return null;
 }
 
+function aggregatePhase(state, phase, runtime) {
+  if (runtime.blocker && runtime.blocker.category !== 'dependency') { runtime.status = 'blocked'; return; }
+  if (phase.depends_on.some((id) => state.phases[id].status !== 'completed')) {
+    runtime.blocker = { category: 'dependency', reason: 'waiting for accepted upstream completion' };
+    runtime.status = 'blocked';
+    return;
+  }
+  delete runtime.blocker;
+  const impl = currentAttempt(runtime.roles.impl || { attempts: [] });
+  const qa = currentAttempt(runtime.roles.qa || { attempts: [] });
+  if (phase.review_loop.enabled) {
+    if (runtime.review_stage === 'impl' && impl?.review_iteration === runtime.review_iteration && impl.outcome?.type === 'completed') {
+      runtime.review_stage = 'qa';
+    }
+    if (runtime.review_stage === 'qa' && qa?.review_iteration === runtime.review_iteration && qa.outcome) {
+      if (['completed', 'qa_failed'].includes(qa.outcome.type)) {
+        runtime.review_history ||= [];
+        if (!runtime.review_history.some((entry) => entry.attempt_id === qa.attempt_id)) {
+          runtime.review_history.push({ ...identityOf(qa), verdict: qa.qa_verdict, evidence: qa.evidence.verdict });
+        }
+      }
+      if (qa.outcome.type === 'completed') { runtime.status = 'completed'; return; }
+      if (qa.outcome.type === 'qa_failed') {
+        if (runtime.review_iteration + 1 >= phase.review_loop.max_iterations) {
+          runtime.status = 'failed';
+          runtime.failure = 'QA review budget exhausted';
+          return;
+        }
+        if (qa.reservation.state === 'released') { runtime.review_iteration++; runtime.review_stage = 'impl'; }
+      }
+    }
+  }
+  const roles = phase.review_loop.enabled ? [runtime.review_stage] : Object.keys(runtime.roles);
+  const entries = roles.map((role) => runtime.roles[role]);
+  if (!phase.review_loop.enabled && entries.every((entry) => currentAttempt(entry)?.outcome?.type === 'completed')) {
+    runtime.status = 'completed';
+  } else if (!phase.review_loop.enabled && entries.some((entry) => currentAttempt(entry)?.outcome?.type === 'qa_failed')) {
+    runtime.status = 'failed';
+    runtime.failure = 'QA verification failed';
+  } else if (entries.some((entry) => {
+    const a = currentAttempt(entry);
+    return a?.outcome?.type === 'failed' && (entry.budgets?.[a.outcome.category] || 0) >= RETRY_LIMITS[a.outcome.category];
+  })) {
+    runtime.status = 'failed';
+    runtime.failure = 'attempt retry budget exhausted';
+  } else if (entries.some((entry) => currentAttempt(entry)?.status === 'needs_operator')) runtime.status = 'needs_operator';
+  else runtime.status = entries.some((entry) => currentAttempt(entry)) ? 'running' : 'pending';
+}
+
+// Terminal outcomes win over an execution blocker; otherwise it keeps the phase visibly blocked.
 function aggregate(state) {
   for (const phase of state.accepted.phases) {
     const runtime = state.phases[phase.id];
-    if (runtime.blocker && runtime.blocker.category !== 'dependency') { runtime.status = 'blocked'; continue; }
-    if (phase.depends_on.some((id) => state.phases[id].status !== 'completed')) {
-      runtime.blocker = { category: 'dependency', reason: 'waiting for accepted upstream completion' };
+    const execution = runtime.blocker?.category === 'execution' ? runtime.blocker : null;
+    if (execution) delete runtime.blocker;
+    aggregatePhase(state, phase, runtime);
+    if (execution && !runtime.blocker && !['completed', 'failed'].includes(runtime.status)) {
+      runtime.blocker = execution;
       runtime.status = 'blocked';
-      continue;
     }
-    delete runtime.blocker;
-    const impl = currentAttempt(runtime.roles.impl || { attempts: [] });
-    const qa = currentAttempt(runtime.roles.qa || { attempts: [] });
-    if (phase.review_loop.enabled) {
-      if (runtime.review_stage === 'impl' && impl?.review_iteration === runtime.review_iteration && impl.outcome?.type === 'completed') {
-        runtime.review_stage = 'qa';
-      }
-      if (runtime.review_stage === 'qa' && qa?.review_iteration === runtime.review_iteration && qa.outcome) {
-        if (['completed', 'qa_failed'].includes(qa.outcome.type)) {
-          runtime.review_history ||= [];
-          if (!runtime.review_history.some((entry) => entry.attempt_id === qa.attempt_id)) {
-            runtime.review_history.push({ ...identityOf(qa), verdict: qa.qa_verdict, evidence: qa.evidence.verdict });
-          }
-        }
-        if (qa.outcome.type === 'completed') { runtime.status = 'completed'; continue; }
-        if (qa.outcome.type === 'qa_failed') {
-          if (runtime.review_iteration + 1 >= phase.review_loop.max_iterations) {
-            runtime.status = 'failed';
-            runtime.failure = 'QA review budget exhausted';
-            continue;
-          }
-          if (qa.reservation.state === 'released') { runtime.review_iteration++; runtime.review_stage = 'impl'; }
-        }
-      }
-    }
-    const roles = phase.review_loop.enabled ? [runtime.review_stage] : Object.keys(runtime.roles);
-    const entries = roles.map((role) => runtime.roles[role]);
-    if (!phase.review_loop.enabled && entries.every((entry) => currentAttempt(entry)?.outcome?.type === 'completed')) {
-      runtime.status = 'completed';
-    } else if (!phase.review_loop.enabled && entries.some((entry) => currentAttempt(entry)?.outcome?.type === 'qa_failed')) {
-      runtime.status = 'failed';
-      runtime.failure = 'QA verification failed';
-    } else if (entries.some((entry) => {
-      const a = currentAttempt(entry);
-      return a?.outcome?.type === 'failed' && (entry.budgets?.[a.outcome.category] || 0) >= RETRY_LIMITS[a.outcome.category];
-    })) {
-      runtime.status = 'failed';
-      runtime.failure = 'attempt retry budget exhausted';
-    } else if (entries.some((entry) => currentAttempt(entry)?.status === 'needs_operator')) runtime.status = 'needs_operator';
-    else runtime.status = entries.some((entry) => currentAttempt(entry)) ? 'running' : 'pending';
   }
 }
 
@@ -917,7 +932,7 @@ async function createAttemptLifecycle({ owner, store, manifestPath, _runtimeRoot
         fault('after_reconcile');
         await syncReservations();
         if (!dispatching || state.operator.paused || state.projection?.status === 'degraded') return store.read();
-        const now = Date.parse(sample.observed_at);
+        const now = performance.now();
         for (const phaseId of state.accepted.execution_order) {
           const phase = state.accepted.phases.find((p) => p.id === phaseId);
           const latest = store.read();
@@ -943,7 +958,10 @@ async function createAttemptLifecycle({ owner, store, manifestPath, _runtimeRoot
               continue;
             }
             const queued = previous?.status === 'queued' ? previous : null;
-            if (queued && !adapterFor(queued)) throw new Error(dispatchRefusal(queued));
+            // Kind mismatches are trust errors; a missing adapter for a bound intent is a durable blocker below.
+            if (queued && (engines.size ? queued.execution === undefined : queued.execution !== undefined)) {
+              throw new Error(dispatchRefusal(queued));
+            }
             let binding = null;
             if (engines.size) {
               // Successes are never reused: each dispatch re-verifies, because a prior launch may have changed files.

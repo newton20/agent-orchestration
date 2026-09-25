@@ -3861,6 +3861,8 @@ async function runOrchestrator(opts) {
           const key = blocker ? `${blocker.code}:${blocker.detail}` : null;
           if (key && executionBlockers.get(phaseId) !== key) {
             logger('warn', `phase ${phaseId} execution blocked (${blocker.code}): ${blocker.reason}; ${blocker.detail}`);
+          } else if (!key && executionBlockers.get(phaseId)) {
+            logger('info', `phase ${phaseId} execution blocker cleared`);
           }
           executionBlockers.set(phaseId, key);
         }
