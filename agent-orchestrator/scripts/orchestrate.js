@@ -3805,7 +3805,7 @@ async function startV2Foundation(opts) {
     projectBeforeLifecycle(store);
     lifecycle = await createAttemptLifecycle({
       owner, store, manifestPath: opts.manifestPath, _runtimeRoot: opts._runtimeRoot,
-      _fixtureAdapter: opts._fixtureAdapter, _lifecycleFault: opts._lifecycleFault,
+      _fixtureAdapter: opts._fixtureAdapter, _engineAdapters: opts._engineAdapters, _lifecycleFault: opts._lifecycleFault,
       _hostEvidence: opts._hostEvidence,
     });
     let state = store.read();

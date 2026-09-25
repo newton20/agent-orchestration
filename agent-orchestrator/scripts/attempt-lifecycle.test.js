@@ -249,7 +249,7 @@ test('final advisory: reservation cleanup acknowledgement requires release and c
   assert.equal(fx.current().reservation_cleared, true);
 });
 
-async function fixture(t, { phases, review = false, launch, onLaunch, readOnly = false, fault, stateFs, hostEvidence = HOST } = {}) {
+async function fixture(t, { phases, review = false, launch, onLaunch, readOnly = false, fault, stateFs, hostEvidence = HOST, engines } = {}) {
   const fx = runtimeFixture(t);
   fx.manifest.phases = phases || [{
     id: 'p1', agent: { role: 'impl' }, completion_signal: 'ignored-v1.md',
@@ -276,8 +276,11 @@ async function fixture(t, { phases, review = false, launch, onLaunch, readOnly =
   };
   let sampleId = 0;
   let clock = Date.parse(TIME);
+  fx.calls = calls;
+  if (engines) fx.engineAdapters = engines(fx);
   const options = () => ({
-    manifestPath: fx.manifestPath, _runtimeRoot: fx.runtimeRoot, _fixtureAdapter: adapter,
+    manifestPath: fx.manifestPath, _runtimeRoot: fx.runtimeRoot,
+    ...(engines ? { _engineAdapters: fx.engineAdapters } : { _fixtureAdapter: adapter }),
     _lifecycleFault: fault, _hostEvidence: hostEvidence, _stateFs: stateFs, logger: () => {},
   });
   fx.options = options;
@@ -1593,4 +1596,428 @@ test('U2 crash after durable closure reacquires and clears an additional checkou
   assert.deepEqual(fx.runtime.state, fx.runtime.store.read());
   await fx.tick();
   assert.deepEqual(fx.calls.map((attempt) => attempt.phase_id), ['a', 'b']);
+});
+
+const sha = (bytes) => require('node:crypto').createHash('sha256').update(bytes).digest('hex');
+const EXE_BYTES = 'fake native agency v1';
+
+function writeInventory(plugin) {
+  const files = [];
+  (function visit(directory, prefix) {
+    for (const name of fs.readdirSync(directory).sort()) {
+      if (!prefix && name === 'package-inventory.json') continue;
+      const file = path.join(directory, name);
+      const relative = prefix ? `${prefix}/${name}` : name;
+      if (fs.statSync(file).isDirectory()) visit(file, relative);
+      else files.push({ path: relative, size: fs.statSync(file).size, sha256: sha(fs.readFileSync(file)) });
+    }
+  })(plugin, '');
+  fs.writeFileSync(path.join(plugin, 'package-inventory.json'),
+    `${JSON.stringify({ version: 1, algorithm: 'sha256', files }, null, 2)}\n`);
+}
+
+function enginePackage(root, name = 'engine') {
+  const exe = path.join(root, `${name}-bin`, 'agency.exe');
+  fs.mkdirSync(path.dirname(exe), { recursive: true });
+  fs.writeFileSync(exe, EXE_BYTES);
+  const plugin = path.join(root, `${name}-plugin`);
+  for (const [relative, text] of Object.entries({
+    '.claude-plugin/plugin.json': '{"name":"agent-orchestrator"}', 'hooks.json': '{}', 'agency.json': '{}',
+    'hooks/copilot-session.js': '// hook', 'scripts/attempt-channel.js': '// channel',
+  })) {
+    const file = path.join(plugin, ...relative.split('/'));
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, text);
+  }
+  writeInventory(plugin);
+  return { exe: fs.realpathSync.native(exe), plugin: fs.realpathSync.native(plugin) };
+}
+
+// A trusted engine-adapter test double: it never starts a process and reports evidence for fake files.
+function engineAdapter(fx, { engine = 'agency-copilot', launch, readOnly = false, tracksDescendants = true } = {}) {
+  let nextPid = 5000;
+  let cachedHash = null;
+  const adapter = {
+    kind: 'engine',
+    capabilities: Object.freeze({ engines: Object.freeze([engine]), read_only_enforced: readOnly,
+      tracks_descendants: tracksDescendants, live_verified: false }),
+    exe: fx.pkg.exe, plugin: fx.pkg.plugin, version: 'copilot 1.2.3', preflightError: null, staleHash: false,
+    async preflight(request) {
+      fx.preflights.push({ engine, request });
+      if (adapter.preflightError) throw new Error(adapter.preflightError);
+      const current = sha(fs.readFileSync(adapter.exe));
+      cachedHash = adapter.staleHash && cachedHash ? cachedHash : current;
+      return {
+        executable: { path: adapter.exe, sha256: cachedHash },
+        package: { root: adapter.plugin, inventory_sha256: sha(fs.readFileSync(path.join(adapter.plugin, 'package-inventory.json'))) },
+        capabilities: { engine_version: adapter.version, agency_version: engine === 'claude' ? null : 'agency 2.0.0',
+          help_sha256: 'f'.repeat(64), read_only_enforced: readOnly, tracks_descendants: tracksDescendants, live_verified: false },
+      };
+    },
+    async launch(attempt, context) {
+      fx.calls.push(attempt);
+      fx.launchContexts.push({ engine, attempt_id: attempt.attempt_id, binding: context.binding });
+      assert.equal(context.binding.engine, attempt.engine);
+      assert.equal(attempt.status, 'launching');
+      if (launch) return launch(attempt, context.observe);
+      const engineProcess = processIdentity(nextPid++);
+      await context.observe({ ...identity(attempt), id: 'launcher', kind: 'launch_process', process: processIdentity(nextPid++) });
+      await context.observe({ ...identity(attempt), id: 'session', kind: 'session', session_id: attempt.attempt_id, process: engineProcess });
+      await context.observe({ ...identity(attempt), id: 'descendants', kind: 'descendants', processes: [], complete: true });
+      await context.observe({ ...identity(attempt), id: 'submission', kind: 'submission', acknowledged: true });
+    },
+    async reconcile(attempt, context) {
+      fx.reconciles.push({ engine, attempt_id: attempt.attempt_id, binding: context.binding });
+    },
+  };
+  return adapter;
+}
+
+function withEngines(configure = (fx) => [engineAdapter(fx)]) {
+  return (fx) => {
+    fx.pkg = enginePackage(fx.root);
+    fx.preflights = [];
+    fx.launchContexts = [];
+    fx.reconciles = [];
+    return configure(fx);
+  };
+}
+
+const bindings = (fx) => fx.runtime.store.read().execution_bindings;
+const boundEvents = (fx) => {
+  const state = fx.runtime.store.projectOutbox({ expectedRevision: fx.runtime.store.read().revision });
+  return require('./event-log').readEvents({ state, limit: 256 }).events.filter((event) => event.type === 'execution_bound');
+};
+const TWO_PHASES = [
+  { id: 'p1', agent: { role: 'impl' }, completion_signal: 'one.md' },
+  { id: 'p2', agent: { role: 'impl' }, depends_on: ['p1'], completion_signal: 'two.md' },
+];
+
+test('U3 engine seam preflights and seals one binding before the first intent, then dispatches through the selected adapter', async (t) => {
+  const fx = await fixture(t, { phases: TWO_PHASES, engines: withEngines() });
+  await fx.tick();
+  const state = fx.runtime.store.read();
+  const binding = state.execution_bindings['agency-copilot'];
+  assert.deepEqual(fx.preflights[0].request, {
+    run_id: state.run_id, engine: 'agency-copilot', models: [], access: ['mutating'], permission_mode: 'default', shell: 'powershell',
+  });
+  assert.deepEqual(binding.executable, { path: fx.pkg.exe, sha256: sha(EXE_BYTES) });
+  assert.equal(binding.package.root, fx.pkg.plugin);
+  assert.equal(binding.evidence.live_acceptance, 'missing');
+  assert.equal(binding.evidence.descendant_tracking, 'known');
+  const first = fx.current('p1');
+  assert.deepEqual(first.execution, { binding_id: binding.binding_id, binding_sha256: binding.binding_sha256 });
+  assert.equal(fx.calls.length, 1);
+  assert.deepEqual(fx.launchContexts[0].binding, binding);
+  assert.equal(first.status, 'running');
+  assert.equal(state.live_dispatch_enabled, false);
+  fx.complete(first);
+  await fx.tick();
+  assert.equal(fx.calls.length, 2);
+  assert.deepEqual(fx.current('p2').execution, first.execution);
+  assert.deepEqual(bindings(fx), { 'agency-copilot': binding }, 'later dispatch verifies instead of rebinding');
+  assert.equal(fx.preflights.length, 2);
+  assert.equal(boundEvents(fx).length, 1);
+});
+
+test('U3 engine seam rejects invalid or self-authorizing adapters and cannot be mixed with the fixture adapter', async (t) => {
+  const fx = runtimeFixture(t);
+  fx.pkg = enginePackage(fx.root);
+  fx.preflights = [];
+  const valid = () => engineAdapter(fx);
+  const base = { manifestPath: fx.manifestPath, _runtimeRoot: fx.runtimeRoot };
+  const fixtureAdapter = { kind: 'fixture', capabilities: { engines: ['agency-copilot'], read_only_enforced: false, tracks_descendants: true }, async launch() {} };
+  for (const [label, extra] of [
+    ['mixed seams', { _fixtureAdapter: fixtureAdapter, _engineAdapters: [valid()] }],
+    ['not an array', { _engineAdapters: valid() }],
+    ['live self-claim', { _engineAdapters: [{ ...valid(), capabilities: { ...valid().capabilities, live_verified: true } }] }],
+    ['multi-engine adapter', { _engineAdapters: [{ ...valid(), capabilities: { ...valid().capabilities, engines: ['agency-copilot', 'claude'] } }] }],
+    ['missing preflight', { _engineAdapters: [{ ...valid(), preflight: undefined }] }],
+    ['fixture disguised as engine', { _engineAdapters: [{ ...fixtureAdapter, preflight() {} }] }],
+    ['duplicate engine', { _engineAdapters: [valid(), valid()] }],
+  ]) {
+    await assert.rejects(O.startV2Foundation({ ...base, ...extra }), /adapter/, label);
+  }
+  const runtime = await O.startV2Foundation({ ...base, _engineAdapters: [valid()] });
+  await runtime.lifecycle.close();
+  await runtime.owner.release();
+});
+
+test('U3 preflight failure and unavailable adapters block dispatch durably without binding or revision churn', async (t) => {
+  await t.test('preflight failure', async (t) => {
+    const fx = await fixture(t, { engines: withEngines() });
+    fx.engineAdapters[0].preflightError = 'agency.exe --version failed';
+    await fx.tick();
+    let state = fx.runtime.store.read();
+    assert.equal(state.execution_bindings, undefined);
+    assert.equal(state.phases.p1.roles.impl.attempts.length, 0);
+    assert.equal(state.phases.p1.status, 'blocked');
+    assert.equal(state.phases.p1.blocker.category, 'execution');
+    assert.equal(state.phases.p1.blocker.code, 'preflight_failed');
+    assert.equal(fx.calls.length, 0);
+    await fx.tick();
+    assert.equal(fx.runtime.store.read().revision, state.revision, 'an unchanged failure does not churn revisions');
+    fx.engineAdapters[0].preflightError = null;
+    await fx.tick();
+    state = fx.runtime.store.read();
+    assert.ok(state.execution_bindings['agency-copilot']);
+    assert.equal(state.phases.p1.blocker, undefined);
+    assert.equal(state.phases.p1.status, 'running');
+    assert.equal(fx.calls.length, 1);
+  });
+  await t.test('adapter unavailable for the accepted engine', async (t) => {
+    const fx = await fixture(t, { phases: [{ id: 'p1', agent: { role: 'impl', engine: 'agency-claude' }, completion_signal: 'x.md' }],
+      engines: withEngines() });
+    await fx.tick();
+    const state = fx.runtime.store.read();
+    assert.equal(state.phases.p1.blocker.code, 'adapter_unavailable');
+    assert.equal(fx.preflights.length, 0);
+    assert.equal(fx.calls.length, 0);
+  });
+  await t.test('read-only policy the adapter cannot enforce', async (t) => {
+    const fx = await fixture(t, { phases: [{ id: 'p1', agent: { role: 'qa', access: 'read-only' }, completion_signal: 'x.md' }],
+      engines: withEngines() });
+    await fx.tick();
+    const state = fx.runtime.store.read();
+    assert.equal(state.execution_bindings, undefined);
+    assert.equal(state.phases.p1.blocker.code, 'preflight_failed');
+    assert.match(state.phases.p1.blocker.detail, /read-only/);
+    assert.equal(fx.calls.length, 0);
+  });
+});
+
+test('U3 restart drift fails closed without re-resolving, and restoring the pinned identity resumes', async (t) => {
+  const drifts = {
+    'executable bytes': (fx) => {
+      fs.writeFileSync(fx.pkg.exe, 'replaced native agency');
+      return () => fs.writeFileSync(fx.pkg.exe, EXE_BYTES);
+    },
+    'stale adapter evidence cannot vouch for a changed executable': (fx) => {
+      fx.engineAdapters[0].staleHash = true;
+      fs.writeFileSync(fx.pkg.exe, 'replaced native agency');
+      return () => fs.writeFileSync(fx.pkg.exe, EXE_BYTES);
+    },
+    'package payload': (fx) => {
+      const file = path.join(fx.pkg.plugin, 'hooks', 'copilot-session.js');
+      const old = fs.readFileSync(file);
+      fs.writeFileSync(file, '// changed hook');
+      return () => fs.writeFileSync(file, old);
+    },
+    'unlisted package file': (fx) => {
+      const file = path.join(fx.pkg.plugin, 'hooks', 'extra-hook.js');
+      fs.writeFileSync(file, '// injected');
+      return () => fs.unlinkSync(file);
+    },
+    'engine capability version': (fx) => {
+      fx.engineAdapters[0].version = 'copilot 1.2.4';
+      return () => { fx.engineAdapters[0].version = 'copilot 1.2.3'; };
+    },
+    're-resolved executable path': (fx) => {
+      const other = path.join(fx.root, 'other-bin', 'agency.exe');
+      fs.mkdirSync(path.dirname(other), { recursive: true });
+      fs.writeFileSync(other, EXE_BYTES);
+      fx.engineAdapters[0].exe = fs.realpathSync.native(other);
+      return () => { fx.engineAdapters[0].exe = fx.pkg.exe; };
+    },
+  };
+  for (const [label, drift] of Object.entries(drifts)) {
+    await t.test(label, async (t) => {
+      const fx = await fixture(t, { phases: TWO_PHASES, engines: withEngines() });
+      await fx.tick();
+      const binding = bindings(fx)['agency-copilot'];
+      fx.complete(fx.current('p1'));
+      await fx.close();
+      const restore = drift(fx);
+      await fx.open();
+      await fx.tick();
+      let state = fx.runtime.store.read();
+      assert.equal(state.phases.p1.status, 'completed');
+      assert.equal(state.phases.p2.status, 'blocked');
+      assert.equal(state.phases.p2.blocker.code, 'binding_drift');
+      assert.equal(state.phases.p2.roles.impl.attempts.length, 0);
+      assert.equal(fx.calls.length, 1);
+      assert.deepEqual(state.execution_bindings, { 'agency-copilot': binding }, 'drift never rebinds');
+      restore();
+      await fx.tick();
+      state = fx.runtime.store.read();
+      assert.equal(fx.calls.length, 2);
+      assert.equal(state.phases.p2.blocker, undefined);
+      assert.equal(fx.current('p2').execution.binding_id, binding.binding_id);
+      assert.deepEqual(state.execution_bindings, { 'agency-copilot': binding });
+    });
+  }
+});
+
+test('U3 queued engine intent resumes under its immutable binding after restart without replay or rebinding', async (t) => {
+  let interrupted = false;
+  const fx = await fixture(t, { engines: withEngines(), fault(point) {
+    if (point === 'after_intent' && !interrupted) { interrupted = true; throw new Error('crash after intent'); }
+  } });
+  await assert.rejects(fx.tick(), /crash after intent/);
+  const queued = fx.current();
+  const binding = bindings(fx)['agency-copilot'];
+  assert.equal(queued.status, 'queued');
+  assert.equal(queued.execution.binding_id, binding.binding_id);
+  assert.equal(fx.calls.length, 0);
+  await fx.reopen();
+  await fx.tick();
+  assert.equal(fx.calls.length, 1);
+  assert.equal(fx.current().attempt_id, queued.attempt_id);
+  assert.deepEqual(fx.current().execution, queued.execution);
+  assert.deepEqual(bindings(fx), { 'agency-copilot': binding });
+  assert.equal(fx.preflights.length, 2, 'resumption re-verifies the pinned identity instead of trusting the old check');
+  assert.equal(boundEvents(fx).length, 1);
+});
+
+test('U3 failed persistence before launch never reaches the engine adapter', async (t) => {
+  await t.test('binding publication failure', async (t) => {
+    let failBinding = true;
+    const fx = await fixture(t, { engines: withEngines(), stateFs: {
+      writeFileSync(target, bytes, ...args) {
+        if (failBinding && String(bytes).includes('"binding_version"')) throw Object.assign(new Error('disk full'), { code: 'ENOSPC' });
+        return fs.writeFileSync(target, bytes, ...args);
+      },
+    } });
+    await assert.rejects(fx.tick(), /publish/);
+    const state = fx.runtime.store.read();
+    assert.equal(state.execution_bindings, undefined);
+    assert.equal(state.phases.p1.roles.impl.attempts.length, 0);
+    assert.equal(fx.calls.length, 0);
+    failBinding = false;
+    await fx.reopen();
+    await fx.tick();
+    assert.equal(fx.calls.length, 1);
+    assert.equal(boundEvents(fx).length, 1);
+  });
+  for (const boundary of ['before_binding', 'after_binding']) {
+    await t.test(boundary, async (t) => {
+      let interrupted = false;
+      const fx = await fixture(t, { engines: withEngines(), fault(point) {
+        if (point === boundary && !interrupted) { interrupted = true; throw new Error(`interrupt ${point}`); }
+      } });
+      await assert.rejects(fx.tick(), /interrupt/);
+      const persisted = bindings(fx);
+      assert.equal(Boolean(persisted), boundary === 'after_binding');
+      assert.equal(fx.runtime.store.read().phases.p1.roles.impl.attempts.length, 0);
+      assert.equal(fx.calls.length, 0);
+      await fx.reopen();
+      await fx.tick();
+      assert.equal(fx.calls.length, 1);
+      if (persisted) assert.deepEqual(bindings(fx), persisted, 'restart replays the persisted binding, not a new one');
+      assert.equal(boundEvents(fx).length, 1);
+    });
+  }
+});
+
+test('U3 wrong engine or attempt binding references are rejected and adapter kinds cannot be swapped', async (t) => {
+  const phases = [{ id: 'p1', agents: [{ role: 'impl' }, { role: 'qa', engine: 'agency-claude' }], completion_signal: 'x.md' }];
+  const fx = await fixture(t, { phases, engines: withEngines((fx) => [engineAdapter(fx), engineAdapter(fx, { engine: 'agency-claude' })]) });
+  await fx.tick();
+  fx.complete(fx.current('p1', 'impl'));
+  await fx.tick();
+  const state = fx.runtime.store.read();
+  assert.deepEqual(Object.keys(state.execution_bindings).sort(), ['agency-claude', 'agency-copilot']);
+  assert.equal(fx.launchContexts.find((c) => c.engine === 'agency-claude').binding.engine, 'agency-claude');
+  const claude = state.execution_bindings['agency-claude'];
+  const mutateImpl = (change) => () => fx.runtime.store.transactInternal({ expectedRevision: fx.runtime.store.read().revision,
+    mutate(draft) { change(draft.phases.p1.roles.impl.attempts[0]); return { result: {}, events: [] }; } });
+  assert.throws(mutateImpl((a) => { a.execution = { binding_id: claude.binding_id, binding_sha256: claude.binding_sha256 }; }), /execution|immutable/);
+  assert.throws(mutateImpl((a) => { a.execution.binding_sha256 = 'd'.repeat(64); }), /execution|immutable/);
+  assert.throws(mutateImpl((a) => { delete a.execution; }), /immutable/);
+  assert.throws(() => fx.runtime.store.transactInternal({ expectedRevision: fx.runtime.store.read().revision, mutate(draft) {
+    const copyAttempt = structuredClone(draft.phases.p1.roles.impl.attempts[0]);
+    copyAttempt.engine = 'agency-claude';
+    draft.phases.p1.roles.impl.attempts[0] = copyAttempt;
+    return { result: {}, events: [] };
+  } }), /immutable|accepted|execution/);
+  await t.test('fixture seam cannot dispatch an engine-bound queued intent', async (t) => {
+    let interrupted = false;
+    const bound = await fixture(t, { engines: withEngines(), fault(point) {
+      if (point === 'after_intent' && !interrupted) { interrupted = true; throw new Error('queued'); }
+    } });
+    await assert.rejects(bound.tick(), /queued/);
+    await bound.close();
+    await bound.open({ _engineAdapters: undefined, _fixtureAdapter: bound.adapter });
+    await assert.rejects(bound.tick(), /engine/);
+    assert.equal(bound.calls.length, 0);
+    assert.equal(bound.current().status, 'queued');
+  });
+  await t.test('engine seam cannot dispatch or bind for a fixture queued intent', async (t) => {
+    let interrupted = false;
+    const unbound = await fixture(t, { fault(point) {
+      if (point === 'after_intent' && !interrupted) { interrupted = true; throw new Error('queued'); }
+    } });
+    await assert.rejects(unbound.tick(), /queued/);
+    await unbound.close();
+    unbound.pkg = enginePackage(unbound.root);
+    unbound.preflights = [];
+    unbound.launchContexts = [];
+    await unbound.open({ _fixtureAdapter: undefined, _engineAdapters: [engineAdapter(unbound)] });
+    await assert.rejects(unbound.tick(), /binding|fixture/);
+    assert.equal(unbound.calls.length, 0);
+    assert.equal(unbound.preflights.length, 0);
+    assert.equal(bindings(unbound), undefined);
+  });
+});
+
+test('U3 unknown process evidence under an engine binding keeps ownership and never replays or rebinds', async (t) => {
+  const fx = await fixture(t, { engines: withEngines((fx) => [engineAdapter(fx, { launch: async (attempt, observe) => {
+    await observe({ ...identity(attempt), id: 'launcher', kind: 'launch_process', process: processIdentity(7100) });
+  } })]) });
+  await fx.tick();
+  const binding = bindings(fx)['agency-copilot'];
+  assert.equal(fx.current().status, 'needs_operator');
+  const unknown = fx.sample([], { complete: false, error: 'access denied' });
+  await fx.tick(unknown);
+  assert.equal(fx.current().health.engine.state, 'unknown');
+  assert.equal(fx.current().reservation.state, 'held');
+  const preflights = fx.preflights.length;
+  await fx.reopen();
+  await fx.tick(fx.sample([], { complete: false, error: 'still denied' }));
+  assert.equal(fx.calls.length, 1);
+  assert.equal(fx.current().status, 'needs_operator');
+  assert.equal(fx.current().reservation.state, 'held');
+  assert.equal(fx.preflights.length, preflights, 'no dispatch means no re-resolution');
+  assert.deepEqual(bindings(fx), { 'agency-copilot': binding });
+  assert.ok(fx.reconciles.length >= 2);
+  assert.ok(fx.reconciles.every((call) => call.binding.binding_id === binding.binding_id));
+});
+
+test('U3 read surfaces never expose binding internals', async (t) => {
+  const fx = await fixture(t, { engines: withEngines() });
+  await fx.tick();
+  const binding = bindings(fx)['agency-copilot'];
+  const snapshot = JSON.stringify(require('./read-model').createSnapshot({ manifestPath: fx.manifestPath }));
+  for (const secret of [fx.pkg.exe, fx.pkg.plugin, binding.binding_sha256, binding.executable.sha256, 'launch_token']) {
+    assert.equal(snapshot.includes(secret), false, secret);
+  }
+  const [event] = boundEvents(fx);
+  assert.deepEqual(Object.keys(event.payload).sort(), ['binding_id', 'binding_sha256', 'engine']);
+});
+
+test('U3 an unverifiable pinned binding blocks dispatch, and only an explicit new run rebinds a drifted identity', async (t) => {
+  const fx = await fixture(t, { phases: TWO_PHASES, engines: withEngines() });
+  await fx.tick();
+  const binding = bindings(fx)['agency-copilot'];
+  fx.complete(fx.current('p1'));
+  fx.engineAdapters[0].preflightError = 'agency.exe --help timed out';
+  await fx.tick();
+  let state = fx.runtime.store.read();
+  assert.equal(state.phases.p2.blocker.code, 'binding_unverified');
+  assert.equal(fx.calls.length, 1);
+  fx.engineAdapters[0].preflightError = null;
+  fs.writeFileSync(fx.pkg.exe, 'upgraded native agency');
+  await fx.tick();
+  assert.equal(fx.runtime.store.read().phases.p2.blocker.code, 'binding_drift');
+  await fx.close();
+  await fx.open({ rerun: true });
+  state = fx.runtime.store.read();
+  assert.equal(state.history.at(-1).execution_bindings['agency-copilot'].binding_id, binding.binding_id);
+  assert.equal(state.execution_bindings, undefined);
+  await fx.tick();
+  const rebound = bindings(fx)['agency-copilot'];
+  assert.notEqual(rebound.binding_id, binding.binding_id);
+  assert.equal(rebound.executable.sha256, sha('upgraded native agency'));
+  assert.equal(fx.calls.length, 2);
+  assert.equal(fx.current('p1').execution.binding_id, rebound.binding_id);
 });
