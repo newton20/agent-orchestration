@@ -369,3 +369,147 @@ test('U2 internal transactions retain atomicity and ownership without command de
   await fx.owner.release();
   assert.throws(() => fx.store.transactInternal({ expectedRevision: 2, mutate }), /ownership|owner/);
 });
+
+function sealedBinding(state, { engine = 'agency-copilot', capabilities = {}, fields = {} } = {}) {
+  const caps = {
+    engine_version: 'copilot 1.2.3', agency_version: engine === 'claude' ? null : 'agency 2.0.0',
+    help_sha256: 'a'.repeat(64), read_only_enforced: false, tracks_descendants: false, ...capabilities,
+  };
+  return S.sealExecutionBinding({
+    binding_version: 1, binding_id: require('node:crypto').randomUUID(), run_id: state.run_id, engine,
+    adapter_kind: 'engine', request: S.executionRequest(state, engine),
+    executable: { path: 'C:\\Tools\\agency.exe', sha256: 'b'.repeat(64) },
+    package: { root: 'C:\\Plugins\\agent-orchestrator', inventory_sha256: 'c'.repeat(64) },
+    capabilities: caps, evidence: S.executionEvidence(engine, caps), bound_at: '2026-09-17T12:00:00.000Z',
+    ...fields,
+  });
+}
+
+test('U3 binding: the dedicated owner operation seals one immutable binding per engine and replays idempotently', async (t) => {
+  const fx = await setup(t);
+  const first = fx.store.initialize(fx.accepted);
+  const binding = sealedBinding(first);
+  assert.deepEqual(binding.request, { models: [], access: ['mutating'], permission_mode: 'default', shell: 'powershell' });
+  assert.deepEqual(binding.evidence, {
+    executable: 'known', package: 'known', engine_version: 'known', agency_version: 'known', capability_help: 'known',
+    read_only_enforcement: 'missing', descendant_tracking: 'missing', live_acceptance: 'missing',
+  });
+  const response = fx.store.bindExecution({ expectedRevision: first.revision, binding });
+  assert.deepEqual(response, { revision: first.revision + 1, result: { binding_id: binding.binding_id, replayed: false } });
+  const bound = fx.store.read();
+  assert.deepEqual(bound.execution_bindings, { 'agency-copilot': binding });
+  const event = bound.outbox.at(-1);
+  assert.equal(event.type, 'execution_bound');
+  assert.deepEqual(event.payload, { engine: 'agency-copilot', binding_id: binding.binding_id, binding_sha256: binding.binding_sha256 });
+  assert.equal(JSON.stringify(bound.outbox).includes('agency.exe'), false, 'events carry identity, not executable paths');
+  assert.deepEqual(fx.store.bindExecution({ expectedRevision: 1, binding: structuredClone(binding) }),
+    { revision: bound.revision, result: { binding_id: binding.binding_id, replayed: true } });
+  assert.equal(fx.store.read().revision, bound.revision, 'an identical replay publishes nothing');
+  assert.throws(() => fx.store.bindExecution({ expectedRevision: bound.revision, binding: sealedBinding(bound) }), /immutable/);
+  assert.throws(() => fx.store.bindExecution({ expectedRevision: bound.revision,
+    binding: sealedBinding(bound, { capabilities: { engine_version: 'copilot 9.9.9' } }) }), /immutable/);
+  assert.throws(() => fx.store.bindExecution({ expectedRevision: 1, binding: sealedBinding(bound, { engine: 'agency-claude' }) }), /revision/);
+  await fx.owner.release();
+  assert.throws(() => fx.store.bindExecution({ expectedRevision: bound.revision, binding }), /owner/);
+  assert.deepEqual(fx.store.read(), bound);
+});
+
+test('U3 binding: generic transactions cannot create, change, or remove execution bindings', async (t) => {
+  const fx = await setup(t);
+  const first = fx.store.initialize(fx.accepted);
+  const attempt = (mutate) => [
+    () => fx.store.transactInternal({ expectedRevision: fx.store.read().revision, mutate(draft) { mutate(draft); return { result: {}, events: [] }; } }),
+    () => fx.store.transact({ expectedRevision: fx.store.read().revision, command: { id: `c-${Math.random()}`.replace('.', ''), payload: {} },
+      mutate(draft) { mutate(draft); return { result: {}, events: [] }; } }),
+  ];
+  for (const run of attempt((draft) => { draft.execution_bindings = { 'agency-copilot': sealedBinding(first) }; })) {
+    assert.throws(run, /immutable/);
+  }
+  fx.store.bindExecution({ expectedRevision: first.revision, binding: sealedBinding(first) });
+  const bound = fx.store.read();
+  for (const mutate of [
+    (draft) => { draft.execution_bindings['agency-copilot'].executable.sha256 = 'd'.repeat(64); },
+    (draft) => { delete draft.execution_bindings['agency-copilot']; },
+    (draft) => { delete draft.execution_bindings; },
+    (draft) => { draft.execution_bindings['agency-claude'] = sealedBinding(bound, { engine: 'agency-claude' }); },
+  ]) {
+    for (const run of attempt(mutate)) assert.throws(run, /immutable/);
+  }
+  assert.deepEqual(fx.store.read(), bound);
+});
+
+test('U3 binding: strict schema rejects credentials, live claims, forged policy, unpinned paths, and unsealed records', async (t) => {
+  const fx = await setup(t);
+  const first = fx.store.initialize(fx.accepted);
+  const reseal = (record) => { const { binding_sha256: _ignored, ...rest } = record; return S.sealExecutionBinding(rest); };
+  const variants = [
+    ['credential field', (b) => reseal({ ...b, environment: { AGENT_ORCHESTRATOR_TOKEN: 'secret' } })],
+    ['credential in capabilities', (b) => reseal({ ...b, capabilities: { ...b.capabilities, token: 'secret' } })],
+    ['live claim', (b) => reseal({ ...b, evidence: { ...b.evidence, live_acceptance: 'known' } })],
+    ['inconsistent evidence', (b) => reseal({ ...b, evidence: { ...b.evidence, read_only_enforcement: 'known' } })],
+    ['forged model policy', (b) => reseal({ ...b, request: { ...b.request, models: ['gpt-5'] } })],
+    ['forged permission policy', (b) => reseal({ ...b, request: { ...b.request, permission_mode: 'bypassPermissions' } })],
+    ['relative executable', (b) => reseal({ ...b, executable: { ...b.executable, path: 'agency.exe' } })],
+    ['shell shim executable', (b) => reseal({ ...b, executable: { ...b.executable, path: 'C:\\Tools\\agency.cmd' } })],
+    ['multi-line version', (b) => reseal({ ...b, capabilities: { ...b.capabilities, engine_version: 'copilot 1\nTOKEN=x' } })],
+    ['missing Agency version', (b) => reseal({ ...b, capabilities: { ...b.capabilities, agency_version: null } })],
+    ['wrong run', (b) => reseal({ ...b, run_id: 'other-run' })],
+    ['wrong adapter kind', (b) => reseal({ ...b, adapter_kind: 'fixture' })],
+    ['unsealed tamper', (b) => ({ ...b, package: { ...b.package, inventory_sha256: 'e'.repeat(64) } })],
+    ['unselected engine', () => sealedBinding(first, { engine: 'claude' })],
+  ];
+  for (const [label, forge] of variants) {
+    assert.throws(() => fx.store.bindExecution({ expectedRevision: first.revision, binding: forge(sealedBinding(first)) }),
+      /invalid state/, label);
+  }
+  assert.deepEqual(fx.store.read(), first);
+});
+
+test('U3 binding: read-only policy requires enforced capability and a tampered persisted binding fails closed', async (t) => {
+  const fx = await setup(t);
+  fx.manifest.phases[0].agent.access = 'read-only';
+  fs.writeFileSync(fx.manifestPath, yaml.dump(fx.manifest));
+  const accepted = P.prepareV2Manifest(fx.manifest, fx.manifestPath);
+  const first = fx.store.initialize(accepted);
+  assert.deepEqual(S.executionRequest(first, 'agency-copilot').access, ['read-only']);
+  assert.throws(() => fx.store.bindExecution({ expectedRevision: first.revision, binding: sealedBinding(first) }), /read-only/);
+  const binding = sealedBinding(first, { capabilities: { read_only_enforced: true } });
+  assert.equal(binding.evidence.read_only_enforcement, 'known');
+  fx.store.bindExecution({ expectedRevision: first.revision, binding });
+  const record = fx.store.read();
+  const tampered = structuredClone(record);
+  tampered.execution_bindings['agency-copilot'].executable.path = 'C:\\Other\\agency.exe';
+  fs.writeFileSync(P.statusPathFor(fx.manifestPath), JSON.stringify(tampered));
+  assert.throws(() => fx.store.read(), /invalid state/);
+  fs.writeFileSync(P.statusPathFor(fx.manifestPath), JSON.stringify(record));
+  assert.deepEqual(fx.store.read(), record);
+});
+
+test('U3 binding: failed publication and degraded projection return no binding', async (t) => {
+  const fx = await setup(t);
+  const first = fx.store.initialize(fx.accepted);
+  const failing = S.createStateStore({ manifestPath: fx.manifestPath, owner: fx.owner,
+    _fs: { renameSync() { throw Object.assign(new Error('disk full'), { code: 'ENOSPC' }); } } });
+  assert.throws(() => failing.bindExecution({ expectedRevision: first.revision, binding: sealedBinding(first) }), /publish/);
+  assert.deepEqual(fx.store.read(), first);
+  const E = require('./event-log');
+  const projected = fx.store.projectOutbox({ expectedRevision: first.revision });
+  fs.appendFileSync(E.eventLogPath(projected), '{bad}\n');
+  const degraded = fx.store.projectOutbox({ expectedRevision: projected.revision });
+  assert.equal(degraded.projection.status, 'degraded');
+  assert.throws(() => fx.store.bindExecution({ expectedRevision: degraded.revision, binding: sealedBinding(degraded) }), /projection/);
+  assert.equal(fx.store.read().execution_bindings, undefined);
+});
+
+test('U3 binding: rerun starts unbound while history keeps the prior run binding', async (t) => {
+  const fx = await setup(t);
+  const first = fx.store.initialize(fx.accepted);
+  const binding = sealedBinding(first);
+  fx.store.bindExecution({ expectedRevision: first.revision, binding });
+  const projected = fx.store.projectOutbox({ expectedRevision: fx.store.read().revision });
+  const next = fx.store.rerun({ expectedRevision: projected.revision, accepted: fx.accepted });
+  assert.equal(next.execution_bindings, undefined, 'an explicit new run must preflight and bind again');
+  assert.deepEqual(next.history.at(-1).execution_bindings, { 'agency-copilot': binding });
+  assert.throws(() => fx.store.bindExecution({ expectedRevision: next.revision, binding }), /invalid state/,
+    'a prior run binding cannot be replayed into the new run');
+});
