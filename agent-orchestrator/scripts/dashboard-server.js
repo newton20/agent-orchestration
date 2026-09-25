@@ -30,7 +30,8 @@ const digest = (value) => createHash('sha256').update(value).digest('hex');
 const fileKey = (file) => process.platform === 'win32' ? path.resolve(file).toLowerCase() : path.resolve(file);
 const absentOwner = (error) => ['ENOENT', 'ECONNREFUSED'].includes(error.code);
 const readinessTimeout = (error) => error.code === undefined && error.message === 'owner readiness query timed out';
-// A pipe closed around our request surfaces as EPIPE/ECONNRESET or an empty reply; malformed replies stay fatal.
+// A pipe closed around or during our request surfaces as EPIPE/ECONNRESET or a reply that ends early;
+// replies with invalid content stay fatal.
 const peerClosed = (error) => ['EPIPE', 'ECONNRESET'].includes(error.code) ||
   (error instanceof SyntaxError && error.message === 'Unexpected end of JSON input');
 const DISCOVERY_SETTLE_MS = 2000;
@@ -665,7 +666,7 @@ async function serveDashboard(options) {
 
 async function startDashboard(options) {
   const context = contextFor(options);
-  const deadline = Date.now() + START_MS;
+  const deadline = Date.now() + (options._startMs ?? START_MS);
   while (Date.now() < deadline) {
     let found = null;
     let starting = false;

@@ -807,6 +807,36 @@ test('U5 a launched service that fails post-readiness verification is killed', {
   assert.equal(status.status, 'stopped', 'the unverified child must not keep the dashboard claim');
 });
 
+test('U5 startup deadlines cut off hung discovery and kill a child whose verification hangs', { timeout: 90000 }, async (t) => {
+  const queryOwner = W.queryOwner;
+  for (const stage of ['initial discovery', 'post-readiness verification']) await t.test(stage, async (t) => {
+    const fx = fixture(t);
+    fx.services.push(async () => {
+      const status = await D.statusDashboard(fx.options);
+      if (status.status === 'running') await D.stopDashboard({ ...fx.options, serviceId: status.service_id });
+    });
+    let queries = 0;
+    const mock = t.mock.method(W, 'queryOwner', async (workspace, options) => {
+      if (options?.namespace !== 'dashboard') return queryOwner(workspace, options);
+      if (++queries === 1 && stage !== 'initial discovery') throw Object.assign(new Error('connect ENOENT'), { code: 'ENOENT' });
+      return new Promise(() => {});
+    });
+    const budget = stage === 'initial discovery' ? 2000 : 20000;
+    const startedAt = Date.now();
+    await assert.rejects(D.startDashboard({ ...fx.options, _startMs: budget }), /dashboard startup acknowledgement timed out/);
+    const elapsed = Date.now() - startedAt;
+    assert.ok(elapsed >= budget - 100 && elapsed < budget + 3000, `startup deadline honored: ${elapsed} ms`);
+    assert.equal(queries, stage === 'initial discovery' ? 1 : 2, 'the hung await is the one cut off');
+    mock.mock.restore();
+    let status;
+    for (let i = 0; i < 100 && status?.status !== 'stopped'; i++) {
+      status = await D.statusDashboard(fx.options);
+      if (status.status !== 'stopped') await delay(50);
+    }
+    assert.equal(status.status, 'stopped', 'a timed-out start leaves no service behind');
+  });
+});
+
 test('U5 a start that loses the claim to a starter that then dies before readiness launches its own service', { timeout: 60000 }, async (t) => {
   const fx = fixture(t);
   fx.services.push(async () => {
