@@ -722,4 +722,5 @@ module.exports = {
   STATE_SCHEMA_VERSION, EXECUTION_BINDING_VERSION, MAX_STATE_BYTES, canonicalJson, fingerprint,
   validateAccepted, validateState, readState, createStateStore,
   assertRerunEligible, executionRequest, executionEvidence, sealExecutionBinding, validateExecutionBinding,
+  exactKeys, CAPABILITY_FIELDS,
 };

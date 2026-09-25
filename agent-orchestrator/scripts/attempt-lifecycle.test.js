@@ -249,7 +249,8 @@ test('final advisory: reservation cleanup acknowledgement requires release and c
   assert.equal(fx.current().reservation_cleared, true);
 });
 
-async function fixture(t, { phases, review = false, launch, onLaunch, readOnly = false, fault, stateFs, hostEvidence = HOST, engines } = {}) {
+async function fixture(t, { phases, review = false, launch, onLaunch, readOnly = false, fault, stateFs, hostEvidence = HOST, engines,
+  preflightTimeoutMs, recheckMs = 0 } = {}) {
   const fx = runtimeFixture(t);
   fx.manifest.phases = phases || [{
     id: 'p1', agent: { role: 'impl' }, completion_signal: 'ignored-v1.md',
@@ -282,6 +283,7 @@ async function fixture(t, { phases, review = false, launch, onLaunch, readOnly =
     manifestPath: fx.manifestPath, _runtimeRoot: fx.runtimeRoot,
     ...(engines ? { _engineAdapters: fx.engineAdapters } : { _fixtureAdapter: adapter }),
     _lifecycleFault: fault, _hostEvidence: hostEvidence, _stateFs: stateFs, logger: () => {},
+    _preflightTimeoutMs: preflightTimeoutMs, _executionRecheckMs: recheckMs,
   });
   fx.options = options;
   fx.open = async (extra = {}) => {
@@ -1642,23 +1644,28 @@ function engineAdapter(fx, { engine = 'agency-copilot', launch, readOnly = false
     capabilities: Object.freeze({ engines: Object.freeze([engine]), read_only_enforced: readOnly,
       tracks_descendants: tracksDescendants, live_verified: false }),
     exe: fx.pkg.exe, plugin: fx.pkg.plugin, version: 'copilot 1.2.3', preflightError: null, staleHash: false,
-    async preflight(request) {
+    hang: false, shapeEvidence: null, signals: [],
+    async preflight(request, options) {
       fx.preflights.push({ engine, request });
+      adapter.signals.push(options?.signal);
+      if (adapter.hang) return new Promise(() => {});
       if (adapter.preflightError) throw new Error(adapter.preflightError);
       const current = sha(fs.readFileSync(adapter.exe));
       cachedHash = adapter.staleHash && cachedHash ? cachedHash : current;
-      return {
+      const evidence = {
         executable: { path: adapter.exe, sha256: cachedHash },
         package: { root: adapter.plugin, inventory_sha256: sha(fs.readFileSync(path.join(adapter.plugin, 'package-inventory.json'))) },
         capabilities: { engine_version: adapter.version, agency_version: engine === 'claude' ? null : 'agency 2.0.0',
           help_sha256: 'f'.repeat(64), read_only_enforced: readOnly, tracks_descendants: tracksDescendants, live_verified: false },
       };
+      return adapter.shapeEvidence ? adapter.shapeEvidence(evidence) : evidence;
     },
     async launch(attempt, context) {
       fx.calls.push(attempt);
       fx.launchContexts.push({ engine, attempt_id: attempt.attempt_id, binding: context.binding });
       assert.equal(context.binding.engine, attempt.engine);
       assert.equal(attempt.status, 'launching');
+      if (adapter.onLaunch) adapter.onLaunch(attempt);
       if (launch) return launch(attempt, context.observe);
       const engineProcess = processIdentity(nextPid++);
       await context.observe({ ...identity(attempt), id: 'launcher', kind: 'launch_process', process: processIdentity(nextPid++) });
@@ -1730,6 +1737,7 @@ test('U3 engine seam rejects invalid or self-authorizing adapters and cannot be 
   for (const [label, extra] of [
     ['mixed seams', { _fixtureAdapter: fixtureAdapter, _engineAdapters: [valid()] }],
     ['not an array', { _engineAdapters: valid() }],
+    ['empty array', { _engineAdapters: [] }],
     ['live self-claim', { _engineAdapters: [{ ...valid(), capabilities: { ...valid().capabilities, live_verified: true } }] }],
     ['multi-engine adapter', { _engineAdapters: [{ ...valid(), capabilities: { ...valid().capabilities, engines: ['agency-copilot', 'claude'] } }] }],
     ['missing preflight', { _engineAdapters: [{ ...valid(), preflight: undefined }] }],
@@ -1818,6 +1826,18 @@ test('U3 restart drift fails closed without re-resolving, and restoring the pinn
       fs.writeFileSync(other, EXE_BYTES);
       fx.engineAdapters[0].exe = fs.realpathSync.native(other);
       return () => { fx.engineAdapters[0].exe = fx.pkg.exe; };
+    },
+    'redirected package directory': (fx) => {
+      const hooks = path.join(fx.pkg.plugin, 'hooks');
+      const moved = path.join(fx.root, 'hooks-elsewhere');
+      fs.renameSync(hooks, moved);
+      fs.symlinkSync(moved, hooks, 'junction');
+      return () => { fs.rmdirSync(hooks); fs.renameSync(moved, hooks); };
+    },
+    'unbounded package directory depth': (fx) => {
+      const top = path.join(fx.pkg.plugin, 'deep');
+      fs.mkdirSync(path.join(top, ...Array.from({ length: 40 }, () => 'd')), { recursive: true });
+      return () => fs.rmSync(top, { recursive: true, force: true });
     },
   };
   for (const [label, drift] of Object.entries(drifts)) {
@@ -2020,4 +2040,113 @@ test('U3 an unverifiable pinned binding blocks dispatch, and only an explicit ne
   assert.equal(rebound.executable.sha256, sha('upgraded native agency'));
   assert.equal(fx.calls.length, 2);
   assert.equal(fx.current('p1').execution.binding_id, rebound.binding_id);
+});
+
+const statusText = (fx) => fs.readFileSync(require('./parse-manifest').statusPathFor(fx.manifestPath), 'utf8');
+
+test('U3 every dispatch re-verifies the pinned identity, even later in the same tick', async (t) => {
+  const other = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'orchestrator-u3-other-'));
+  t.after(() => fs.rmSync(other, { recursive: true, force: true }));
+  require('node:child_process').execFileSync('git', ['init', '--quiet', other]);
+  const fx = await fixture(t, { phases: [
+    { id: 'p1', agent: { role: 'impl' }, completion_signal: 'one.md' },
+    { id: 'p2', agent: { role: 'impl', workdir: other }, completion_signal: 'two.md' },
+  ], engines: withEngines() });
+  fx.engineAdapters[0].onLaunch = () => fs.writeFileSync(fx.pkg.exe, 'upgraded during the first launch');
+  await fx.tick();
+  const state = fx.runtime.store.read();
+  assert.equal(fx.calls.length, 1);
+  assert.equal(fx.preflights.length, 2, 'the second dispatch must not reuse the first verification');
+  assert.equal(state.phases.p2.blocker.code, 'binding_drift');
+  assert.equal(state.phases.p2.roles.impl.attempts.length, 0);
+});
+
+test('U3 adapter error text never reaches canonical state and varying errors do not churn revisions', async (t) => {
+  const fx = await fixture(t, { engines: withEngines() });
+  fx.engineAdapters[0].preflightError = 'Command failed: agency --version TOKEN=secret-one';
+  await fx.tick();
+  const state = fx.runtime.store.read();
+  assert.equal(state.phases.p1.blocker.code, 'preflight_failed');
+  assert.equal(state.phases.p1.blocker.detail, 'engine adapter preflight failed');
+  fx.engineAdapters[0].preflightError = 'Command failed: agency --version TOKEN=secret-two';
+  await fx.tick();
+  assert.equal(fx.runtime.store.read().revision, state.revision);
+  const log = require('./event-log').eventLogPath(fx.runtime.store.projectOutbox({ expectedRevision: state.revision }));
+  for (const text of [statusText(fx), fs.readFileSync(log, 'utf8')]) {
+    assert.equal(/secret-(one|two)|TOKEN=/.test(text), false);
+  }
+});
+
+test('U3 a hung preflight is abandoned at the controller deadline without stalling the tick', async (t) => {
+  const fx = await fixture(t, { engines: withEngines(), preflightTimeoutMs: 50 });
+  fx.engineAdapters[0].hang = true;
+  await fx.tick();
+  const state = fx.runtime.store.read();
+  assert.equal(state.phases.p1.blocker.code, 'preflight_failed');
+  assert.match(state.phases.p1.blocker.detail, /exceeded 50 ms/);
+  assert.equal(fx.engineAdapters[0].signals[0].aborted, true, 'the adapter is told to stop its probes');
+  assert.equal(fx.calls.length, 0);
+});
+
+test('U3 malformed or self-authorizing preflight evidence never becomes a binding', async (t) => {
+  for (const [label, shape] of [
+    ['invocation arguments', (e) => ({ ...e, invocation: { file: e.executable.path, args: ['--token', 'hidden'] } })],
+    ['environment inside capabilities', (e) => ({ ...e, capabilities: { ...e.capabilities, environment: { TOKEN: 'hidden' } } })],
+    ['live self-claim', (e) => ({ ...e, capabilities: { ...e.capabilities, live_verified: true } })],
+    ['capability contradicting the adapter declaration', (e) => ({ ...e, capabilities: { ...e.capabilities, tracks_descendants: false } })],
+  ]) {
+    await t.test(label, async (t) => {
+      const fx = await fixture(t, { engines: withEngines() });
+      fx.engineAdapters[0].shapeEvidence = shape;
+      await fx.tick();
+      const state = fx.runtime.store.read();
+      assert.equal(state.execution_bindings, undefined);
+      assert.equal(state.phases.p1.blocker.code, 'preflight_failed');
+      assert.match(state.phases.p1.blocker.detail, /evidence must contain only|cannot claim live|disagree/);
+      assert.equal(/hidden|--token/.test(statusText(fx)), false);
+      assert.equal(fx.calls.length, 0);
+    });
+  }
+});
+
+test('U3 a checkout-deferred role keeps its execution blocker until it is actually re-verified', async (t) => {
+  const phases = [
+    { id: 'p1', agent: { role: 'impl' }, completion_signal: 'one.md' },
+    { id: 'p2', agent: { role: 'impl' }, depends_on: ['p1'], completion_signal: 'two.md' },
+    { id: 'p3', agent: { role: 'impl', engine: 'agency-claude' }, depends_on: ['p1'], completion_signal: 'three.md' },
+  ];
+  const fx = await fixture(t, { phases, engines: withEngines((fx) => {
+    const claudePackage = enginePackage(fx.root, 'claude');
+    const claude = engineAdapter(fx, { engine: 'agency-claude' });
+    Object.assign(claude, { exe: claudePackage.exe, plugin: claudePackage.plugin });
+    return [engineAdapter(fx), claude];
+  }) });
+  await fx.tick();
+  fx.complete(fx.current('p1'));
+  fs.writeFileSync(fx.pkg.exe, 'upgraded copilot');
+  await fx.tick();
+  let state = fx.runtime.store.read();
+  assert.equal(state.phases.p2.blocker.code, 'binding_drift');
+  assert.equal(fx.current('p3').status, 'running', 'the other engine still dispatches and now holds the checkout');
+  const preflights = fx.preflights.length;
+  await fx.tick();
+  state = fx.runtime.store.read();
+  assert.equal(state.phases.p2.blocker.code, 'binding_drift', 'a deferred role proves nothing about drift');
+  assert.equal(fx.preflights.length, preflights);
+});
+
+test('U3 execution failures are rechecked on a bounded interval, and a restart rechecks immediately', async (t) => {
+  const fx = await fixture(t, { engines: withEngines(), recheckMs: 60000 });
+  fx.engineAdapters[0].preflightError = 'probe unavailable';
+  await fx.tick();
+  await fx.tick();
+  assert.equal(fx.preflights.length, 1);
+  fx.engineAdapters[0].preflightError = null;
+  await fx.tick();
+  assert.equal(fx.calls.length, 0, 'recovery waits for the recheck interval');
+  await fx.reopen();
+  await fx.tick();
+  assert.equal(fx.preflights.length, 2);
+  assert.equal(fx.calls.length, 1);
+  assert.equal(fx.runtime.store.read().phases.p1.blocker, undefined);
 });

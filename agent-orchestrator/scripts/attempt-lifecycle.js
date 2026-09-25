@@ -7,9 +7,10 @@ const yaml = require('js-yaml');
 const W = require('./workspace-owner');
 const {
   canonicalJson, fingerprint, EXECUTION_BINDING_VERSION, executionRequest, executionEvidence,
-  sealExecutionBinding, validateExecutionBinding,
+  sealExecutionBinding, validateExecutionBinding, exactKeys, CAPABILITY_FIELDS,
 } = require('./state-store');
 const { V2_ENGINES } = require('./parse-manifest');
+const { INVENTORY_FILENAME } = require('./package-plugin');
 const { observeProcessIdentity, sameHostname, creationTimeKey } = require('./check-health');
 const { observeProcessTable } = require('./spawn-session');
 const { generatePrompt, atomicWrite } = require('./generate-prompt');
@@ -21,10 +22,12 @@ const MAX_ATTEMPTS_PER_ROLE = 64;
 const MAX_OBSERVATIONS = 64;
 // Intent, reservation, launch, every allowed observation, the outcome, and binding/blocker bookkeeping.
 const DISPATCH_EVENT_RESERVE = MAX_OBSERVATIONS + 6;
-const PACKAGE_INVENTORY = 'package-inventory.json';
 const MAX_PACKAGE_FILES = 4096;
+const MAX_PACKAGE_ENTRIES = 2 * MAX_PACKAGE_FILES;
+const MAX_PACKAGE_DEPTH = 32;
 const MAX_INVENTORY_BYTES = 4 * 1024 * 1024;
-const CAPABILITY_FIELDS = ['engine_version', 'agency_version', 'help_sha256', 'read_only_enforced', 'tracks_descendants'];
+const PREFLIGHT_TIMEOUT_MS = 60 * 1000;
+const EXECUTION_RECHECK_MS = 5 * 60 * 1000;
 const EXECUTION_REASONS = Object.freeze({
   adapter_unavailable: 'no trusted engine adapter is configured for the accepted engine',
   preflight_failed: 'engine preflight could not establish an execution binding; dispatch is blocked',
@@ -53,8 +56,9 @@ function hasDispatchCapacity(state) {
     Buffer.byteLength(canonicalJson(state.outbox)) <= MAX_OUTBOX_BYTES - DISPATCH_EVENT_RESERVE * 1024;
 }
 
-const exactKeys = (value, keys) => isObject(value) &&
-  canonicalJson(Object.keys(value).sort()) === canonicalJson([...keys].sort());
+// Only controller-authored check messages may reach canonical state; adapter error text is never persisted.
+class ExecutionCheckError extends Error {}
+const check = (message) => new ExecutionCheckError(message);
 
 function validateEngineAdapters(adapters) {
   const registry = new Map();
@@ -84,15 +88,34 @@ function normalizePreflight(raw, adapter) {
   if (!exactKeys(raw, ['executable', 'package', 'capabilities']) || !exactKeys(raw.executable, ['path', 'sha256']) ||
       !exactKeys(raw.package, ['root', 'inventory_sha256']) ||
       !exactKeys(raw.capabilities, [...CAPABILITY_FIELDS, 'live_verified'])) {
-    throw new Error('engine preflight evidence must contain only executable, package and capability facts');
+    throw check('engine preflight evidence must contain only executable, package and capability facts');
   }
   const { live_verified: live, ...capabilities } = raw.capabilities;
-  if (live !== false) throw new Error('engine preflight cannot claim live verification');
+  if (live !== false) throw check('engine preflight cannot claim live verification');
   if (capabilities.read_only_enforced !== adapter.capabilities.read_only_enforced ||
       capabilities.tracks_descendants !== adapter.capabilities.tracks_descendants) {
-    throw new Error('engine preflight capabilities disagree with the adapter declaration');
+    throw check('engine preflight capabilities disagree with the adapter declaration');
   }
   return copy({ executable: raw.executable, package: raw.package, capabilities });
+}
+
+// Preflight must be effect-free, so abandoning it at the deadline cannot strand an external launch.
+async function runPreflight(adapter, request, timeoutMs) {
+  const abort = new AbortController();
+  let timer;
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      abort.abort();
+      reject(check(`engine adapter preflight exceeded ${timeoutMs} ms`));
+    }, timeoutMs);
+  });
+  try {
+    const raw = await Promise.race([Promise.resolve().then(() => adapter.preflight(request, { signal: abort.signal })), deadline]);
+    return normalizePreflight(raw, adapter);
+  } catch (error) {
+    if (error instanceof ExecutionCheckError) throw error;
+    throw check('engine adapter preflight failed');
+  } finally { clearTimeout(timer); }
 }
 
 function evidenceDrift(binding, evidence) {
@@ -107,57 +130,68 @@ const sha256File = (file) => createHash('sha256').update(fs.readFileSync(file)).
 // The controller re-hashes pinned files itself so adapter-reported evidence cannot vouch for a changed file.
 function verifyPinnedFiles({ executable, package: pkg }) {
   if (fs.realpathSync.native(executable.path) !== executable.path || !fs.lstatSync(executable.path).isFile() ||
-      !/\.exe$/i.test(executable.path)) throw new Error('executable is no longer the pinned native file');
-  if (sha256File(executable.path) !== executable.sha256) throw new Error('executable sha256 changed');
+      !/\.exe$/i.test(executable.path)) throw check('executable is no longer the pinned native file');
+  if (sha256File(executable.path) !== executable.sha256) throw check('executable sha256 changed');
   if (fs.realpathSync.native(pkg.root) !== pkg.root || !fs.lstatSync(pkg.root).isDirectory()) {
-    throw new Error('package root is no longer the pinned directory');
+    throw check('package root is no longer the pinned directory');
   }
-  const inventoryPath = path.join(pkg.root, PACKAGE_INVENTORY);
+  const inventoryPath = path.join(pkg.root, INVENTORY_FILENAME);
   const stat = fs.lstatSync(inventoryPath);
-  if (!stat.isFile() || stat.size > MAX_INVENTORY_BYTES) throw new Error('package inventory is not a bounded regular file');
+  if (!stat.isFile() || stat.size > MAX_INVENTORY_BYTES) throw check('package inventory is not a bounded regular file');
   const bytes = fs.readFileSync(inventoryPath);
-  if (createHash('sha256').update(bytes).digest('hex') !== pkg.inventory_sha256) throw new Error('package inventory sha256 changed');
-  const inventory = JSON.parse(bytes.toString('utf8'));
+  if (createHash('sha256').update(bytes).digest('hex') !== pkg.inventory_sha256) throw check('package inventory sha256 changed');
+  let inventory;
+  try { inventory = JSON.parse(bytes.toString('utf8')); } catch { throw check('package inventory is not valid JSON'); }
   if (!isObject(inventory) || inventory.version !== 1 || inventory.algorithm !== 'sha256' ||
       !Array.isArray(inventory.files) || inventory.files.length > MAX_PACKAGE_FILES) {
-    throw new Error('package inventory format is unsupported');
+    throw check('package inventory format is unsupported');
   }
   const listed = new Map();
   for (const entry of inventory.files) {
-    if (!isObject(entry) || typeof entry.path !== 'string' || entry.path === PACKAGE_INVENTORY || listed.has(entry.path) ||
+    if (!isObject(entry) || typeof entry.path !== 'string' || entry.path === INVENTORY_FILENAME || listed.has(entry.path) ||
         entry.path.split('/').some((part) => !part || part === '.' || part === '..' || /[\\:\0]/.test(part)) ||
         !Number.isSafeInteger(entry.size) || entry.size < 0 || !/^[a-f0-9]{64}$/.test(entry.sha256)) {
-      throw new Error('package inventory entry is invalid');
+      throw check('package inventory entry is invalid');
     }
     listed.set(entry.path, entry);
   }
   const found = new Set();
-  (function visit(directory, prefix) {
+  let entries = 0;
+  (function visit(directory, prefix, depth) {
+    if (depth > MAX_PACKAGE_DEPTH) throw check('package directory tree exceeds the supported depth');
     for (const name of fs.readdirSync(directory)) {
+      if (++entries > MAX_PACKAGE_ENTRIES) throw check('package contains too many entries');
       const file = path.join(directory, name);
       const relative = prefix ? `${prefix}/${name}` : name;
       const entry = fs.lstatSync(file);
-      if (entry.isSymbolicLink()) throw new Error(`package contains a redirected entry: ${relative}`);
-      if (entry.isDirectory()) visit(file, relative);
-      else if (!entry.isFile()) throw new Error(`package contains an unsupported entry: ${relative}`);
-      else if (relative !== PACKAGE_INVENTORY) found.add(relative);
-      if (found.size > MAX_PACKAGE_FILES) throw new Error('package contains too many files');
+      if (entry.isSymbolicLink()) throw check(`package contains a redirected entry: ${relative}`);
+      if (entry.isDirectory()) visit(file, relative, depth + 1);
+      else if (!entry.isFile()) throw check(`package contains an unsupported entry: ${relative}`);
+      else if (relative !== INVENTORY_FILENAME) found.add(relative);
     }
-  })(pkg.root, '');
-  for (const relative of found) if (!listed.has(relative)) throw new Error(`package contains an unlisted file: ${relative}`);
+  })(pkg.root, '', 0);
+  for (const relative of found) if (!listed.has(relative)) throw check(`package contains an unlisted file: ${relative}`);
   for (const [relative, entry] of listed) {
     const file = path.join(pkg.root, ...relative.split('/'));
     if (!found.has(relative) || fs.statSync(file).size !== entry.size || sha256File(file) !== entry.sha256) {
-      throw new Error(`package file changed: ${relative}`);
+      throw check(`package file changed: ${relative}`);
     }
   }
 }
 
-function executionFailure(code, detail) {
-  const text = detail instanceof Error ? detail.message : String(detail);
-  return { code, reason: EXECUTION_REASONS[code], detail: text.replace(/[\u0000-\u001f\u007f]+/g, ' ').slice(0, 256) };
+function executionDetail(error) {
+  if (error instanceof ExecutionCheckError) return error.message;
+  if (typeof error?.message === 'string' && error.message.startsWith('invalid state: ')) return error.message;
+  if (typeof error?.code === 'string' && /^E[A-Z0-9]{1,31}$/.test(error.code)) {
+    return `${error.code} during ${/^[a-z]{1,32}$/.test(error.syscall || '') ? error.syscall : 'file verification'}`;
+  }
+  return 'unexpected execution verification error';
 }
 
+function executionFailure(code, detail) {
+  const text = typeof detail === 'string' ? detail : executionDetail(detail);
+  return { code, reason: EXECUTION_REASONS[code], detail: text.replace(/[\u0000-\u001f\u007f]+/g, ' ').slice(0, 256) };
+}
 function newerSample(sample, watermark) {
   return !watermark || (sample.sample_id !== watermark.sample_id &&
     Date.parse(sample.observed_at) > Date.parse(watermark.observed_at));
@@ -476,14 +510,21 @@ function aggregate(state) {
   }
 }
 
-async function createAttemptLifecycle({ owner, store, manifestPath, _runtimeRoot, _fixtureAdapter, _engineAdapters, _lifecycleFault, _hostEvidence }) {
+async function createAttemptLifecycle({ owner, store, manifestPath, _runtimeRoot, _fixtureAdapter, _engineAdapters, _lifecycleFault, _hostEvidence,
+  _preflightTimeoutMs = PREFLIGHT_TIMEOUT_MS, _executionRecheckMs = EXECUTION_RECHECK_MS }) {
   if (_fixtureAdapter !== undefined && _engineAdapters !== undefined) {
     throw new Error('fixture and engine adapters cannot be combined; production V2 dispatch is disabled');
+  }
+  if (!Number.isSafeInteger(_preflightTimeoutMs) || _preflightTimeoutMs <= 0 ||
+      !Number.isSafeInteger(_executionRecheckMs) || _executionRecheckMs < 0) {
+    throw new Error('engine preflight timeout and execution recheck interval must be bounded integers');
   }
   validateFixtureAdapter(_fixtureAdapter);
   const fixture = _fixtureAdapter;
   const engines = validateEngineAdapters(_engineAdapters);
   const dispatching = Boolean(fixture) || engines.size > 0;
+  // In-memory only, so a controller restart always rechecks immediately.
+  const executionFailures = new Map();
   const primary = store.read().workspace;
   const context = { manifest_path: path.resolve(manifestPath), run_id: store.read().run_id };
   const owners = new Map([[primary.key, owner]]);
@@ -692,7 +733,7 @@ async function createAttemptLifecycle({ owner, store, manifestPath, _runtimeRoot
     const state = store.read();
     const existing = state.execution_bindings?.[engine] || null;
     const request = executionRequest(state, engine);
-    const preflight = async () => normalizePreflight(await adapter.preflight(copy({ run_id: state.run_id, engine, ...request })), adapter);
+    const preflight = () => runPreflight(adapter, copy({ run_id: state.run_id, engine, ...request }), _preflightTimeoutMs);
     if (existing) {
       let evidence;
       try { evidence = await preflight(); } catch (error) {
@@ -701,7 +742,9 @@ async function createAttemptLifecycle({ owner, store, manifestPath, _runtimeRoot
       const changed = evidenceDrift(existing, evidence);
       if (changed.length) return { failure: executionFailure('binding_drift', `changed ${changed.join(', ')}`) };
       try { verifyPinnedFiles(existing); } catch (error) {
-        return { failure: executionFailure('binding_drift', error) };
+        // A missing pinned file is drift; other OS errors (locks, access) only leave the binding unverified.
+        const drift = error instanceof ExecutionCheckError || ['ENOENT', 'ENOTDIR'].includes(error?.code);
+        return { failure: executionFailure(drift ? 'binding_drift' : 'binding_unverified', error) };
       }
       return { binding: existing };
     }
@@ -874,7 +917,7 @@ async function createAttemptLifecycle({ owner, store, manifestPath, _runtimeRoot
         fault('after_reconcile');
         await syncReservations();
         if (!dispatching || state.operator.paused || state.projection?.status === 'degraded') return store.read();
-        const verified = new Map();
+        const now = Date.parse(sample.observed_at);
         for (const phaseId of state.accepted.execution_order) {
           const phase = state.accepted.phases.find((p) => p.id === phaseId);
           const latest = store.read();
@@ -884,10 +927,10 @@ async function createAttemptLifecycle({ owner, store, manifestPath, _runtimeRoot
           if (latest.operator.paused || (runtime.blocker && !recheck) || ['completed', 'failed'].includes(runtime.status)) continue;
           const roles = phase.review_loop.enabled ? [runtime.review_stage] : Object.keys(runtime.roles);
           const failures = [];
-          let evaluated = true;
+          let unverified = false;
           for (const role of roles) {
             const admission = store.read();
-            if (admission.operator.paused || !hasDispatchCapacity(admission)) { evaluated = false; break; }
+            if (admission.operator.paused || !hasDispatchCapacity(admission)) { unverified = true; break; }
             const entry = store.read().phases[phase.id].roles[role];
             const category = retryCategory(entry, runtime.review_iteration);
             const previous = currentAttempt(entry);
@@ -895,14 +938,23 @@ async function createAttemptLifecycle({ owner, store, manifestPath, _runtimeRoot
               (entry.budgets?.[category] || 0) >= RETRY_LIMITS[category])) continue;
             const agent = agentFor(latest, phase, role);
             if (allAttempts(store.read()).some((a) => unreleased(a) && a.workspace.key === agent.workspace.key &&
-                a.attempt_id !== (previous?.status === 'queued' ? previous.attempt_id : null)) && agent.access === 'mutating') continue;
+                a.attempt_id !== (previous?.status === 'queued' ? previous.attempt_id : null)) && agent.access === 'mutating') {
+              unverified = true;
+              continue;
+            }
             const queued = previous?.status === 'queued' ? previous : null;
             if (queued && !adapterFor(queued)) throw new Error(dispatchRefusal(queued));
             let binding = null;
             if (engines.size) {
-              if (!verified.has(agent.engine)) verified.set(agent.engine, await verifyExecution(agent.engine));
-              const outcome = verified.get(agent.engine);
-              if (outcome.failure) { failures.push(outcome.failure); continue; }
+              // Successes are never reused: each dispatch re-verifies, because a prior launch may have changed files.
+              const cached = executionFailures.get(agent.engine);
+              const outcome = cached && now < cached.retry_at ? cached : await verifyExecution(agent.engine);
+              if (outcome.failure) {
+                if (outcome !== cached) executionFailures.set(agent.engine, { ...outcome, retry_at: now + _executionRecheckMs });
+                failures.push(outcome.failure);
+                continue;
+              }
+              executionFailures.delete(agent.engine);
               binding = outcome.binding;
             }
             let id = queued?.attempt_id || null;
@@ -912,7 +964,7 @@ async function createAttemptLifecycle({ owner, store, manifestPath, _runtimeRoot
             }
             await dispatch(id, sample, binding);
           }
-          if (engines.size && evaluated) setExecutionBlocker(phase.id, failures[0] || null);
+          if (engines.size && (failures.length || !unverified)) setExecutionBlocker(phase.id, failures[0] || null);
         }
         return commit('aggregate', aggregate);
       } finally { busy = false; }

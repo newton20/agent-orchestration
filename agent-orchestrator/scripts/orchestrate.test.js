@@ -134,9 +134,13 @@ test('U3 public V2 runner keeps engine dispatch dormant; only trusted programmat
     async preflight() { throw new Error('probe unavailable offline'); },
     async launch() { assert.fail('engine launch reached'); },
   };
-  const result = await ActualOrchestrator.runOrchestrator({ ...base, _engineAdapters: [adapter] });
+  const warnings = [];
+  const result = await ActualOrchestrator.runOrchestrator({ ...base, _engineAdapters: [adapter],
+    logger: (level, message) => { if (level === 'warn') warnings.push(message); } });
   assert.equal(result.ok, true, JSON.stringify(result));
   assert.equal(result.summary, 'live_dispatch_disabled');
+  assert.ok(warnings.some((message) => /phase p1 execution blocked \(preflight_failed\)/.test(message)), JSON.stringify(warnings));
+  assert.equal(warnings.some((message) => message.includes('offline')), false, 'adapter error text is never echoed');
   state = require('./state-store').readState(fx.manifestPath);
   assert.equal(state.live_dispatch_enabled, false);
   assert.equal(state.execution_bindings, undefined);
