@@ -30,9 +30,11 @@ const digest = (value) => createHash('sha256').update(value).digest('hex');
 const fileKey = (file) => process.platform === 'win32' ? path.resolve(file).toLowerCase() : path.resolve(file);
 const absentOwner = (error) => ['ENOENT', 'ECONNREFUSED'].includes(error.code);
 const readinessTimeout = (error) => error.code === undefined && error.message === 'owner readiness query timed out';
-// Windows reports a pipe closed around our request as EPIPE/ECONNRESET or an empty reply.
-const peerClosed = (error) => error instanceof SyntaxError || ['EPIPE', 'ECONNRESET'].includes(error.code);
+// A pipe closed around our request surfaces as EPIPE/ECONNRESET or an empty reply; malformed replies stay fatal.
+const peerClosed = (error) => ['EPIPE', 'ECONNRESET'].includes(error.code) ||
+  (error instanceof SyntaxError && error.message === 'Unexpected end of JSON input');
 const DISCOVERY_SETTLE_MS = 2000;
+const DISCOVERY_RETRY_MS = 50;
 const STOP_ACK_MS = 10000;
 const START_MS = 30000;
 let defaultRuntimeRoot;
@@ -146,13 +148,24 @@ function controlRequest(pipe, request) {
 // Readiness, private records and the control reply are separate reads, so an instance that stops or
 // dies can vanish between them. Absence is concluded only from a fresh owner query, never from these errors.
 async function discover(context) {
-  const deadline = Date.now() + DISCOVERY_SETTLE_MS;
+  let deadline;
   for (;;) {
     try { return await observeInstance(context); } catch (error) {
-      if (!(absentOwner(error) || peerClosed(error)) || Date.now() >= deadline) throw error;
+      if (!(absentOwner(error) || peerClosed(error))) throw error;
+      deadline ??= Date.now() + DISCOVERY_SETTLE_MS;
+      if (Date.now() + DISCOVERY_RETRY_MS >= deadline) throw error;
     }
-    await delay(50);
+    await delay(DISCOVERY_RETRY_MS);
   }
+}
+
+// Pipe timeouts bound inactivity only, so lifecycle deadlines also race each awaited reply.
+function within(deadline, pending, message) {
+  let timer;
+  const expired = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), Math.max(0, deadline - Date.now()));
+  });
+  return Promise.race([pending, expired]).finally(() => clearTimeout(timer));
 }
 
 async function observeInstance(context) {
@@ -210,7 +223,8 @@ async function stopDashboard(options) {
   const deadline = Date.now() + STOP_ACK_MS;
   while (Date.now() < deadline) {
     try {
-      const owner = await W.queryOwner(context.workspace, { namespace: 'dashboard' });
+      const owner = await within(deadline, W.queryOwner(context.workspace, { namespace: 'dashboard' }),
+        'dashboard stop acknowledgement timed out');
       if (owner.service_id !== serviceId) return { status: 'stopped', service_id: serviceId };
     } catch (error) {
       if (absentOwner(error)) return { status: 'stopped', service_id: serviceId };
@@ -655,7 +669,7 @@ async function startDashboard(options) {
   while (Date.now() < deadline) {
     let found = null;
     let starting = false;
-    try { found = await discover(context); } catch (error) {
+    try { found = await within(deadline, discover(context), 'dashboard startup acknowledgement timed out'); } catch (error) {
       if (error.code !== 'DASHBOARD_STARTING') throw error;
       starting = true;
     }
@@ -685,7 +699,7 @@ async function launchDashboard(context, options, deadline) {
         : done(reject, Object.assign(new Error(message?.error || 'dashboard startup failed'), { code: message?.code })));
       child.send({ manifestPath: context.manifestPath, _runtimeRoot: context.runtimeRoot, _staticRoot: options._staticRoot });
     });
-    const found = await discover(context);
+    const found = await within(deadline, discover(context), 'dashboard startup acknowledgement timed out');
     if (!found || found.status.service_id !== ready.service_id) throw new Error('dashboard readiness instance mismatch');
     child.disconnect();
     child.unref();
