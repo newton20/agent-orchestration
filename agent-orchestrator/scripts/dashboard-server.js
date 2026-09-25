@@ -29,6 +29,12 @@ const token = () => randomBytes(32).toString('base64url');
 const digest = (value) => createHash('sha256').update(value).digest('hex');
 const fileKey = (file) => process.platform === 'win32' ? path.resolve(file).toLowerCase() : path.resolve(file);
 const absentOwner = (error) => ['ENOENT', 'ECONNREFUSED'].includes(error.code);
+const readinessTimeout = (error) => error.code === undefined && error.message === 'owner readiness query timed out';
+// Windows reports a pipe closed around our request as EPIPE/ECONNRESET or an empty reply.
+const peerClosed = (error) => error instanceof SyntaxError || ['EPIPE', 'ECONNRESET'].includes(error.code);
+const DISCOVERY_SETTLE_MS = 2000;
+const STOP_ACK_MS = 10000;
+const START_MS = 30000;
 let defaultRuntimeRoot;
 
 class DashboardError extends Error {
@@ -137,11 +143,23 @@ function controlRequest(pipe, request) {
   });
 }
 
+// Readiness, private records and the control reply are separate reads, so an instance that stops or
+// dies can vanish between them. Absence is concluded only from a fresh owner query, never from these errors.
 async function discover(context) {
+  const deadline = Date.now() + DISCOVERY_SETTLE_MS;
+  for (;;) {
+    try { return await observeInstance(context); } catch (error) {
+      if (!(absentOwner(error) || peerClosed(error)) || Date.now() >= deadline) throw error;
+    }
+    await delay(50);
+  }
+}
+
+async function observeInstance(context) {
   let owner;
   try { owner = await W.queryOwner(context.workspace, { namespace: 'dashboard' }); } catch (error) {
     if (absentOwner(error)) return null;
-    if (error.code === undefined && error.message === 'owner readiness query timed out') {
+    if (readinessTimeout(error)) {
       throw Object.assign(new Error('dashboard owner readiness is still pending; retry discovery', { cause: error }),
         { code: 'DASHBOARD_STARTING' });
     }
@@ -189,13 +207,14 @@ async function stopDashboard(options) {
   await controlRequest(found.paths.control, {
     type: 'stop', service_id: serviceId, workspace_key: context.workspace.key, token: found.capability.token,
   });
-  for (let i = 0; i < 100; i++) {
+  const deadline = Date.now() + STOP_ACK_MS;
+  while (Date.now() < deadline) {
     try {
       const owner = await W.queryOwner(context.workspace, { namespace: 'dashboard' });
       if (owner.service_id !== serviceId) return { status: 'stopped', service_id: serviceId };
     } catch (error) {
       if (absentOwner(error)) return { status: 'stopped', service_id: serviceId };
-      if (!(error instanceof SyntaxError) && error.code !== 'ECONNRESET') throw error;
+      if (!peerClosed(error) && !readinessTimeout(error)) throw error;
     }
     await delay(50);
   }
@@ -632,29 +651,33 @@ async function serveDashboard(options) {
 
 async function startDashboard(options) {
   const context = contextFor(options);
-  async function waitForService() {
-    const deadline = Date.now() + 30000;
-    while (Date.now() < deadline) {
-      try {
-        const found = await discover(context);
-        if (found) return found;
-      } catch (error) { if (error.code !== 'DASHBOARD_STARTING') throw error; }
-      await delay(100);
+  const deadline = Date.now() + START_MS;
+  while (Date.now() < deadline) {
+    let found = null;
+    let starting = false;
+    try { found = await discover(context); } catch (error) {
+      if (error.code !== 'DASHBOARD_STARTING') throw error;
+      starting = true;
     }
-    throw new Error('dashboard startup acknowledgement timed out');
+    if (found) return found.status;
+    // A competing starter that dies before readiness leaves no owner; launch rather than wait it out.
+    if (!starting) {
+      const launched = await launchDashboard(context, options, deadline);
+      if (launched) return launched;
+    }
+    await delay(100);
   }
-  let existing;
-  try { existing = await discover(context); } catch (error) {
-    if (error.code !== 'DASHBOARD_STARTING') throw error;
-    return (await waitForService()).status;
-  }
-  if (existing) return existing.status;
+  throw new Error('dashboard startup acknowledgement timed out');
+}
+
+async function launchDashboard(context, options, deadline) {
   const child = fork(__filename, ['--child'], {
     detached: true, windowsHide: true, stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
   });
   try {
     const ready = await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('dashboard startup acknowledgement timed out')), 30000);
+      const timer = setTimeout(() => reject(new Error('dashboard startup acknowledgement timed out')),
+        Math.max(1, deadline - Date.now()));
       const done = (callback, value) => { clearTimeout(timer); callback(value); };
       child.once('error', (error) => done(reject, error));
       child.once('exit', () => done(reject, new Error('dashboard exited before readiness')));
@@ -669,7 +692,7 @@ async function startDashboard(options) {
     return found.status;
   } catch (error) {
     child.kill();
-    if (error.code === 'ELOCKED') return (await waitForService()).status;
+    if (error.code === 'ELOCKED') return null;
     throw error;
   }
 }
