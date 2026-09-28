@@ -276,10 +276,14 @@ identity. Failed OS observations remain explicitly unknown. An old handle
 only cleans up its own matching discovery record and never a successor's.
 Stale process-death discovery records may remain; they confer no ownership.
 
-`queryOwner(workspace, { namespace })` sends a bounded readiness query.
+`queryOwner(workspace, { namespace, signal })` sends a bounded readiness query.
 Its response contains `{ ok, status, workspace_key, namespace, service_id,
 process }`. Unsupported/mutation requests and mismatched keys are rejected.
 This endpoint is an inspection surface, not operator-command authorization.
+An optional `AbortSignal` cancels the connection, not just the waiting
+promise; an already-aborted request opens no socket. A zero-byte reply has
+code `EMPTY_REPLY`. Nonempty malformed or truncated JSON remains a protocol
+failure and is not interchangeable with an empty closed pipe.
 
 Updated V1 and V2 runners share the controller pipe claim. Before
 activation, the owner inspects legacy lock records at the manifest protocol
@@ -367,6 +371,16 @@ reuse the live service; another manifest in that workspace conflicts.
 when authoring/state reads are unavailable. An optional exact service ID
 after the manifest further scopes `stop`.
 
+Discovery re-observes transient closed pipes or vanished records for up to
+two seconds after the first such error. It concludes absence only from a
+fresh owner query; identity conflicts and nonempty malformed replies stay
+fatal. Startup has a 30-second acknowledgement deadline, including discovery
+and post-readiness verification. After discovery, stop allows ten seconds
+for its control reply and observed owner release. Deadline cancellation
+closes pending sockets and ends discovery retries. A failed start kills only
+its own newly launched child. A competing starter that vanishes permits a
+fresh launch attempt under the remaining startup deadline.
+
 `access` displays a one-use bootstrap code only to a human interactive
 terminal. Codes expire after 60 seconds; at most eight unexpired codes may
 exist. The private `CODE_LIMIT` diagnostic is not a browser HTTP response.
@@ -424,10 +438,23 @@ artifact text supply context without upgrading worker reports to independent
 verification. Reader freshness, run-correlated controller evidence, and
 workspace service observations remain separate.
 
-Initial redirected/aliased static roots are rejected. Actual TCP
-backpressure/stop-flush behavior and near-limit polling cost remain platform
-acceptance concerns; known transient stop/discovery failures require retry
-rather than guessing ownership.
+Initial redirected/aliased static roots are rejected. Windows fixture
+acceptance exercised real TCP backpressure, resumed-reader ordered delivery,
+stalled-reader disconnection and slot reuse while healthy readers continued
+receiving observations. Stop replies were readable after detached service
+exit. These observations do not establish behavior on other platforms or
+near-limit polling performance.
+
+Package publication retries only Windows `EPERM` from the final staging
+rename, using a five-second monotonic budget and asynchronous bounded
+backoff. Each attempt rechecks the parent, staging path and absent output;
+installation is not repeated and the publication lock stays held. Other
+errors fail immediately. Exhaustion fails publication and retains the first
+rename error if cleanup succeeds; cleanup failures are surfaced explicitly.
+Cleanup proceeds only through a safe parent. A replaced unsafe parent
+may require manual cleanup of relocated owned artifacts. OS calls, process
+suspension and scheduler delays can postpone error delivery beyond the
+retry budget; no additional rename starts once that budget has expired.
 
 ## Attempt lifecycle
 

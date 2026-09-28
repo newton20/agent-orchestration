@@ -748,6 +748,11 @@ test('U5 discovery retries a live owner through closed pipes without inferring a
   reply = () => Promise.reject(malformed);
   await assert.rejects(D.statusDashboard(fx.options), (error) => error === malformed);
   assert.equal(queries, 1, 'a malformed reply is not an empty closed-pipe reply');
+  const truncated = new SyntaxError('Unexpected end of JSON input');
+  queries = 0;
+  reply = () => Promise.reject(truncated);
+  await assert.rejects(D.statusDashboard(fx.options), error => error === truncated);
+  assert.equal(queries, 1, 'truncated owner replies must never be treated as empty replies');
   mock.mock.restore();
   assert.equal((await D.statusDashboard(fx.options)).service_id, service.serviceId);
 });
@@ -755,7 +760,7 @@ test('U5 discovery retries a live owner through closed pipes without inferring a
 test('U5 an acknowledged stop waits through closed, empty and timed-out owner replies within its deadline', { timeout: 120000 }, async (t) => {
   const queryOwner = W.queryOwner;
   const cases = {
-    'transient owner replies': [closedPipe(), new SyntaxError('Unexpected end of JSON input'), new Error('owner readiness query timed out')],
+    'transient owner replies': [closedPipe(), Object.assign(new Error('empty reply'), { code: 'EMPTY_REPLY' }), new Error('owner readiness query timed out')],
     'rejected owner queries stay fatal': [new Error('owner readiness full-key mismatch or rejected query')],
     'malformed owner replies stay fatal': [new SyntaxError('Unexpected token \'x\', "x" is not valid JSON')],
     'an owner that keeps answering exhausts the deadline': null,
@@ -824,9 +829,11 @@ test('U5 startup deadlines cut off hung discovery and kill a child whose verific
       if (status.status === 'running') await D.stopDashboard({ ...fx.options, serviceId: status.service_id });
     });
     let queries = 0;
+    let querySignal;
     const mock = t.mock.method(W, 'queryOwner', async (workspace, options) => {
       if (options?.namespace !== 'dashboard') return queryOwner(workspace, options);
       if (++queries === 1 && stage !== 'initial discovery') throw Object.assign(new Error('connect ENOENT'), { code: 'ENOENT' });
+      querySignal = options.signal;
       return new Promise(() => {});
     });
     const budget = stage === 'initial discovery' ? 2000 : 20000;
@@ -835,6 +842,7 @@ test('U5 startup deadlines cut off hung discovery and kill a child whose verific
     const elapsed = Date.now() - startedAt;
     assert.ok(elapsed >= budget - 100 && elapsed < budget + 3000, `startup deadline honored: ${elapsed} ms`);
     assert.equal(queries, stage === 'initial discovery' ? 1 : 2, 'the hung await is the one cut off');
+    assert.equal(querySignal?.aborted, true, 'deadline cancellation must reach the owner socket');
     mock.mock.restore();
     let status;
     for (let i = 0; i < 100 && status?.status !== 'stopped'; i++) {
@@ -888,6 +896,57 @@ test('U5 a start that loses the claim to a starter that then dies before readine
   assert.notEqual(status.pid, process.pid);
   assert.equal(observed[1], 'starting', 'after ELOCKED the start waits on the live starter');
   assert.ok(Date.now() - startedAt < 20000, 'a vanished starter must not consume the startup deadline');
+});
+
+test('U5 outer startup deadline cancels a nested discovery retry without another query', async (t) => {
+  const fx = fixture(t);
+  let queries = 0;
+  let querySignal;
+  t.mock.method(W, 'queryOwner', async (_workspace, options) => {
+    queries++;
+    if (queries === 1) throw closedPipe();
+    querySignal = options.signal;
+    return new Promise(() => {});
+  });
+  await assert.rejects(D.startDashboard({ ...fx.options, _startMs: 200 }), /startup acknowledgement timed out/);
+  assert.equal(queries, 2);
+  assert.equal(querySignal?.aborted, true);
+  await delay(100);
+  assert.equal(queries, 2, 'cancelled discovery must not continue in the background');
+});
+
+test('U5 startup deadline closes a trickling dashboard control socket', { timeout: 30000 }, async (t) => {
+  const fx = fixture(t);
+  const service = await start(t, fx);
+  const ready = await W.queryOwner(fx.state.workspace, { namespace: 'dashboard' });
+  const directory = path.dirname(service.discoveryPath);
+  const records = ['dashboard.json', 'dashboard-capability.json']
+    .map(name => [path.join(directory, name), fs.readFileSync(path.join(directory, name))]);
+  await service.stop();
+  fs.mkdirSync(directory, { recursive: true });
+  for (const [file, bytes] of records) fs.writeFileSync(file, bytes);
+  let peer;
+  let interval;
+  let resolveClosed;
+  const closed = new Promise(resolve => { resolveClosed = resolve; });
+  const server = net.createServer({ allowHalfOpen: true }, socket => {
+    peer = socket;
+    socket.on('error', () => {});
+    socket.on('close', () => { clearInterval(interval); resolveClosed(); });
+    socket.once('data', () => {
+      interval = setInterval(() => socket.write(' '), 20);
+    });
+  });
+  await new Promise(resolve => server.listen(`${W.pipeNameFor(fx.state.workspace, 'dashboard')}-${service.serviceId}`, resolve));
+  t.after(async () => {
+    clearInterval(interval);
+    peer?.destroy();
+    await new Promise(resolve => server.close(resolve));
+  });
+  t.mock.method(W, 'queryOwner', async () => ready);
+  await assert.rejects(D.startDashboard({ ...fx.options, _startMs: 250 }), /startup acknowledgement timed out/);
+  assert.ok(peer, 'the pending control request was reached');
+  await Promise.race([closed, delay(500).then(() => assert.fail('control socket outlived its cancelled request'))]);
 });
 
 test('U5 artifacts are bounded inert text selected by identity, and redirected paths fail closed', { timeout: 30000 }, async (t) => {

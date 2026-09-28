@@ -49,6 +49,12 @@ output. Node itself is not bundled. The packager excludes test/fixture
 paths, hidden entries, and named secret/credential paths; never place
 secrets inside runtime source files.
 
+On Windows, a transient `EPERM` at the final staging rename is retried for
+up to five seconds with path and output-absence checks before each attempt.
+The package is installed only once; retries never replace an existing output.
+Other errors or exhausted retries fail publication explicitly. A paused
+process or slow OS call can delay return beyond the retry budget.
+
 Agency loading does not run this build or install npm dependencies on the
 package's behalf. A successful build establishes filesystem/runtime
 packaging only, not installed-engine plugin discovery.
@@ -104,6 +110,10 @@ and `access` accept `--workspace` with the original Git workspace directory.
 `stop` may also take an exact service ID after the manifest path. It stops
 only that companion, not the controller or its workers. Status comes from
 live service identity rather than trusting a stored port or PID.
+Closed-pipe discovery races are re-observed within a two-second settle
+window. Startup waits up to 30 seconds; after discovery, stop waits up to
+ten seconds for its reply and owner release. Expiry cancels pending
+queries; malformed replies and identity mismatches remain fatal.
 
 The snapshot/SSE/auth/error contract and sanitized examples are in
 `scripts\test-support\dashboard-contract.json` in the source checkout.
@@ -113,9 +123,9 @@ not evidence that a controller or worker is alive.
 
 This service is for a trusted local operator, not isolation from hostile
 same-user processes. Loopback cookies are host-scoped rather than
-port-isolated. Rejected aliased static roots, transient concurrent
-stop/discovery failures, real-socket backpressure/stop flush behavior, and
-near-limit polling cost remain documented platform acceptance concerns.
+port-isolated. Aliased static roots are rejected. Windows fixtures exercise
+real-socket backpressure, delayed stop replies and lifecycle races;
+near-limit polling cost remains unbenchmarked.
 Never resolve a diagnostic by deleting scheduler ownership records.
 
 ## V1 status
