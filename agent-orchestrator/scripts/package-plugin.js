@@ -5,8 +5,11 @@ const fs = require('node:fs');
 const path = require('node:path');
 const childProcess = require('node:child_process');
 const { createHash } = require('node:crypto');
+const { performance } = require('node:perf_hooks');
+const timers = require('node:timers/promises');
 
 const INVENTORY_FILENAME = 'package-inventory.json';
+const RENAME_RETRY_TIMEOUT_MS = 5000;
 const NPM_CI_ARGS = Object.freeze(['ci', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund']);
 const COMPONENTS = ['.claude-plugin', 'agency.json', 'hooks', 'scripts', 'templates', 'skills', 'dashboard'];
 const OPTIONAL_FILES = ['hooks.json'];
@@ -100,6 +103,32 @@ function checkoutRoot(sourceRoot) {
 
 function assertOutputAbsent(output) {
   if (exists(output)) throw new Error(`Output already exists: ${output}`);
+}
+
+async function publishStaging(staging, output) {
+  const parent = path.dirname(output);
+  const deadline = performance.now() + RENAME_RETRY_TIMEOUT_MS;
+  let firstError;
+  let delayMs = 50;
+  for (;;) {
+    if (firstError && performance.now() >= deadline) throw firstError;
+    safePath(parent);
+    safePath(staging);
+    assertOutputAbsent(output);
+    // Synchronous path checks can also consume the remaining retry budget.
+    if (firstError && performance.now() >= deadline) throw firstError;
+    try {
+      fs.renameSync(staging, output);
+      return;
+    } catch (error) {
+      if (process.platform !== 'win32' || error.code !== 'EPERM') throw error;
+      firstError ??= error;
+    }
+    const remainingMs = deadline - performance.now();
+    if (remainingMs <= 0) throw firstError;
+    await timers.setTimeout(Math.min(delayMs, remainingMs));
+    delayMs = Math.min(delayMs * 2, 500);
+  }
 }
 
 function excluded(name) {
@@ -252,18 +281,20 @@ async function packagePlugin({ output, sourceRoot = path.resolve(__dirname, '..'
     const inventory = inventoryFor(staging);
     validateInstalledDependencies(scripts, manifest, lock);
     fs.writeFileSync(path.join(staging, INVENTORY_FILENAME), `${JSON.stringify(inventory, null, 2)}\n`, { flag: 'wx' });
-    safePath(parent);
-    safePath(staging);
-    assertOutputAbsent(output);
-    fs.renameSync(staging, output);
+    await publishStaging(staging, output);
     staging = undefined;
     return { output, inventoryPath: path.join(output, INVENTORY_FILENAME), inventory };
   } finally {
     try {
-      if (staging) fs.rmSync(staging, { recursive: true, force: true });
+      if (staging) {
+        // A replaced ancestor must not redirect cleanup into an unowned tree.
+        safePath(parent);
+        fs.rmSync(staging, { recursive: true, force: true });
+      }
     } finally {
       if (lockFd !== undefined) {
         fs.closeSync(lockFd);
+        safePath(parent);
         fs.unlinkSync(lockPath);
       }
     }
