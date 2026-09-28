@@ -29,6 +29,12 @@ const token = () => randomBytes(32).toString('base64url');
 const digest = (value) => createHash('sha256').update(value).digest('hex');
 const fileKey = (file) => process.platform === 'win32' ? path.resolve(file).toLowerCase() : path.resolve(file);
 const absentOwner = (error) => ['ENOENT', 'ECONNREFUSED'].includes(error.code);
+const readinessTimeout = (error) => error.code === undefined && error.message === 'owner readiness query timed out';
+const peerClosed = (error) => ['EPIPE', 'ECONNRESET', 'EMPTY_REPLY'].includes(error.code);
+const DISCOVERY_SETTLE_MS = 2000;
+const DISCOVERY_RETRY_MS = 50;
+const STOP_ACK_MS = 10000;
+const START_MS = 30000;
 let defaultRuntimeRoot;
 
 class DashboardError extends Error {
@@ -113,20 +119,27 @@ function equalSecret(left, right) {
     Buffer.byteLength(left) === Buffer.byteLength(right) && timingSafeEqual(Buffer.from(left), Buffer.from(right));
 }
 
-function controlRequest(pipe, request) {
+function controlRequest(pipe, request, { signal } = {}) {
   return new Promise((resolve, reject) => {
-    const socket = net.createConnection(pipe);
+    signal?.throwIfAborted();
+    const socket = net.createConnection({ path: pipe, signal });
     let input = '';
     socket.setTimeout(2500, () => socket.destroy(new Error('dashboard control timed out')));
     socket.on('error', reject);
-    socket.on('connect', () => socket.end(JSON.stringify(request) + '\n'));
+    // Windows pipe shutdown can truncate a reply still being written.
+    socket.on('connect', () => socket.write(JSON.stringify(request) + '\n'));
     socket.on('data', (chunk) => {
       input += chunk.toString('utf8');
       if (Buffer.byteLength(input) > 64 * 1024) socket.destroy(new Error('oversized dashboard control response'));
     });
     socket.on('end', () => {
+      let response;
+      try { response = JSON.parse(input); } catch (_) {
+        reject(input ? new Error('invalid dashboard control response')
+          : Object.assign(new Error('dashboard control closed without a reply'), { code: 'EMPTY_REPLY' }));
+        return;
+      }
       try {
-        const response = JSON.parse(input);
         if (!response.ok) throw new Error(response.error || 'dashboard control rejected');
         if (response.service_id !== request.service_id || response.workspace_key !== request.workspace_key) {
           throw new Error('dashboard control instance mismatch');
@@ -137,16 +150,74 @@ function controlRequest(pipe, request) {
   });
 }
 
-async function discover(context) {
+// Readiness, private records and the control reply are separate reads, so an instance that stops or
+// dies can vanish between them. Absence is concluded only from a fresh owner query, never from these errors.
+async function discover(context, { signal } = {}) {
+  let deadline;
+  let lastError;
+  for (;;) {
+    signal?.throwIfAborted();
+    try {
+      return deadline === undefined ? await observeInstance(context, signal)
+        : await within(deadline, retrySignal => observeInstance(context, retrySignal), lastError, signal);
+    } catch (error) {
+      signal?.throwIfAborted();
+      if (!(absentOwner(error) || peerClosed(error))) throw error;
+      lastError = error;
+      deadline ??= Date.now() + DISCOVERY_SETTLE_MS;
+      if (Date.now() + DISCOVERY_RETRY_MS >= deadline) throw error;
+      await delay(DISCOVERY_RETRY_MS, undefined, { signal });
+      if (Date.now() >= deadline) throw error;
+    }
+  }
+}
+
+// Inactivity timeouts do not bound trickling peers; expiry must close the socket as well as reject.
+function within(deadline, operation, message, signal) {
+  const error = message instanceof Error ? message : new Error(message);
+  if (signal?.aborted) return Promise.reject(signal.reason);
+  if (Date.now() >= deadline) return Promise.reject(error);
+  const abort = new AbortController();
+  let timer;
+  let cancel;
+  const expired = new Promise((_, reject) => {
+    cancel = () => {
+      reject(signal.reason);
+      abort.abort(signal.reason);
+    };
+    signal?.addEventListener('abort', cancel, { once: true });
+    timer = setTimeout(() => {
+      reject(error);
+      abort.abort(error);
+    }, Math.max(0, deadline - Date.now()));
+  });
+  const pending = Promise.resolve().then(() => {
+    abort.signal.throwIfAborted();
+    return operation(abort.signal);
+  }).then(result => {
+    if (Date.now() >= deadline) {
+      abort.abort(error);
+      throw error;
+    }
+    return result;
+  });
+  return Promise.race([pending, expired]).finally(() => {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', cancel);
+  });
+}
+
+async function observeInstance(context, signal) {
   let owner;
-  try { owner = await W.queryOwner(context.workspace, { namespace: 'dashboard' }); } catch (error) {
+  try { owner = await W.queryOwner(context.workspace, { namespace: 'dashboard', signal }); } catch (error) {
     if (absentOwner(error)) return null;
-    if (error.code === undefined && error.message === 'owner readiness query timed out') {
+    if (readinessTimeout(error)) {
       throw Object.assign(new Error('dashboard owner readiness is still pending; retry discovery', { cause: error }),
         { code: 'DASHBOARD_STARTING' });
     }
     throw error;
   }
+  signal?.throwIfAborted();
   if (owner.status !== 'ready') throw Object.assign(new Error('dashboard is starting or unavailable; retry discovery'),
     { code: 'DASHBOARD_STARTING' });
   const paths = instancePaths(context, owner.service_id);
@@ -157,7 +228,8 @@ async function discover(context) {
       !/^[A-Za-z0-9_-]{43}$/.test(capability.token)) throw new Error('dashboard discovery identity or manifest conflict');
   const status = await controlRequest(paths.control, {
     type: 'status', service_id: owner.service_id, workspace_key: context.workspace.key, token: capability.token,
-  });
+  }, { signal });
+  signal?.throwIfAborted();
   if (status.url !== discovery.url || status.manifest_path !== discovery.manifest_path ||
       !/^http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}$/.test(status.url)) throw new Error('dashboard discovery address mismatch');
   return { status, paths, capability };
@@ -186,16 +258,18 @@ async function stopDashboard(options) {
   if (!found) return { status: 'stopped', service_id: options.serviceId || null };
   if (options.serviceId && options.serviceId !== found.status.service_id) throw new Error('dashboard service instance changed; refusing stop');
   const serviceId = found.status.service_id;
-  await controlRequest(found.paths.control, {
+  const deadline = Date.now() + STOP_ACK_MS;
+  await within(deadline, signal => controlRequest(found.paths.control, {
     type: 'stop', service_id: serviceId, workspace_key: context.workspace.key, token: found.capability.token,
-  });
-  for (let i = 0; i < 100; i++) {
+  }, { signal }), 'dashboard stop acknowledgement timed out');
+  while (Date.now() < deadline) {
     try {
-      const owner = await W.queryOwner(context.workspace, { namespace: 'dashboard' });
+      const owner = await within(deadline, signal => W.queryOwner(context.workspace, { namespace: 'dashboard', signal }),
+        'dashboard stop acknowledgement timed out');
       if (owner.service_id !== serviceId) return { status: 'stopped', service_id: serviceId };
     } catch (error) {
       if (absentOwner(error)) return { status: 'stopped', service_id: serviceId };
-      if (!(error instanceof SyntaxError) && error.code !== 'ECONNRESET') throw error;
+      if (!peerClosed(error) && !readinessTimeout(error)) throw error;
     }
     await delay(50);
   }
@@ -632,29 +706,33 @@ async function serveDashboard(options) {
 
 async function startDashboard(options) {
   const context = contextFor(options);
-  async function waitForService() {
-    const deadline = Date.now() + 30000;
-    while (Date.now() < deadline) {
-      try {
-        const found = await discover(context);
-        if (found) return found;
-      } catch (error) { if (error.code !== 'DASHBOARD_STARTING') throw error; }
-      await delay(100);
+  const deadline = Date.now() + (options._startMs ?? START_MS);
+  while (Date.now() < deadline) {
+    let found = null;
+    let starting = false;
+    try { found = await within(deadline, signal => discover(context, { signal }), 'dashboard startup acknowledgement timed out'); } catch (error) {
+      if (error.code !== 'DASHBOARD_STARTING') throw error;
+      starting = true;
     }
-    throw new Error('dashboard startup acknowledgement timed out');
+    if (found) return found.status;
+    // A competing starter that dies before readiness leaves no owner; launch rather than wait it out.
+    if (!starting) {
+      const launched = await launchDashboard(context, options, deadline);
+      if (launched) return launched;
+    }
+    await delay(100);
   }
-  let existing;
-  try { existing = await discover(context); } catch (error) {
-    if (error.code !== 'DASHBOARD_STARTING') throw error;
-    return (await waitForService()).status;
-  }
-  if (existing) return existing.status;
+  throw new Error('dashboard startup acknowledgement timed out');
+}
+
+async function launchDashboard(context, options, deadline) {
   const child = fork(__filename, ['--child'], {
     detached: true, windowsHide: true, stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
   });
   try {
     const ready = await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('dashboard startup acknowledgement timed out')), 30000);
+      const timer = setTimeout(() => reject(new Error('dashboard startup acknowledgement timed out')),
+        Math.max(1, deadline - Date.now()));
       const done = (callback, value) => { clearTimeout(timer); callback(value); };
       child.once('error', (error) => done(reject, error));
       child.once('exit', () => done(reject, new Error('dashboard exited before readiness')));
@@ -662,14 +740,14 @@ async function startDashboard(options) {
         : done(reject, Object.assign(new Error(message?.error || 'dashboard startup failed'), { code: message?.code })));
       child.send({ manifestPath: context.manifestPath, _runtimeRoot: context.runtimeRoot, _staticRoot: options._staticRoot });
     });
-    const found = await discover(context);
+    const found = await within(deadline, signal => discover(context, { signal }), 'dashboard startup acknowledgement timed out');
     if (!found || found.status.service_id !== ready.service_id) throw new Error('dashboard readiness instance mismatch');
     child.disconnect();
     child.unref();
     return found.status;
   } catch (error) {
     child.kill();
-    if (error.code === 'ELOCKED') return (await waitForService()).status;
+    if (error.code === 'ELOCKED') return null;
     throw error;
   }
 }

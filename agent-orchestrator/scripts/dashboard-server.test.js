@@ -297,6 +297,138 @@ test('U5 deferred events recheck session expiry when observation drain resumes',
   assert.equal(frames.some((frame) => frame.includes('event: events\n')), false);
 });
 
+function appendEvents(fx, count, payloadBytes) {
+  const state = fx.state;
+  fs.mkdirSync(path.dirname(eventLogPath(state)), { recursive: true });
+  const lines = [];
+  for (let i = 0; i < count; i++) {
+    const sequence = state.next_event_sequence++;
+    lines.push(JSON.stringify({ sequence, event_id: `${state.run_id}:${sequence}`, run_id: state.run_id,
+      revision: ++state.revision, type: sequence === 1 ? 'run_created' : 'paused', payload: { note: 'x'.repeat(payloadBytes) } }));
+  }
+  fs.appendFileSync(eventLogPath(state), lines.join('\n') + '\n');
+  state.projection.acknowledged_sequence = state.next_event_sequence - 1;
+  fx.write();
+}
+
+// A raw loopback reader lets the test stop kernel-level reads; it decodes the chunked SSE body itself.
+function tcpReader(t, service, cookie, runId) {
+  const { host, port } = new URL(service.url);
+  const socket = net.connect(Number(port), '127.0.0.1');
+  t.after(() => socket.destroy());
+  const reader = { socket, ids: [], status: null, ended: false };
+  let raw = Buffer.alloc(0);
+  let body = '';
+  socket.on('connect', () => {
+    socket.write(`GET /api/stream?run_id=${runId} HTTP/1.1\r\nHost: ${host}\r\nCookie: ${cookie}\r\n\r\n`);
+    socket.pause();
+  });
+  socket.on('error', () => {});
+  socket.on('end', () => { reader.ended = true; });
+  socket.on('data', (chunk) => {
+    raw = Buffer.concat([raw, chunk]);
+    if (reader.status === null) {
+      const end = raw.indexOf('\r\n\r\n');
+      if (end < 0) return;
+      reader.status = Number(/^HTTP\/1\.1 (\d{3})/.exec(raw.subarray(0, end).toString('latin1'))[1]);
+      raw = raw.subarray(end + 4);
+    }
+    for (let line = raw.indexOf('\r\n'); line >= 0; line = raw.indexOf('\r\n')) {
+      const size = parseInt(raw.subarray(0, line).toString('latin1'), 16);
+      if (raw.length < line + 4 + size) break;
+      body += raw.subarray(line + 2, line + 2 + size).toString('utf8');
+      raw = raw.subarray(line + 4 + size);
+    }
+    for (let end = body.indexOf('\n\n'); end >= 0; end = body.indexOf('\n\n')) {
+      const frame = body.slice(0, end);
+      body = body.slice(end + 2);
+      if (!frame.includes('event: events\n')) continue;
+      const data = JSON.parse(frame.split('\n').find((line) => line.startsWith('data: ')).slice(6));
+      reader.ids.push(...data.events.map((event) => event.event_id));
+    }
+  });
+  return reader;
+}
+
+test('U5 real TCP backpressure disconnects stalled readers, frees their slots and keeps a resumed reader in sequence', { timeout: 90000 }, async (t) => {
+  const fx = fixture(t);
+  appendEvents(fx, 500, 2400);
+  const service = await start(t, fx);
+  const auth = await login(fx, service);
+  const cookie = auth.headers.Cookie;
+  const runId = fx.state.run_id;
+  const write = http.ServerResponse.prototype.write;
+  const served = new Map();
+  t.mock.method(http.ServerResponse.prototype, 'write', function (chunk, ...args) {
+    const accepted = write.call(this, chunk, ...args);
+    const port = this.socket?.remotePort;
+    if (port !== undefined && this.getHeader('X-Dashboard-Service') === service.serviceId && typeof chunk === 'string') {
+      let entry = served.get(port);
+      if (!entry) {
+        entry = { rejectedWrites: 0, drains: 0, stalledSince: null, maxBuffered: 0, closed: false };
+        served.set(port, entry);
+        this.once('close', () => { entry.closed = true; });
+      }
+      if (!accepted) {
+        entry.rejectedWrites++;
+        entry.stalledSince ??= Date.now();
+        this.once('drain', () => { entry.stalledSince = null; entry.drains++; });
+      }
+      entry.maxBuffered = Math.max(entry.maxBuffered, this.writableLength);
+    }
+    return accepted;
+  });
+  const growth = setInterval(() => appendEvents(fx, 20, 2400), 1000);
+  let resumeWhenStalled;
+  try {
+    const resumed = tcpReader(t, service, cookie, runId);
+    const stalled = Array.from({ length: D.LIMITS.streams - 1 }, () => tcpReader(t, service, cookie, runId));
+    const until = async (condition, message, timeout = 30000) => {
+      for (const deadline = Date.now() + timeout; !condition();) {
+        if (Date.now() > deadline) throw new Error(message);
+        await delay(100);
+      }
+    };
+    const entryFor = (reader) => served.get(reader.socket.localPort);
+    // Resume one reader only after the kernel has refused its data for a while, but before the drain deadline.
+    let stalledBeforeResumeMs = null;
+    let drainsAtResume = null;
+    resumeWhenStalled = setInterval(() => {
+      const since = entryFor(resumed)?.stalledSince;
+      if (since && Date.now() - since >= 1500) {
+        stalledBeforeResumeMs = Date.now() - since;
+        drainsAtResume = entryFor(resumed).drains;
+        clearInterval(resumeWhenStalled);
+        resumed.socket.resume();
+      }
+    }, 50);
+    await until(() => [resumed, ...stalled].every(entryFor), 'every reader must be served');
+    const full = await fetch(`${service.url}/api/stream?run_id=${runId}`, auth);
+    assert.equal(full.status, 429);
+    await full.body?.cancel();
+    await until(() => stalled.every((reader) => entryFor(reader).closed), 'stalled readers must be disconnected');
+    for (const reader of stalled) {
+      const entry = entryFor(reader);
+      assert.ok(entry.rejectedWrites > 0, 'the socket itself must apply backpressure');
+      assert.ok(entry.maxBuffered <= D.LIMITS.event_page_bytes + 32 * 1024, `bounded server buffering: ${entry.maxBuffered}`);
+    }
+    const abort = new AbortController();
+    t.after(() => abort.abort());
+    assert.equal((await fetch(`${service.url}/api/stream?run_id=${runId}`, { ...auth, signal: abort.signal })).status, 200);
+    clearInterval(growth);
+    const expected = Array.from({ length: fx.state.next_event_sequence - 1 }, (_, i) => `${runId}:${i + 1}`);
+    await until(() => resumed.ids.length >= expected.length, 'the resumed reader must receive the whole timeline');
+    assert.deepEqual(resumed.ids, expected);
+    assert.ok(stalledBeforeResumeMs >= 1500 && stalledBeforeResumeMs < 5000, `sustained stall before resume: ${stalledBeforeResumeMs}`);
+    assert.ok(entryFor(resumed).drains > drainsAtResume, 'the resumed reader recovered through drain');
+    assert.equal(entryFor(resumed).closed, false);
+    assert.equal(resumed.ended, false);
+  } finally {
+    clearInterval(growth);
+    clearInterval(resumeWhenStalled);
+  }
+});
+
 test('U5 HTTP auth is private, one-use, bounded, same-origin, and read-only', { timeout: 30000 }, async (t) => {
   const fx = fixture(t);
   const before = fs.readFileSync(statusPathFor(fx.manifestPath), 'utf8');
@@ -540,6 +672,283 @@ test('U5 startup keeps identity conflicts and private-record errors fatal', { ti
   assert.equal((await D.statusDashboard(fx.options)).service_id, service.serviceId);
 });
 
+const closedPipe = () => Object.assign(new Error('write EPIPE'), { code: 'EPIPE', syscall: 'write' });
+
+test('U5 discovery re-observes an instance that stops between readiness, private records and its control reply', { timeout: 60000 }, async (t) => {
+  const queryOwner = W.queryOwner;
+  const stages = ['owner reply', 'private records', 'control reply', 'empty control reply', 'truncated control reply', 'replacement owner'];
+  for (const stage of stages) await t.test(stage, async (t) => {
+    const fx = fixture(t);
+    const service = await start(t, fx);
+    const ready = await queryOwner(fx.state.workspace, { namespace: 'dashboard' });
+    const directory = path.dirname(service.discoveryPath);
+    const records = ['dashboard.json', 'dashboard-capability.json']
+      .map((name) => [path.join(directory, name), fs.readFileSync(path.join(directory, name))]);
+    const reply = { 'empty control reply': '', 'truncated control reply': '{"ok":' }[stage];
+    let replacement = null;
+    let controlReplies = 0;
+    let queries = 0;
+    t.mock.method(W, 'queryOwner', async (workspace, options) => {
+      if (options?.namespace !== 'dashboard' || ++queries > 1) return queryOwner(workspace, options);
+      await service.stop();
+      if (stage === 'owner reply') throw closedPipe();
+      if (stage.includes('control reply')) {
+        fs.mkdirSync(directory, { recursive: true });
+        for (const [file, bytes] of records) fs.writeFileSync(file, bytes);
+      }
+      if (reply !== undefined) {
+        const impostor = net.createServer((socket) => socket.once('data', () => { controlReplies++; socket.end(reply); }));
+        await new Promise((resolve) => impostor.listen(`${W.pipeNameFor(fx.state.workspace, 'dashboard')}-${service.serviceId}`, resolve));
+        t.after(() => new Promise((resolve) => impostor.close(resolve)));
+      }
+      if (stage === 'replacement owner') replacement = await start(t, fx);
+      return ready;
+    });
+    if (stage === 'truncated control reply') {
+      await assert.rejects(D.statusDashboard(fx.options), /invalid dashboard control response/);
+      assert.equal(queries, 1, 'a reply with content is a protocol failure, not a closed pipe');
+      assert.equal(controlReplies, 1);
+      return;
+    }
+    const status = await D.statusDashboard(fx.options);
+    if (stage === 'replacement owner') assert.equal(status.service_id, replacement.serviceId);
+    else assert.deepEqual(status, { status: 'stopped', service_id: null, url: null });
+    assert.equal(queries, 2, 'absence or replacement must come from a fresh owner query');
+    if (reply !== undefined) assert.equal(controlReplies, 1);
+  });
+});
+
+test('U5 discovery retries a live owner through closed pipes without inferring absence', { timeout: 30000 }, async (t) => {
+  const fx = fixture(t);
+  const service = await start(t, fx);
+  const queryOwner = W.queryOwner;
+  let queries = 0;
+  let reply;
+  const mock = t.mock.method(W, 'queryOwner', (workspace, options) => {
+    if (options?.namespace !== 'dashboard') return queryOwner(workspace, options);
+    return reply(++queries, workspace, options);
+  });
+  const persistent = closedPipe();
+  const fatal = new Error('owner readiness full-key mismatch or rejected query');
+  reply = (n, ...args) => n === 1 ? Promise.reject(closedPipe()) : queryOwner(...args);
+  assert.equal((await D.statusDashboard(fx.options)).service_id, service.serviceId);
+  assert.equal(queries, 2);
+  queries = 0;
+  reply = () => Promise.reject(persistent);
+  const started = Date.now();
+  await assert.rejects(D.statusDashboard(fx.options), (error) => error === persistent);
+  assert.ok(queries > 1, 'a closed pipe is re-observed');
+  assert.ok(Date.now() - started < 5000, 're-observation is bounded');
+  queries = 0;
+  reply = () => Promise.reject(fatal);
+  await assert.rejects(D.statusDashboard(fx.options), (error) => error === fatal);
+  assert.equal(queries, 1, 'identity and protocol failures are not retried');
+  const malformed = new SyntaxError('Unexpected token \'x\', "x" is not valid JSON');
+  queries = 0;
+  reply = () => Promise.reject(malformed);
+  await assert.rejects(D.statusDashboard(fx.options), (error) => error === malformed);
+  assert.equal(queries, 1, 'a malformed reply is not an empty closed-pipe reply');
+  const truncated = new SyntaxError('Unexpected end of JSON input');
+  queries = 0;
+  reply = () => Promise.reject(truncated);
+  await assert.rejects(D.statusDashboard(fx.options), error => error === truncated);
+  assert.equal(queries, 1, 'truncated owner replies must never be treated as empty replies');
+  mock.mock.restore();
+  assert.equal((await D.statusDashboard(fx.options)).service_id, service.serviceId);
+});
+
+test('U5 an acknowledged stop waits through closed, empty and timed-out owner replies within its deadline', { timeout: 120000 }, async (t) => {
+  const queryOwner = W.queryOwner;
+  const cases = {
+    'transient owner replies': [closedPipe(), Object.assign(new Error('empty reply'), { code: 'EMPTY_REPLY' }), new Error('owner readiness query timed out')],
+    'rejected owner queries stay fatal': [new Error('owner readiness full-key mismatch or rejected query')],
+    'malformed owner replies stay fatal': [new SyntaxError('Unexpected token \'x\', "x" is not valid JSON')],
+    'an owner that keeps answering exhausts the deadline': null,
+    'a reply that never completes is cut off at the deadline': 'hang',
+  };
+  for (const [name, replies] of Object.entries(cases)) await t.test(name, async (t) => {
+    const fx = fixture(t);
+    const service = await start(t, fx);
+    const ready = await queryOwner(fx.state.workspace, { namespace: 'dashboard' });
+    const bounded = !Array.isArray(replies);
+    const first = replies?.[0];
+    let queries = 0;
+    t.mock.method(W, 'queryOwner', async (workspace, options) => {
+      if (options?.namespace !== 'dashboard' || ++queries === 1) return queryOwner(workspace, options);
+      if (replies === 'hang') return new Promise(() => {});
+      if (!replies) return ready;
+      if (replies.length) throw replies.shift();
+      return queryOwner(workspace, options);
+    });
+    const startedAt = Date.now();
+    const stopping = D.stopDashboard({ ...fx.options, serviceId: service.serviceId });
+    if (bounded) {
+      await assert.rejects(stopping, /dashboard stop acknowledgement timed out/);
+      const elapsed = Date.now() - startedAt;
+      assert.ok(elapsed >= 9000 && elapsed < 12000, `bounded acknowledgement wait: ${elapsed} ms`);
+      if (replies === 'hang') assert.equal(queries, 2, 'the pending reply itself is cut off');
+    } else if (name.includes('fatal')) await assert.rejects(stopping, (error) => error === first);
+    else assert.deepEqual(await stopping, { status: 'stopped', service_id: service.serviceId });
+    if (!bounded) assert.equal(replies.length, 0);
+    await service.stop();
+    assert.equal(fs.existsSync(service.discoveryPath), false, 'the acknowledged stop completes');
+  });
+});
+
+test('U5 a launched service that fails post-readiness verification is killed', { timeout: 60000 }, async (t) => {
+  const fx = fixture(t);
+  fx.services.push(async () => {
+    const status = await D.statusDashboard(fx.options);
+    if (status.status === 'running') await D.stopDashboard({ ...fx.options, serviceId: status.service_id });
+  });
+  const queryOwner = W.queryOwner;
+  const rejected = new Error('owner readiness full-key mismatch or rejected query');
+  let queries = 0;
+  const mock = t.mock.method(W, 'queryOwner', async (workspace, options) => {
+    if (options?.namespace !== 'dashboard') return queryOwner(workspace, options);
+    if (++queries === 1) throw Object.assign(new Error('connect ENOENT'), { code: 'ENOENT' });
+    throw rejected;
+  });
+  await assert.rejects(D.startDashboard(fx.options), (error) => error === rejected);
+  assert.equal(queries, 2, 'verification ran after the launched child reported readiness');
+  mock.mock.restore();
+  let status;
+  for (let i = 0; i < 100 && status?.status !== 'stopped'; i++) {
+    status = await D.statusDashboard(fx.options);
+    if (status.status !== 'stopped') await delay(50);
+  }
+  assert.equal(status.status, 'stopped', 'the unverified child must not keep the dashboard claim');
+});
+
+test('U5 startup deadlines cut off hung discovery and kill a child whose verification hangs', { timeout: 90000 }, async (t) => {
+  const queryOwner = W.queryOwner;
+  for (const stage of ['initial discovery', 'post-readiness verification']) await t.test(stage, async (t) => {
+    const fx = fixture(t);
+    fx.services.push(async () => {
+      const status = await D.statusDashboard(fx.options);
+      if (status.status === 'running') await D.stopDashboard({ ...fx.options, serviceId: status.service_id });
+    });
+    let queries = 0;
+    let querySignal;
+    const mock = t.mock.method(W, 'queryOwner', async (workspace, options) => {
+      if (options?.namespace !== 'dashboard') return queryOwner(workspace, options);
+      if (++queries === 1 && stage !== 'initial discovery') throw Object.assign(new Error('connect ENOENT'), { code: 'ENOENT' });
+      querySignal = options.signal;
+      return new Promise(() => {});
+    });
+    const budget = stage === 'initial discovery' ? 2000 : 20000;
+    const startedAt = Date.now();
+    await assert.rejects(D.startDashboard({ ...fx.options, _startMs: budget }), /dashboard startup acknowledgement timed out/);
+    const elapsed = Date.now() - startedAt;
+    assert.ok(elapsed >= budget - 100 && elapsed < budget + 3000, `startup deadline honored: ${elapsed} ms`);
+    assert.equal(queries, stage === 'initial discovery' ? 1 : 2, 'the hung await is the one cut off');
+    assert.equal(querySignal?.aborted, true, 'deadline cancellation must reach the owner socket');
+    mock.mock.restore();
+    let status;
+    for (let i = 0; i < 100 && status?.status !== 'stopped'; i++) {
+      status = await D.statusDashboard(fx.options);
+      if (status.status !== 'stopped') await delay(50);
+    }
+    assert.equal(status.status, 'stopped', 'a timed-out start leaves no service behind');
+  });
+});
+
+test('U5 a start that loses the claim to a starter that then dies before readiness launches its own service', { timeout: 60000 }, async (t) => {
+  const fx = fixture(t);
+  fx.services.push(async () => {
+    const status = await D.statusDashboard(fx.options);
+    if (status.status === 'running') await D.stopDashboard({ ...fx.options, serviceId: status.service_id });
+  });
+  const holder = execFile(process.execPath, ['-e', `
+    require(process.argv[1]).acquireWorkspaceOwner(JSON.parse(process.argv[2]), { namespace: 'dashboard', _runtimeRoot: process.argv[3] })
+      .then((owner) => console.log(owner.serviceId), (error) => { console.error(error.message); process.exit(1); });
+    setInterval(() => {}, 1000);
+  `, require.resolve('./workspace-owner'), JSON.stringify(fx.state.workspace), fx.runtimeRoot], { windowsHide: true });
+  t.after(() => holder.kill());
+  const heldId = await new Promise((resolve, reject) => {
+    holder.stdout.once('data', (data) => resolve(String(data).trim()));
+    holder.once('exit', (code) => reject(new Error(`starting owner exited early (${code})`)));
+  });
+  assert.equal((await W.queryOwner(fx.state.workspace, { namespace: 'dashboard' })).status, 'starting');
+  // The first report of absence forces a launch while the claim is still held, so that child must fail ELOCKED.
+  const queryOwner = W.queryOwner;
+  const observed = [];
+  t.mock.method(W, 'queryOwner', async (workspace, options) => {
+    if (options?.namespace !== 'dashboard') return queryOwner(workspace, options);
+    if (observed.length === 0) {
+      observed.push('ENOENT');
+      throw Object.assign(new Error('connect ENOENT'), { code: 'ENOENT' });
+    }
+    if (observed.length === 2) holder.kill();
+    try {
+      const record = await queryOwner(workspace, options);
+      observed.push(record.status);
+      return record;
+    } catch (error) {
+      observed.push(error.code || error.message);
+      throw error;
+    }
+  });
+  const startedAt = Date.now();
+  const status = await D.startDashboard(fx.options);
+  assert.equal(status.status, 'running');
+  assert.notEqual(status.service_id, heldId);
+  assert.notEqual(status.pid, process.pid);
+  assert.equal(observed[1], 'starting', 'after ELOCKED the start waits on the live starter');
+  assert.ok(Date.now() - startedAt < 20000, 'a vanished starter must not consume the startup deadline');
+});
+
+test('U5 outer startup deadline cancels a nested discovery retry without another query', async (t) => {
+  const fx = fixture(t);
+  let queries = 0;
+  let querySignal;
+  t.mock.method(W, 'queryOwner', async (_workspace, options) => {
+    queries++;
+    if (queries === 1) throw closedPipe();
+    querySignal = options.signal;
+    return new Promise(() => {});
+  });
+  await assert.rejects(D.startDashboard({ ...fx.options, _startMs: 200 }), /startup acknowledgement timed out/);
+  assert.equal(queries, 2);
+  assert.equal(querySignal?.aborted, true);
+  await delay(100);
+  assert.equal(queries, 2, 'cancelled discovery must not continue in the background');
+});
+
+test('U5 startup deadline closes a trickling dashboard control socket', { timeout: 30000 }, async (t) => {
+  const fx = fixture(t);
+  const service = await start(t, fx);
+  const ready = await W.queryOwner(fx.state.workspace, { namespace: 'dashboard' });
+  const directory = path.dirname(service.discoveryPath);
+  const records = ['dashboard.json', 'dashboard-capability.json']
+    .map(name => [path.join(directory, name), fs.readFileSync(path.join(directory, name))]);
+  await service.stop();
+  fs.mkdirSync(directory, { recursive: true });
+  for (const [file, bytes] of records) fs.writeFileSync(file, bytes);
+  let peer;
+  let interval;
+  let resolveClosed;
+  const closed = new Promise(resolve => { resolveClosed = resolve; });
+  const server = net.createServer({ allowHalfOpen: true }, socket => {
+    peer = socket;
+    socket.on('error', () => {});
+    socket.on('close', () => { clearInterval(interval); resolveClosed(); });
+    socket.once('data', () => {
+      interval = setInterval(() => socket.write(' '), 20);
+    });
+  });
+  await new Promise(resolve => server.listen(`${W.pipeNameFor(fx.state.workspace, 'dashboard')}-${service.serviceId}`, resolve));
+  t.after(async () => {
+    clearInterval(interval);
+    peer?.destroy();
+    await new Promise(resolve => server.close(resolve));
+  });
+  t.mock.method(W, 'queryOwner', async () => ready);
+  await assert.rejects(D.startDashboard({ ...fx.options, _startMs: 250 }), /startup acknowledgement timed out/);
+  assert.ok(peer, 'the pending control request was reached');
+  await Promise.race([closed, delay(500).then(() => assert.fail('control socket outlived its cancelled request'))]);
+});
+
 test('U5 artifacts are bounded inert text selected by identity, and redirected paths fail closed', { timeout: 30000 }, async (t) => {
   const fx = fixture(t);
   const attempt = fx.attempt();
@@ -643,6 +1052,47 @@ test('U5 detached process readiness and stop work without acquiring controller a
   await assert.rejects(D.stopDashboard({ ...fx.options, serviceId: randomUUID() }), /instance/i);
   assert.equal((await fetch(started.url)).status, 200);
   await D.stopDashboard({ ...fx.options, serviceId: started.service_id });
+  assert.equal((await D.statusDashboard(fx.options)).status, 'stopped');
+});
+
+test('U5 a stop requester that reads only after the detached service exits still receives its acknowledgement', { timeout: 60000 }, async (t) => {
+  const fx = fixture(t);
+  fx.services.push(async () => {
+    const status = await D.statusDashboard(fx.options);
+    if (status.status === 'running') await D.stopDashboard({ ...fx.options, serviceId: status.service_id });
+  });
+  const started = await D.startDashboard(fx.options);
+  assert.notEqual(started.pid, process.pid);
+  const directory = path.join(fx.runtimeRoot, createHash('sha256').update(fx.state.workspace.key).digest('hex'),
+    'dashboard', started.service_id);
+  const { token } = JSON.parse(fs.readFileSync(path.join(directory, 'dashboard-capability.json'), 'utf8'));
+  const exited = async () => {
+    for (let i = 0; i < 300; i++) {
+      try { process.kill(started.pid, 0); } catch (error) {
+        if (error.code === 'ESRCH') return;
+        throw error;
+      }
+      await delay(50);
+    }
+    throw new Error('dashboard service process did not exit after stop');
+  };
+  const reply = await new Promise((resolve, reject) => {
+    const socket = net.createConnection(`${W.pipeNameFor(fx.state.workspace, 'dashboard')}-${started.service_id}`);
+    let input = '';
+    socket.setTimeout(30000, () => socket.destroy(new Error('stop acknowledgement was not delivered')));
+    socket.on('error', reject);
+    socket.on('data', (chunk) => { input += chunk.toString('utf8'); });
+    socket.on('end', () => resolve(input));
+    socket.on('connect', () => {
+      socket.pause();
+      socket.end(JSON.stringify({ type: 'stop', service_id: started.service_id,
+        workspace_key: fx.state.workspace.key, token }) + '\n');
+      exited().then(() => socket.resume(), reject);
+    });
+  });
+  const ack = JSON.parse(reply);
+  assert.equal(ack.ok, true);
+  assert.equal(ack.service_id, started.service_id);
   assert.equal((await D.statusDashboard(fx.options)).status, 'stopped');
 });
 

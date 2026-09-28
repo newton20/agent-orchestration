@@ -276,10 +276,14 @@ identity. Failed OS observations remain explicitly unknown. An old handle
 only cleans up its own matching discovery record and never a successor's.
 Stale process-death discovery records may remain; they confer no ownership.
 
-`queryOwner(workspace, { namespace })` sends a bounded readiness query.
+`queryOwner(workspace, { namespace, signal })` sends a bounded readiness query.
 Its response contains `{ ok, status, workspace_key, namespace, service_id,
 process }`. Unsupported/mutation requests and mismatched keys are rejected.
 This endpoint is an inspection surface, not operator-command authorization.
+An optional `AbortSignal` cancels the connection, not just the waiting
+promise; an already-aborted request opens no socket. A zero-byte reply has
+code `EMPTY_REPLY`. Nonempty malformed or truncated JSON remains a protocol
+failure and is not interchangeable with an empty closed pipe.
 
 Updated V1 and V2 runners share the controller pipe claim. Before
 activation, the owner inspects legacy lock records at the manifest protocol
@@ -348,8 +352,7 @@ accepted snapshot. Authoring validation errors/drift are reported
 separately, without replacing the run.
 
 Live engine acceptance and authenticated workflow mutations remain separate
-integrations. The read-only dashboard backend below adds neither capability;
-frontend integration and combined browser acceptance remain separate gates.
+integrations. The read-only dashboard below adds neither capability.
 
 ## Read-only dashboard companion
 
@@ -367,6 +370,16 @@ reuse the live service; another manifest in that workspace conflicts.
 `status`, `stop`, and `access` support `--workspace <original-directory>`
 when authoring/state reads are unavailable. An optional exact service ID
 after the manifest further scopes `stop`.
+
+Discovery re-observes transient closed pipes or vanished records for up to
+two seconds after the first such error. It concludes absence only from a
+fresh owner query; identity conflicts and nonempty malformed replies stay
+fatal. Startup has a 30-second acknowledgement deadline, including discovery
+and post-readiness verification. After discovery, stop allows ten seconds
+for its control reply and observed owner release. Deadline cancellation
+closes pending sockets and ends discovery retries. A failed start kills only
+its own newly launched child. A competing starter that vanishes permits a
+fresh launch attempt under the remaining startup deadline.
 
 `access` displays a one-use bootstrap code only to a human interactive
 terminal. Codes expire after 60 seconds; at most eight unexpired codes may
@@ -416,12 +429,32 @@ retain U4's 256-event/256-KiB bounds. Errors use fixed redacted messages,
 not raw filesystem exceptions, state, prompts, or credentials.
 
 Only `dashboard\index.html`, `dashboard\app.js`, and `dashboard\styles.css`
-are served as static assets. They are separately owned frontend files;
-their absence returns `UI_UNAVAILABLE`, not a successful placeholder.
-Initial redirected/aliased static roots are rejected. Real-browser
-authentication/reconnect and actual TCP backpressure/stop-flush acceptance
-remain unproven until separately exercised; known transient stop/discovery
-failures require retry rather than guessing ownership.
+are served as static assets. Packaging requires all three and includes them
+in the SHA-256 inventory; it excludes frontend tests and fixtures.
+Their absence returns `UI_UNAVAILABLE`, not a successful placeholder.
+The UI follows the current run unless the operator pins historical state.
+Canonical snapshots determine progress; the bounded timeline and inert
+artifact text supply context without upgrading worker reports to independent
+verification. Reader freshness, run-correlated controller evidence, and
+workspace service observations remain separate.
+
+Initial redirected/aliased static roots are rejected. Windows fixture
+acceptance exercised real TCP backpressure, resumed-reader ordered delivery,
+stalled-reader disconnection and slot reuse while healthy readers continued
+receiving observations. Stop replies were readable after detached service
+exit. These observations do not establish behavior on other platforms or
+near-limit polling performance.
+
+Package publication retries only Windows `EPERM` from the final staging
+rename, using a five-second monotonic budget and asynchronous bounded
+backoff. Each attempt rechecks the parent, staging path and absent output;
+installation is not repeated and the publication lock stays held. Other
+errors fail immediately. Exhaustion fails publication and retains the first
+rename error if cleanup succeeds; cleanup failures are surfaced explicitly.
+Cleanup proceeds only through a safe parent. A replaced unsafe parent
+may require manual cleanup of relocated owned artifacts. OS calls, process
+suspension and scheduler delays can postpone error delivery beyond the
+retry budget; no additional rename starts once that budget has expired.
 
 ## Attempt lifecycle
 
