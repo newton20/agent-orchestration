@@ -8,13 +8,21 @@ const { assertOwnership, validateWorkspace, readCheckoutReservation } = require(
 const { statusPathFor, validate, normalizePhases, findDanglingDeps, V2_ENGINES, V2_ACCESS } = require('./parse-manifest');
 
 const STATE_SCHEMA_VERSION = 2;
+const EXECUTION_BINDING_VERSION = 1;
 const MAX_STATE_BYTES = 16 * 1024 * 1024;
 const SAFE_ID = /^(?!\.+$)[A-Za-z0-9._-]+$/;
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const HEX64 = /^[a-f0-9]{64}$/;
+const BINDING_FIELDS = ['adapter_kind', 'binding_id', 'binding_sha256', 'binding_version', 'bound_at', 'capabilities',
+  'engine', 'evidence', 'executable', 'package', 'request', 'run_id'];
+const CAPABILITY_FIELDS = ['agency_version', 'engine_version', 'help_sha256', 'read_only_enforced', 'tracks_descendants'];
 const RESERVED = new Set(['__proto__', 'constructor', 'prototype']);
 const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const isId = (value) => typeof value === 'string' && SAFE_ID.test(value) && !RESERVED.has(value);
 const positive = (value) => Number.isSafeInteger(value) && value > 0;
 const nonnegative = (value) => Number.isSafeInteger(value) && value >= 0;
+const singleLine = (value, max) => typeof value === 'string' && value.length > 0 && value.length <= max &&
+  !/[\u0000-\u001f\u007f]/.test(value);
 
 function requireShape(condition, message) {
   if (!condition) throw new Error(`invalid state: ${message}`);
@@ -49,6 +57,70 @@ function clone(value) {
 
 function fingerprint(payload) {
   return createHash('sha256').update(canonicalJson(payload)).digest('hex');
+}
+
+const exactKeys = (value, keys) => isObject(value) &&
+  canonicalJson(Object.keys(value).sort()) === canonicalJson([...keys].sort());
+
+// Derived only from the accepted snapshot, so a binding cannot widen the accepted model/permission/access policy.
+function executionRequest(record, engine) {
+  const defaults = record.accepted.manifest.defaults;
+  const agents = record.accepted.phases.flatMap((phase) => {
+    const roles = new Set(phase.agents.map((agent) => agent.role));
+    if (phase.review_loop.enabled) { roles.add('impl'); roles.add('qa'); }
+    return [...roles].map((role) => phase.agents.find((agent) => agent.role === role) ||
+      { engine: defaults.engine, access: 'mutating', model: defaults.model || null });
+  }).filter((agent) => agent.engine === engine);
+  return {
+    models: [...new Set(agents.map((agent) => agent.model ?? null).filter((model) => model !== null))].sort(),
+    access: [...new Set(agents.map((agent) => agent.access))].sort(),
+    permission_mode: defaults.permission_mode ?? 'default',
+    shell: record.accepted.manifest.terminal.shell,
+  };
+}
+
+function executionEvidence(engine, capabilities) {
+  return {
+    executable: 'known', package: 'known', engine_version: 'known',
+    agency_version: engine === 'claude' ? 'not_applicable' : 'known',
+    capability_help: 'known',
+    read_only_enforcement: capabilities.read_only_enforced === true ? 'known' : 'missing',
+    descendant_tracking: capabilities.tracks_descendants === true ? 'known' : 'missing',
+    live_acceptance: 'missing',
+  };
+}
+
+function sealExecutionBinding(fields) {
+  const { binding_sha256: _previousSeal, ...record } = fields;
+  return { ...clone(record), binding_sha256: fingerprint(record) };
+}
+
+function validateExecutionBinding(binding, record) {
+  requireShape(exactKeys(binding, BINDING_FIELDS), 'execution binding fields must match the version 1 contract');
+  requireShape(binding.binding_version === EXECUTION_BINDING_VERSION && UUID_V4.test(binding.binding_id) &&
+    binding.run_id === record.run_id && V2_ENGINES.includes(binding.engine) && binding.adapter_kind === 'engine',
+  'execution binding must name this run, a supported engine and a trusted engine adapter');
+  const request = executionRequest(record, binding.engine);
+  requireShape(request.access.length > 0, 'execution binding engine is not selected by the accepted configuration');
+  requireShape(exactKeys(binding.request, Object.keys(request)) && canonicalJson(binding.request) === canonicalJson(request),
+    'execution binding model/permission/access policy must match the accepted configuration');
+  const { executable, package: pkg, capabilities: caps } = binding;
+  requireShape(exactKeys(executable, ['path', 'sha256']) && singleLine(executable.path, 1024) &&
+    path.isAbsolute(executable.path) && /\.exe$/i.test(executable.path) && HEX64.test(executable.sha256),
+  'execution binding requires a pinned native executable path and hash');
+  requireShape(exactKeys(pkg, ['root', 'inventory_sha256']) && singleLine(pkg.root, 1024) && path.isAbsolute(pkg.root) &&
+    HEX64.test(pkg.inventory_sha256), 'execution binding requires a pinned package root and inventory hash');
+  requireShape(exactKeys(caps, CAPABILITY_FIELDS) && singleLine(caps.engine_version, 256) && HEX64.test(caps.help_sha256) &&
+    (binding.engine === 'claude' ? caps.agency_version === null : singleLine(caps.agency_version, 256)) &&
+    typeof caps.read_only_enforced === 'boolean' && typeof caps.tracks_descendants === 'boolean',
+  'execution binding requires selected-engine version and capability evidence');
+  requireShape(!request.access.includes('read-only') || caps.read_only_enforced,
+    'read-only access requires adapter-enforced restriction evidence');
+  requireShape(canonicalJson(binding.evidence) === canonicalJson(executionEvidence(binding.engine, caps)),
+    'execution binding must state known and missing evidence consistently and cannot claim live acceptance');
+  requireShape(typeof binding.bound_at === 'string' && Number.isFinite(Date.parse(binding.bound_at)), 'execution binding time is required');
+  const { binding_sha256: seal, ...sealed } = binding;
+  requireShape(HEX64.test(seal) && seal === fingerprint(sealed), 'execution binding seal mismatch');
 }
 
 function validateAccepted(accepted) {
@@ -132,6 +204,15 @@ function validateLifecycleAttempt(attempt, record) {
     attempt.intent.timeout_minutes === phase.timeout_minutes, 'attempt differs from accepted execution configuration');
   requireShape(canonicalJson(attempt.intent.required_verification) ===
     canonicalJson(attempt.role === 'qa' ? ['scope', 'P1', 'P2', 'P3', 'P4', 'P6'] : []), 'required verification cannot be weakened');
+  if (attempt.execution !== undefined) {
+    const binding = record.execution_bindings?.[attempt.engine];
+    requireShape(exactKeys(attempt.execution, ['binding_id', 'binding_sha256']) && isObject(binding) &&
+      attempt.execution.binding_id === binding.binding_id && attempt.execution.binding_sha256 === binding.binding_sha256,
+    'attempt execution binding must reference this run binding for its engine');
+    requireShape(attempt.model == null || binding.request.models.includes(attempt.model),
+      'attempt model is outside its execution binding policy');
+    requireShape(binding.request.access.includes(attempt.access), 'attempt access is outside its execution binding policy');
+  }
   requireShape(isObject(attempt.artifacts), 'attempt artifact paths are required');
   const directory = path.join(record.workspace.root, 'docs', 'orchestration', 'runs', attempt.run_id,
     'phases', attempt.phase_id, attempt.role, String(attempt.review_iteration), attempt.attempt_id);
@@ -161,6 +242,7 @@ function preserveLifecycle(previous, next) {
           'workdir', 'workspace', 'intent', 'artifacts', 'created_at', 'intended_review_stage', 'retry_category', 'previous_attempt_id']) {
           requireShape(canonicalJson(attempt[field]) === canonicalJson(current[field]), `immutable attempt field ${field}`);
         }
+        requireShape(canonicalJson(attempt.execution ?? null) === canonicalJson(current.execution ?? null), 'immutable attempt field execution');
         if (attempt.status !== 'queued' || attempt.started_at ||
             !['queued', 'launching'].includes(current.status)) {
           requireShape(canonicalJson(attempt.launch_host) === canonicalJson(current.launch_host), 'immutable attempt field launch_host');
@@ -209,6 +291,16 @@ function validateRun(record) {
   requireShape(typeof record.created_at === 'string' && Number.isFinite(Date.parse(record.created_at)) &&
     typeof record.updated_at === 'string' && Number.isFinite(Date.parse(record.updated_at)), 'state timestamps are required');
   requireShape(isObject(record.phases), 'phases must be a map');
+  if (record.execution_bindings !== undefined) {
+    requireShape(isObject(record.execution_bindings), 'execution_bindings must be a map');
+    const bindingIds = new Set();
+    for (const [engine, binding] of Object.entries(record.execution_bindings)) {
+      requireShape(V2_ENGINES.includes(engine) && isObject(binding) && binding.engine === engine, 'execution binding key must name its engine');
+      validateExecutionBinding(binding, record);
+      requireShape(!bindingIds.has(binding.binding_id), 'duplicate execution binding identity');
+      bindingIds.add(binding.binding_id);
+    }
+  }
   const phaseIds = record.accepted.phases.map((phase) => phase.id).sort();
   requireShape(canonicalJson(Object.keys(record.phases).sort()) === canonicalJson(phaseIds), 'runtime phases disagree with accepted phases');
   const attempts = new Set();
@@ -231,6 +323,7 @@ function validateRun(record) {
         requireShape(V2_ENGINES.includes(attempt.engine) && V2_ACCESS.includes(attempt.access), 'invalid attempt engine/access');
         requireShape(typeof attempt.workdir === 'string' && path.isAbsolute(attempt.workdir), 'attempt workdir must be absolute');
         validateWorkspace(attempt.workspace);
+        requireShape(attempt.execution === undefined || attempt.lifecycle_version === 1, 'execution binding references require a lifecycle attempt');
         if (attempt.lifecycle_version !== undefined) validateLifecycleAttempt(attempt, record);
         attempts.add(attempt.attempt_id);
       }
@@ -371,6 +464,8 @@ function assertRerunEligible(state, { allowUnclearedReservations = false } = {})
   const attempts = phases.flatMap((phase) => Object.values(phase.roles).flatMap((role) => role.attempts));
   if (!attempts.length && phases.every((phase) => phase.status === 'pending')) return;
   if (phases.some((phase) => {
+    // Execution-blocked phases may hold only terminal attempts; the per-attempt closure checks below still apply.
+    if (phase.status === 'blocked' && phase.blocker?.category === 'execution') return false;
     const unstarted = Object.values(phase.roles).every((role) => role.attempts.length === 0);
     if (unstarted && (phase.status === 'pending' ||
         (phase.status === 'blocked' && phase.blocker?.category === 'dependency'))) return false;
@@ -466,6 +561,10 @@ function createStateStore({ manifestPath, owner, _fs = {}, _eventFs = {}, _proje
       if (canonicalJson(draft.projection ?? null) !== canonicalJson(current.state.projection ?? null)) {
         throw new Error('immutable transaction field: projection');
       }
+      // Only bindExecution may seal a binding; generic callbacks may reference one but never create or edit it.
+      if (canonicalJson(draft.execution_bindings ?? null) !== canonicalJson(current.state.execution_bindings ?? null)) {
+        throw new Error('immutable transaction field: execution_bindings');
+      }
       // Structural acceptance belongs to the later human-command contract.
       if (canonicalJson(draft.accepted) !== canonicalJson(current.state.accepted)) throw new Error('accepted snapshot is immutable in foundation transactions');
       preserveLifecycle(current.state, draft);
@@ -502,6 +601,36 @@ function createStateStore({ manifestPath, owner, _fs = {}, _eventFs = {}, _proje
     },
     transact: (options) => transact(options),
     transactInternal: (options) => transact(options, true),
+    bindExecution({ expectedRevision, binding }) {
+      const current = readRecord(manifestPath);
+      requireShape(current.state?.schema_version === 2, 'initialize a V2 run before binding execution');
+      owned(current.state.workspace);
+      requireShape(isObject(binding) && V2_ENGINES.includes(binding.engine), 'execution binding requires a supported engine');
+      const existing = current.state.execution_bindings?.[binding.engine];
+      if (existing) {
+        if (canonicalJson(existing) !== canonicalJson(binding)) {
+          throw new Error('execution binding is immutable for this run; start an explicit new run to rebind');
+        }
+        return { revision: current.state.revision, result: { binding_id: existing.binding_id, replayed: true } };
+      }
+      if (!positive(expectedRevision) || expectedRevision !== current.state.revision) throw new Error('state revision conflict');
+      if (current.state.projection?.status === 'degraded') {
+        throw new Error('event projection backpressure: execution binding is disabled while projection is degraded');
+      }
+      const draft = clone(current.state);
+      draft.execution_bindings = { ...(draft.execution_bindings || {}), [binding.engine]: clone(binding) };
+      validateExecutionBinding(draft.execution_bindings[binding.engine], draft);
+      mutating = true;
+      try {
+        draft.revision++;
+        draft.updated_at = new Date().toISOString();
+        appendEvents(draft, [{ type: 'execution_bound', payload: {
+          engine: binding.engine, binding_id: binding.binding_id, binding_sha256: binding.binding_sha256,
+        } }]);
+        publish(draft, current.bytes);
+      } finally { mutating = false; }
+      return { revision: draft.revision, result: { binding_id: binding.binding_id, replayed: false } };
+    },
     projectOutbox({ expectedRevision }) {
       let current = readRecord(manifestPath);
       requireShape(current.state?.schema_version === 2, 'initialize a V2 run before projecting');
@@ -592,7 +721,8 @@ function createStateStore({ manifestPath, owner, _fs = {}, _eventFs = {}, _proje
 }
 
 module.exports = {
-  STATE_SCHEMA_VERSION, MAX_STATE_BYTES, canonicalJson, fingerprint,
+  STATE_SCHEMA_VERSION, EXECUTION_BINDING_VERSION, MAX_STATE_BYTES, canonicalJson, fingerprint,
   validateAccepted, validateState, readState, createStateStore,
-  assertRerunEligible,
+  assertRerunEligible, executionRequest, executionEvidence, sealExecutionBinding, validateExecutionBinding,
+  exactKeys, CAPABILITY_FIELDS,
 };

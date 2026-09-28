@@ -117,6 +117,37 @@ test('U4 missing acknowledged event log remains a history gap on public restart'
   assert.equal(E.readEvents({ state: restarted }).history.status, 'gap');
 });
 
+test('U3 public V2 runner keeps engine dispatch dormant; only trusted programmatic adapters reach the binding seam', async (t) => {
+  const fx = runtimeFixture(t);
+  const sample = async () => ({ sample_id: `dormant-${Date.now()}-${Math.random()}`.replace('.', ''),
+    observed_at: new Date().toISOString(), processes: [], complete: true });
+  const base = { manifestPath: fx.manifestPath, maxTicks: 1, activeIntervalMs: 1, _runtimeRoot: fx.runtimeRoot,
+    logger: () => {}, _healthSample: sample };
+  assert.equal((await ActualOrchestrator.runOrchestrator(base)).ok, true);
+  let state = require('./state-store').readState(fx.manifestPath);
+  assert.equal(state.execution_bindings, undefined);
+  assert.equal(state.phases.p1.roles.impl.attempts.length, 0);
+  assert.throws(() => O.parseCliArgs(['node', 's.js', '--engine-adapters', 'agency-copilot', 'm.yaml']), /unknown argument/);
+  const adapter = {
+    kind: 'engine',
+    capabilities: { engines: ['agency-copilot'], read_only_enforced: false, tracks_descendants: false, live_verified: false },
+    async preflight() { throw new Error('probe unavailable offline'); },
+    async launch() { assert.fail('engine launch reached'); },
+  };
+  const warnings = [];
+  const result = await ActualOrchestrator.runOrchestrator({ ...base, _engineAdapters: [adapter],
+    logger: (level, message) => { if (level === 'warn') warnings.push(message); } });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.summary, 'live_dispatch_disabled');
+  assert.ok(warnings.some((message) => /phase p1 execution blocked \(preflight_failed\)/.test(message)), JSON.stringify(warnings));
+  assert.equal(warnings.some((message) => message.includes('offline')), false, 'adapter error text is never echoed');
+  state = require('./state-store').readState(fx.manifestPath);
+  assert.equal(state.live_dispatch_enabled, false);
+  assert.equal(state.execution_bindings, undefined);
+  assert.equal(state.phases.p1.blocker.code, 'preflight_failed');
+  assert.equal(state.phases.p1.roles.impl.attempts.length, 0);
+});
+
 test('U4 routine retention does not repeatedly warn about missing history', async (t) => {
   const fx = runtimeFixture(t);
   const warnings = [];

@@ -3805,8 +3805,9 @@ async function startV2Foundation(opts) {
     projectBeforeLifecycle(store);
     lifecycle = await createAttemptLifecycle({
       owner, store, manifestPath: opts.manifestPath, _runtimeRoot: opts._runtimeRoot,
-      _fixtureAdapter: opts._fixtureAdapter, _lifecycleFault: opts._lifecycleFault,
-      _hostEvidence: opts._hostEvidence,
+      _fixtureAdapter: opts._fixtureAdapter, _engineAdapters: opts._engineAdapters, _lifecycleFault: opts._lifecycleFault,
+      _hostEvidence: opts._hostEvidence, _preflightTimeoutMs: opts._preflightTimeoutMs,
+      _executionRecheckMs: opts._executionRecheckMs,
     });
     let state = store.read();
     const scaffold = scaffoldProtocol({ manifestPath: opts.manifestPath, accepted: state.accepted, runId: state.run_id, owner, pluginDir: opts.pluginDir });
@@ -3853,6 +3854,19 @@ async function runOrchestrator(opts) {
         }
       };
       reportProjection();
+      const executionBlockers = new Map();
+      const reportExecutionBlockers = () => {
+        for (const [phaseId, phase] of Object.entries(runtime.state.phases)) {
+          const blocker = phase.blocker?.category === 'execution' ? phase.blocker : null;
+          const key = blocker ? `${blocker.code}:${blocker.detail}` : null;
+          if (key && executionBlockers.get(phaseId) !== key) {
+            logger('warn', `phase ${phaseId} execution blocked (${blocker.code}): ${blocker.reason}; ${blocker.detail}`);
+          } else if (!key && executionBlockers.get(phaseId)) {
+            logger('info', `phase ${phaseId} execution blocker cleared`);
+          }
+          executionBlockers.set(phaseId, key);
+        }
+      };
       if (runtime.authoring.status !== 'unchanged') {
         logger('warn', `authoring manifest is ${runtime.authoring.status}; continuing with the persisted accepted snapshot`);
       }
@@ -3863,6 +3877,7 @@ async function runOrchestrator(opts) {
         runtime.state = await lifecycle.tick(opts._healthSample ? { sample: await opts._healthSample() } : {});
         runtime.state = runtime.store.projectOutbox({ expectedRevision: runtime.state.revision });
         reportProjection();
+        reportExecutionBlockers();
         if (runtime.state.process_diagnostic) logger('warn', runtime.state.process_diagnostic.error);
         if (tick + 1 >= limit) break;
         await new Promise((resolve) => {
