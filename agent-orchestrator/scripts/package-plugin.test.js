@@ -20,7 +20,7 @@ function write(root, relative, content) {
 
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(__dirname, '.package-plugin-test-'));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
   const checkout = path.join(root, 'checkout');
   const sourceRoot = path.join(checkout, 'plugin');
   fs.mkdirSync(path.join(checkout, '.git'), { recursive: true });
