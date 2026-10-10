@@ -2,8 +2,8 @@
 
 V2 supports Windows and Node >=20. Its Windows ownership tests run real
 competing Node processes. Production worker dispatch remains disabled.
-The lifecycle is exercised through an explicit programmatic fixture adapter;
-there is no CLI flag that enables it.
+The lifecycle is exercised through explicit programmatic fixture or trusted
+engine-adapter seams; no CLI flag or manifest field enables either.
 Updated V1 and V2 controllers require Windows PowerShell, Git on PATH,
 and access to the current user's LocalApplicationData directory for their
 shared ownership primitive.
@@ -70,8 +70,8 @@ include `impl` and `qa` role records even when one role was implicit in the
 manifest. Lifecycle code fills the attempt arrays. Each attempt must have
 `attempt_id`, `run_id`, `phase_id`, `role`, `review_iteration`, `engine`,
 `access`, `workdir`, and `workspace`. Additional lifecycle fields belong
-on that record; PID alone is not process identity. Without a fixture adapter,
-the runner observes existing attempts but creates no new dispatches.
+on that record; PID alone is not process identity. Without a configured fixture
+or engine adapter, the runner observes existing attempts but creates no new dispatches.
 
 `createStateStore({ manifestPath, owner })` returns synchronous methods:
 
@@ -83,6 +83,7 @@ the runner observes existing attempts but creates no new dispatches.
 | `transactInternal({ expectedRevision, mutate })` | Commit an owner-internal transition with the same revision and publication guarantees, without storing a command deduplication result. |
 | `projectOutbox({ expectedRevision })` | Project committed events under live ownership, publish acknowledgements/status, and return the latest canonical state. |
 | `rerun({ expectedRevision, accepted })` | Create a new run ID and retain the prior record, without recursively nesting history. Require drained, non-degraded projection, matching workspace, and resolved attempt ownership. |
+| `bindExecution({ expectedRevision, binding })` | Seal one binding per run and engine under live ownership; an identical replay is a no-op even with a stale revision. New bindings require the current revision and non-degraded projection. |
 
 Example owner-side transition:
 
@@ -455,9 +456,10 @@ any prompt publication or launch. The launcher process, correlated engine
 session, and acknowledged submission are separate observations. A shell
 or session-name match does not establish submission.
 
-Dispatch order is: publish queued intent, acquire and durably record the
+Engine dispatch first verifies, or once per run and engine seals, the
+execution binding. Dispatch order is: publish queued intent, acquire and durably record the
 checkout reservation, publish the prompt, publish `launching`, then call
-the fixture adapter once. Restart may continue a queued intent under its
+the selected adapter once. Restart may continue a queued intent under its
 original attempt ID. Once `launching` is durable, missing acknowledgement
 requires reconciliation and never automatic replay. A thrown adapter call
 leaves its durable intent and reservations available for the next tick.
@@ -480,7 +482,9 @@ The canonical 16 MiB state limit still applies.
 
 ## Fixture adapter contract
 
-Only the `_fixtureAdapter` programmatic option enables lifecycle dispatch:
+`_fixtureAdapter` and `_engineAdapters` are the only lifecycle dispatch seams;
+they are mutually exclusive and unreachable from manifests or the CLI.
+The fixture adapter is:
 
 ```js
 {
@@ -530,6 +534,122 @@ reports cannot change phase progression. Current attempts alone determine
 review progression, outcomes, and retry eligibility. Additive descendant/closure
 observations cannot rewrite that outcome or its process/submission identity.
 No observation or artifact-provided role label grants operator authority.
+
+## Execution/preflight binding (contract version 1)
+
+Engine dispatch requires one sealed execution binding per run and engine.
+Production dispatch remains disabled: `live_dispatch_enabled` stays `false`,
+no manifest or CLI input supplies adapters, and shipped adapters refuse launch.
+The optional `execution_bindings` map is absent until the first binding, so
+older V2 records remain valid.
+
+Each `execution_bindings[engine]` has this shape:
+
+```js
+{
+  binding_version: 1, binding_id, run_id, engine, adapter_kind: 'engine',
+  request: { models, access, permission_mode, shell },
+  executable: { path, sha256 },
+  package: { root, inventory_sha256 },
+  capabilities: { engine_version, agency_version, help_sha256,
+                  read_only_enforced, tracks_descendants },
+  evidence: { executable, package, engine_version, agency_version,
+              capability_help, read_only_enforcement, descendant_tracking,
+              live_acceptance },
+  bound_at, binding_sha256
+}
+```
+
+`request` must equal the policy derived from the accepted snapshot for that
+engine: distinct models and access modes, the effective permission mode, and
+terminal shell. The executable is an absolute native `.exe` realpath.
+Version strings are single lines of at most 256 characters. Strict key
+allowlists exclude invocation, environment and credential fields.
+`binding_sha256` seals the canonical record without that field; a tampered
+seal fails validation on read.
+
+Evidence values are `known`, `missing`, or `not_applicable`, as appropriate
+for their matching capability. Direct Claude has no Agency version and uses
+`not_applicable` for that evidence. Read-only access requires
+`read_only_enforced: true`. Version 1 always records live acceptance as
+`missing`; binding evidence does not establish live support.
+
+`store.bindExecution({ expectedRevision, binding })` is the only writer.
+It checks live ownership. A new binding requires the current revision and
+non-degraded projection, and atomically publishes an `execution_bound` event
+with `{ engine, binding_id, binding_sha256 }`. An identical replay returns
+`{ revision, result: { binding_id, replayed: true } }` without publication,
+even with a stale revision. A different binding for an already-bound engine
+is rejected. Generic transactions cannot create, modify or remove bindings.
+
+Engine-bound attempts have an immutable
+`execution: { binding_id, binding_sha256 }` reference to their run's binding
+for that engine. Attempt model/access must remain inside its policy. Fixture
+attempts have no such reference. Rerun starts unbound and archives the old bindings.
+
+### Trusted engine-adapter seam
+
+`startV2Foundation({ _engineAdapters })` and
+`createAttemptLifecycle({ _engineAdapters })` accept a nonempty array of
+trusted adapters, mutually exclusive with `_fixtureAdapter`:
+
+```js
+{
+  kind: 'engine',
+  capabilities: { engines: ['<one engine>'], read_only_enforced,
+                  tracks_descendants, live_verified: false },
+  async preflight(request, { signal }) { /* probes only, no launch effects */ },
+  async launch(attempt, { observe, binding }) { /* enforce the supplied binding before effects */ },
+  async reconcile(attempt, { observe, binding }) { /* optional, observation only */ }
+}
+```
+
+Preflight receives `{ run_id, engine, models, access, permission_mode, shell }`
+and an `AbortSignal`. It returns only:
+
+```js
+{
+  executable: { path, sha256 },
+  package: { root, inventory_sha256 },
+  capabilities: { engine_version, agency_version, help_sha256,
+                  read_only_enforced, tracks_descendants, live_verified: false }
+}
+```
+
+The controller abandons preflight after 60 seconds and aborts its signal;
+adapters must use asynchronous probes so this deadline can run.
+Before every dispatch, including queued-intent resumption after restart,
+the controller repeats preflight, hashes the executable, and verifies package
+bytes against `package-inventory.json`. Package checks allow at most 4,096
+files, 8,192 entries and depth 32; unlisted or redirected entries fail.
+The first successful check seals the binding before intent publication.
+Later checks must match it without silently resolving a different executable.
+The adapter must also refuse launch effects if its prepared files differ
+from the supplied binding.
+
+Failures persist a phase blocker with category `execution`:
+
+| Code | Meaning |
+|---|---|
+| `adapter_unavailable` | No trusted adapter is configured for this engine. |
+| `preflight_failed` | Initial preflight could not establish a binding. |
+| `binding_unverified` | Preflight or an OS error prevented verification of an existing binding. |
+| `binding_drift` | A pinned file is missing or executable/package/capability evidence changed. |
+
+Adapter error text is not persisted. Blocker details use controller-authored
+check messages, schema violations, or an OS error code/syscall. The snapshot
+exposes only known execution codes and fixed messages; it excludes raw
+details, executable/package paths and binding records. Unknown codes get a
+generic execution-binding message.
+
+Monitoring and observation-only reconciliation continue while dispatch is
+blocked, preserving closure accounting. Terminal phases drop their execution
+blocker and are not redispatched. A failed engine check is reused for five
+minutes of monotonic controller time; restart rechecks immediately. Unchanged
+failures do not add revisions. Restoring the exact pinned identity clears
+the blocker on a subsequent check; otherwise use an eligible explicit rerun.
+Mid-run rebinding requires a future operator command. Binding or intent
+persistence failure propagates before launch effects.
 
 ## Attempt artifacts and review
 
@@ -697,13 +817,14 @@ started phase must be completed or failed, and every historical attempt must hav
 supported terminal lifecycle outcome and concrete cooperative, adapter,
 no-external-effect, or process closure evidence. Mutating attempts also need
 confirmed private reservation cleanup. Never-started pending or
-dependency-blocked phases have no worker ownership to drain and do not
-prevent rerun. Live, unknown, queued, or
+dependency-blocked phases, and execution-blocked phases, do not prevent
+rerun; every existing attempt still requires a terminal outcome, concrete
+closure and a cleared mutating reservation. Live, unknown, queued, or
 uncleared work cannot be discarded through rerun.
 
 Rerun startup first checks canonical closure eligibility, projects pending
 events, then synchronizes reservations under the **old run ID**, without
-invoking its fixture adapter. Cleanup transitions are projected before
+invoking any adapter. Cleanup transitions are projected before
 `store.rerun`; rerun requires a drained, non-degraded projection.
 Only after cleanup succeeds does `store.rerun` publish the new ID and retain
 the complete prior run in immutable history. Imported V1 history remains
