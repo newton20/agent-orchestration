@@ -193,8 +193,20 @@ function phaseSnapshot(run, accepted) {
   const roles = Object.entries(phase.roles);
   const blockers = [];
   if (phase.blocker) {
-    const category = choice(phase.blocker.category, ['dependency', 'workspace', 'operator', 'verification', 'retry_budget'], 'controller');
-    blockers.push({ category, message: category === 'dependency' ? 'Waiting for accepted upstream completion.' : 'Controller intervention is required.' });
+    const category = choice(phase.blocker.category, ['dependency', 'workspace', 'operator', 'verification', 'retry_budget', 'execution'], 'controller');
+    if (category === 'execution') {
+      const messages = {
+        adapter_unavailable: 'The configured execution adapter is unavailable.',
+        preflight_failed: 'Execution preflight failed before a binding could be established.',
+        binding_unverified: 'The pinned execution binding could not be verified.',
+        binding_drift: 'The executable, package, or capabilities differ from the pinned execution binding.',
+      };
+      const code = choice(phase.blocker.code, Object.keys(messages), null);
+      blockers.push(code ? { category, code, message: messages[code] }
+        : { category, message: 'Execution binding requires controller attention.' });
+    } else {
+      blockers.push({ category, message: category === 'dependency' ? 'Waiting for accepted upstream completion.' : 'Controller intervention is required.' });
+    }
   }
   if (phase.status === 'needs_operator') blockers.push({ category: 'operator', message: 'Attempt observation or delivery requires intervention.' });
   if (phase.status === 'failed') blockers.push({ category: 'failure', message: 'The controller recorded a phase failure.' });

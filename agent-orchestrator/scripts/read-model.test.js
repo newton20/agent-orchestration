@@ -20,6 +20,30 @@ const identity = (attempt) => Object.fromEntries(
 const phaseOf = (snapshot, id = 'p1') => snapshot.phases.find((phase) => phase.phase_id === id);
 const roleOf = (snapshot, role = 'impl') => phaseOf(snapshot).roles.find((entry) => entry.role === role);
 
+test('U3 execution blockers expose only known codes and fixed messages', (t) => {
+  const fx = fixture(t);
+  const messages = {
+    adapter_unavailable: 'The configured execution adapter is unavailable.',
+    preflight_failed: 'Execution preflight failed before a binding could be established.',
+    binding_unverified: 'The pinned execution binding could not be verified.',
+    binding_drift: 'The executable, package, or capabilities differ from the pinned execution binding.',
+  };
+  for (const [code, message] of Object.entries(messages)) {
+    fx.mutate(state => {
+      state.phases.p1.blocker = { category: 'execution', code, reason: 'private-reason', detail: 'private-error' };
+    });
+    const snapshot = fx.snapshot();
+    assert.deepEqual(phaseOf(snapshot).blockers, [{ category: 'execution', code, message }]);
+    assert.equal(JSON.stringify(snapshot).includes('private-'), false);
+    assert.equal(snapshot.execution_bindings, undefined);
+  }
+  fx.mutate(state => {
+    state.phases.p1.blocker = { category: 'execution', code: 'private-unknown-code', detail: 'private-error' };
+  });
+  assert.deepEqual(phaseOf(fx.snapshot()).blockers,
+    [{ category: 'execution', message: 'Execution binding requires controller attention.' }]);
+});
+
 function diskFixture(t) {
   const fx = runtimeFixture(t);
   const { manifestPath } = fx;
