@@ -40,19 +40,28 @@ outside the checkout whose parent already exists:
 npm run package:plugin -- --output C:\artifacts\agent-orchestrator
 ```
 
-The command builds a directory containing the plugin components and locked
-runtime dependencies, then writes `package-inventory.json` with sorted
-SHA-256 file hashes. It runs `npm ci --omit=dev --ignore-scripts --no-audit
+The command builds a directory containing the plugin components, the three
+dashboard assets, and locked runtime dependencies, then writes
+`package-inventory.json` with sorted SHA-256 file hashes. It runs
+`npm ci --omit=dev --ignore-scripts --no-audit
 --no-fund` inside the staging directory and refuses to replace an existing
 output. Node itself is not bundled. The packager excludes test/fixture
 paths, hidden entries, and named secret/credential paths; never place
 secrets inside runtime source files.
 
+On Windows, a transient `EPERM` at the final staging rename is retried for
+up to five seconds with path and output-absence checks before each attempt.
+The package is installed only once; retries never replace an existing output.
+Other errors or exhausted retries fail publication explicitly. A paused
+process or slow OS call can delay return beyond the retry budget.
+
 Agency loading does not run this build or install npm dependencies on the
 package's behalf. A successful build establishes filesystem/runtime
 packaging only, not installed-engine plugin discovery.
 The source-checkout test entrypoints include offline adapter/channel/package
-and Copilot-hook tests. The twelve live-acceptance cases remain explicit
+and Copilot-hook tests. The scripts suite also runs the dashboard frontend
+tests; frontend test files are excluded from the package.
+The twelve live-acceptance cases remain explicit
 skips with unimplemented procedures; removing a skip cannot turn them into
 a passing acceptance result.
 
@@ -61,13 +70,13 @@ See `docs\manifest-reference.md` for V1/V2 configuration boundaries and
 contracts. A live run requires a dedicated disposable checkout and separate
 authorization; do not enable production through the fixture adapter.
 
-### Read-only dashboard backend
+### Read-only dashboard
 
 The loopback companion exposes authenticated snapshots, events, and bounded
 artifact reads independently of the controller. It never schedules workers,
-projects the outbox, or changes canonical state. Frontend assets and combined
-browser acceptance are not included yet; opening `/` returns
-`503 UI_UNAVAILABLE` until the UI is integrated.
+projects the outbox, or changes canonical state. Open its reported URL for
+the bundled progress dashboard. Missing assets return `503 UI_UNAVAILABLE`;
+rebuild an incomplete package rather than substituting a placeholder.
 
 From `agent-orchestrator\scripts`, replace the example manifest path with
 the run you want to inspect:
@@ -87,14 +96,24 @@ another manifest in the same workspace is a conflict. The package's
 Only run `access` in your own interactive terminal. It displays a one-use
 code valid for 60 seconds; machine output provides instructions, not a code.
 Browser sessions last 15 minutes and expire on service restart. Codes and
-cookies belong in neither URLs nor logs. The installed UI will collect the
-code locally; backend delivery alone is not a finished browser workflow.
+cookies belong in neither URLs nor logs. Enter the code in the local page's
+access form.
+
+The page shows intervention and freshness first, then phases, selected-attempt
+evidence, and a bounded timeline. Follow the current run or pin a historical
+run for inspection. Worker reports and QA evidence remain distinct from
+independent verification. Artifact text is untrusted, even when its hash
+matches accepted evidence. The page has no workflow mutation controls.
 
 For recovery when the manifest or status is unavailable, `status`, `stop`,
 and `access` accept `--workspace` with the original Git workspace directory.
 `stop` may also take an exact service ID after the manifest path. It stops
 only that companion, not the controller or its workers. Status comes from
 live service identity rather than trusting a stored port or PID.
+Closed-pipe discovery races are re-observed within a two-second settle
+window. Startup waits up to 30 seconds; after discovery, stop waits up to
+ten seconds for its reply and owner release. Expiry cancels pending
+queries; malformed replies and identity mismatches remain fatal.
 
 The snapshot/SSE/auth/error contract and sanitized examples are in
 `scripts\test-support\dashboard-contract.json` in the source checkout.
@@ -104,9 +123,9 @@ not evidence that a controller or worker is alive.
 
 This service is for a trusted local operator, not isolation from hostile
 same-user processes. Loopback cookies are host-scoped rather than
-port-isolated. Rejected aliased static roots, transient concurrent
-stop/discovery failures, real-socket backpressure/stop flush behavior, and
-near-limit polling cost remain documented platform acceptance concerns.
+port-isolated. Aliased static roots are rejected. Windows fixtures exercise
+real-socket backpressure, delayed stop replies and lifecycle races;
+near-limit polling cost remains unbenchmarked.
 Never resolve a diagnostic by deleting scheduler ownership records.
 
 ## V1 status

@@ -11,6 +11,70 @@ const childProcess = require('node:child_process');
 const { runtimeFixture } = require('./test-support/runtime-fixture');
 const W = require('./workspace-owner');
 
+test('owner query distinguishes empty replies from truncated JSON', async (t) => {
+  const fx = runtimeFixture(t);
+  const workspace = W.resolveWorkspace(fx.workdir);
+  for (const reply of ['', '{"ok":']) {
+    const server = net.createServer(socket => socket.once('data', () => socket.end(reply)));
+    await new Promise(resolve => server.listen(W.pipeNameFor(workspace), resolve));
+    try {
+      await assert.rejects(W.queryOwner(workspace), error => reply
+        ? error instanceof SyntaxError && error.code !== 'EMPTY_REPLY'
+        : error.code === 'EMPTY_REPLY');
+    } finally { await new Promise(resolve => server.close(resolve)); }
+  }
+});
+
+test('owner query cancellation closes an active trickling socket', { timeout: 10000 }, async (t) => {
+  const fx = runtimeFixture(t);
+  const workspace = W.resolveWorkspace(fx.workdir);
+  let peer;
+  let interval;
+  let endTimer;
+  let firstWrite;
+  const trickling = new Promise(resolve => { firstWrite = resolve; });
+  const server = net.createServer(socket => {
+    peer = socket;
+    socket.on('error', () => {});
+    socket.on('close', () => clearInterval(interval));
+    socket.on('data', () => {
+      interval = setInterval(() => { socket.write(' '); firstWrite(); }, 20);
+    });
+  });
+  await new Promise(resolve => server.listen(W.pipeNameFor(workspace), resolve));
+  t.after(async () => {
+    clearInterval(interval);
+    clearTimeout(endTimer);
+    peer?.destroy();
+    await new Promise(resolve => server.close(resolve));
+  });
+  const connected = once(server, 'connection');
+  const abort = new AbortController();
+  const query = W.queryOwner(workspace, { signal: abort.signal });
+  const rejected = assert.rejects(query, error => error.name === 'AbortError' || error === abort.signal.reason);
+  await connected;
+  await trickling;
+  const closed = new Promise(resolve => peer.once('close', resolve));
+  abort.abort(new Error('test deadline reached'));
+  endTimer = setTimeout(() => { clearInterval(interval); peer.end(); }, 2000);
+  await rejected;
+  await Promise.race([closed, new Promise((_, reject) => {
+    const timer = setTimeout(() => reject(new Error('cancelled owner socket is still open')), 500);
+    timer.unref();
+  })]);
+});
+
+test('owner query refuses an already cancelled request before opening a socket', async (t) => {
+  const fx = runtimeFixture(t);
+  const workspace = W.resolveWorkspace(fx.workdir);
+  const create = t.mock.method(net, 'createConnection', () => assert.fail('cancelled query opened a socket'));
+  const abort = new AbortController();
+  const reason = new Error('cancelled before query');
+  abort.abort(reason);
+  await assert.rejects(W.queryOwner(workspace, { signal: abort.signal }), error => error === reason);
+  assert.equal(create.mock.callCount(), 0);
+});
+
 test('U2 real competing processes respect live checkout claims and durable unresolved reservations after owner shutdown', { timeout: 60000 }, async (t) => {
   const fx = runtimeFixture(t);
   const workspace = W.resolveWorkspace(fx.workdir);

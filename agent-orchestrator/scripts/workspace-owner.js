@@ -435,9 +435,10 @@ async function acquireWorkspaceOwner(workspace, options = {}) {
   }
 }
 
-function queryOwner(workspace, { namespace = 'controller' } = {}) {
+function queryOwner(workspace, { namespace = 'controller', signal } = {}) {
   return new Promise((resolve, reject) => {
-    const socket = net.createConnection(pipeNameFor(workspace, namespace));
+    signal?.throwIfAborted();
+    const socket = net.createConnection({ path: pipeNameFor(workspace, namespace), signal });
     let input = '';
     socket.setTimeout(2000, () => socket.destroy(new Error('owner readiness query timed out')));
     socket.on('error', reject);
@@ -448,6 +449,7 @@ function queryOwner(workspace, { namespace = 'controller' } = {}) {
     });
     socket.on('end', () => {
       try {
+        if (!input) throw Object.assign(new Error('owner readiness closed without a reply'), { code: 'EMPTY_REPLY' });
         const response = JSON.parse(input);
         if (!response.ok || response.workspace_key !== workspace.key || response.namespace !== namespace) {
           throw new Error('owner readiness full-key mismatch or rejected query');
